@@ -1,0 +1,122 @@
+{
+  "version": "0.1.0",
+  "timestamp": "2026-06-21T11:35:57.568Z",
+  "node_version": "v20.19.2",
+  "platform": "linux",
+  "suites": {
+    "skip_detection": {
+      "total_cases": 50,
+      "correct": 50,
+      "accuracy": 1,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1,
+      "tp": 40,
+      "tn": 10,
+      "fp": 0,
+      "fn": 0,
+      "by_category": {
+        "short": {
+          "total": 10,
+          "correct": 10,
+          "accuracy": 1
+        },
+        "cli-command": {
+          "total": 10,
+          "correct": 10,
+          "accuracy": 1
+        },
+        "slash-command": {
+          "total": 10,
+          "correct": 10,
+          "accuracy": 1
+        },
+        "complex-query": {
+          "total": 10,
+          "correct": 10,
+          "accuracy": 1
+        },
+        "code-heavy": {
+          "total": 10,
+          "correct": 10,
+          "accuracy": 1
+        }
+      },
+      "failures": []
+    },
+    "parse_robustness": {
+      "total_cases": 30,
+      "correct": 30,
+      "success_rate": 1,
+      "by_format": {
+        "raw": {
+          "total": 6,
+          "correct": 6,
+          "success_rate": 1
+        },
+        "markdown-json-block": {
+          "total": 6,
+          "correct": 6,
+          "success_rate": 1
+        },
+        "markdown-plain-block": {
+          "total": 6,
+          "correct": 6,
+          "success_rate": 1
+        },
+        "embedded": {
+          "total": 6,
+          "correct": 6,
+          "success_rate": 1
+        },
+        "garbage": {
+          "total": 6,
+          "correct": 6,
+          "success_rate": 1
+        }
+      },
+      "failures": []
+    },
+    "cache_performance": {
+      "n_entries": 1000,
+      "write_ms": 18.3,
+      "read_ms": 8.49,
+      "read_hits": 1000,
+      "write_ops_per_sec": 54641,
+      "read_ops_per_sec": 117779,
+      "ttl_expiry_correct": true,
+      "ttl_expired_checked": 10,
+      "ttl_expired_null_returns": 10
+    },
+    "throughput": {
+      "iterations": 10000,
+      "elapsed_ms": 1.731,
+      "skip_detection_ops_per_sec": 5775646,
+      "skip_count": 7500,
+      "no_skip_count": 2500
+    }
+  },
+  "summary": "PASS",
+  "thresholds": {
+    "skip_accuracy": {
+      "required": 0.95,
+      "actual": 1,
+      "pass": true
+    },
+    "parse_success": {
+      "required": 0.9,
+      "actual": 1,
+      "pass": true
+    },
+    "cache_write_ops": {
+      "required": 1000,
+      "actual": 54641,
+      "pass": true
+    },
+    "throughput_ops": {
+      "required": 10000,
+      "actual": 5775646,
+      "pass": true
+    }
+  }
+}

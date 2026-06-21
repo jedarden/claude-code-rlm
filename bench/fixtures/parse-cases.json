@@ -1,0 +1,272 @@
+[
+  {
+    "id": "parse-raw-001",
+    "input": "{\"intent\": \"debugging\", \"tasks\": [\"reproduce\", \"fix\"]}",
+    "expected_success": true,
+    "expected_field": "intent",
+    "expected_value": "debugging",
+    "format": "raw",
+    "description": "Simple JSON object with string and array values"
+  },
+  {
+    "id": "parse-raw-002",
+    "input": "{\"approach\": \"iterative\", \"confidence\": 0.85}",
+    "expected_success": true,
+    "expected_field": "approach",
+    "expected_value": "iterative",
+    "format": "raw",
+    "description": "JSON object with string and number values"
+  },
+  {
+    "id": "parse-raw-003",
+    "input": "{\"domain\": \"backend\", \"tech\": [\"Node.js\", \"TypeScript\"]}",
+    "expected_success": true,
+    "expected_field": "domain",
+    "expected_value": "backend",
+    "format": "raw",
+    "description": "JSON object with domain and tech stack array"
+  },
+  {
+    "id": "parse-raw-004",
+    "input": "{\"tasks\": [\"analyze\", \"design\", \"implement\"], \"priority\": 1}",
+    "expected_success": true,
+    "expected_field": "priority",
+    "expected_value": 1,
+    "format": "raw",
+    "description": "JSON object with array and numeric field"
+  },
+  {
+    "id": "parse-raw-005",
+    "input": "{\"approach\": \"direct\", \"skip_rlm\": false}",
+    "expected_success": true,
+    "expected_field": "approach",
+    "expected_value": "direct",
+    "format": "raw",
+    "description": "JSON object with boolean field (skip_rlm false is NOT the error sentinel)"
+  },
+  {
+    "id": "parse-raw-006",
+    "input": "{}",
+    "expected_success": true,
+    "expected_field": null,
+    "expected_value": null,
+    "format": "raw",
+    "description": "Empty JSON object — valid parse, no field to verify"
+  },
+  {
+    "id": "parse-markdown-json-block-001",
+    "input": "```json\n{\"intent\": \"code_writing\"}\n```",
+    "expected_success": true,
+    "expected_field": "intent",
+    "expected_value": "code_writing",
+    "format": "markdown-json-block",
+    "description": "JSON inside a json-tagged fenced block"
+  },
+  {
+    "id": "parse-markdown-json-block-002",
+    "input": "Here is the analysis:\n```json\n{\"approach\": \"modular\", \"confidence\": 0.9}\n```\n",
+    "expected_success": true,
+    "expected_field": "approach",
+    "expected_value": "modular",
+    "format": "markdown-json-block",
+    "description": "JSON fenced block with preceding prose and trailing newline"
+  },
+  {
+    "id": "parse-markdown-json-block-003",
+    "input": "```json\n{\"domain\": \"web\", \"tech\": [\"React\", \"Node.js\"]}\n```",
+    "expected_success": true,
+    "expected_field": "domain",
+    "expected_value": "web",
+    "format": "markdown-json-block",
+    "description": "JSON fenced block with array value"
+  },
+  {
+    "id": "parse-markdown-json-block-004",
+    "input": "Analysis complete. Result:\n```json\n{\"domain\": \"backend\", \"files\": [\"src/auth.ts\"]}\n```\nDone.",
+    "expected_success": true,
+    "expected_field": "domain",
+    "expected_value": "backend",
+    "format": "markdown-json-block",
+    "description": "JSON fenced block surrounded by prose text"
+  },
+  {
+    "id": "parse-markdown-json-block-005",
+    "input": "```json\n{\"intent\": {\"primary\": \"refactoring\", \"confidence\": 0.85}}\n```",
+    "expected_success": true,
+    "expected_field": "intent",
+    "expected_value": {"primary": "refactoring", "confidence": 0.85},
+    "format": "markdown-json-block",
+    "description": "JSON fenced block with nested object value"
+  },
+  {
+    "id": "parse-markdown-json-block-006",
+    "input": "Quick preresearch:\n```json\n{\"ready\": true, \"priority\": 2}\n```\nProceed.",
+    "expected_success": true,
+    "expected_field": "ready",
+    "expected_value": true,
+    "format": "markdown-json-block",
+    "description": "JSON fenced block with boolean value and surrounding text"
+  },
+  {
+    "id": "parse-markdown-plain-block-001",
+    "input": "```\n{\"intent\": \"refactoring\"}\n```",
+    "expected_success": true,
+    "expected_field": "intent",
+    "expected_value": "refactoring",
+    "format": "markdown-plain-block",
+    "description": "JSON inside an untagged fenced block"
+  },
+  {
+    "id": "parse-markdown-plain-block-002",
+    "input": "Result:\n```\n{\"tech\": [\"TypeScript\"], \"approach\": \"typed\"}\n```\n",
+    "expected_success": true,
+    "expected_field": "approach",
+    "expected_value": "typed",
+    "format": "markdown-plain-block",
+    "description": "JSON in plain fenced block with preceding label"
+  },
+  {
+    "id": "parse-markdown-plain-block-003",
+    "input": "```\n{\"priority\": 3, \"ready\": true}\n```",
+    "expected_success": true,
+    "expected_field": "priority",
+    "expected_value": 3,
+    "format": "markdown-plain-block",
+    "description": "JSON in plain fenced block with numeric and boolean fields"
+  },
+  {
+    "id": "parse-markdown-plain-block-004",
+    "input": "Analysis done:\n```\n{\"domain\": \"web\", \"confidence\": 0.75}\n```\nEnd",
+    "expected_success": true,
+    "expected_field": "domain",
+    "expected_value": "web",
+    "format": "markdown-plain-block",
+    "description": "JSON in plain fenced block surrounded by prose"
+  },
+  {
+    "id": "parse-markdown-plain-block-005",
+    "input": "```\n{\"files\": [\"index.ts\", \"auth.ts\"], \"count\": 2}\n```",
+    "expected_success": true,
+    "expected_field": "count",
+    "expected_value": 2,
+    "format": "markdown-plain-block",
+    "description": "JSON in plain fenced block with file list and count"
+  },
+  {
+    "id": "parse-markdown-plain-block-006",
+    "input": "Here:\n```\n{\"approach\": \"event-driven\"}\n```\n",
+    "expected_success": true,
+    "expected_field": "approach",
+    "expected_value": "event-driven",
+    "format": "markdown-plain-block",
+    "description": "JSON in plain fenced block — minimal prose wrapper"
+  },
+  {
+    "id": "parse-embedded-001",
+    "input": "The analysis shows {\"intent\": \"debugging\"} for this request.",
+    "expected_success": true,
+    "expected_field": "intent",
+    "expected_value": "debugging",
+    "format": "embedded",
+    "description": "JSON object embedded mid-sentence with no other curly braces"
+  },
+  {
+    "id": "parse-embedded-002",
+    "input": "Preresearch complete: {\"approach\": \"modular\", \"confidence\": 0.8}",
+    "expected_success": true,
+    "expected_field": "approach",
+    "expected_value": "modular",
+    "format": "embedded",
+    "description": "JSON object at end of prose text"
+  },
+  {
+    "id": "parse-embedded-003",
+    "input": "Done! {\"domain\": \"backend\", \"priority\": 2} analysis complete.",
+    "expected_success": true,
+    "expected_field": "domain",
+    "expected_value": "backend",
+    "format": "embedded",
+    "description": "JSON object near start of text with trailing prose"
+  },
+  {
+    "id": "parse-embedded-004",
+    "input": "Result: {\"files\": [\"main.ts\"], \"ready\": true} complete.",
+    "expected_success": true,
+    "expected_field": "ready",
+    "expected_value": true,
+    "format": "embedded",
+    "description": "JSON object with boolean and array embedded in prose"
+  },
+  {
+    "id": "parse-embedded-005",
+    "input": "After careful analysis:\n{\"tech\": [\"Node.js\"], \"approach\": \"async\"}",
+    "expected_success": true,
+    "expected_field": "approach",
+    "expected_value": "async",
+    "format": "embedded",
+    "description": "JSON object after newline-separated prose header"
+  },
+  {
+    "id": "parse-embedded-006",
+    "input": "Analysis summary: {\"intent\": \"architecture\", \"confidence\": 0.95}",
+    "expected_success": true,
+    "expected_field": "intent",
+    "expected_value": "architecture",
+    "format": "embedded",
+    "description": "JSON object embedded after a label prefix"
+  },
+  {
+    "id": "parse-garbage-001",
+    "input": "This is plain English text with no JSON structure whatsoever.",
+    "expected_success": false,
+    "expected_field": null,
+    "expected_value": null,
+    "format": "garbage",
+    "description": "Completely plain text — no JSON or code block markers"
+  },
+  {
+    "id": "parse-garbage-002",
+    "input": "<response><intent>debugging</intent><status>complete</status></response>",
+    "expected_success": false,
+    "expected_field": null,
+    "expected_value": null,
+    "format": "garbage",
+    "description": "XML response — no curly braces, fails all parse strategies"
+  },
+  {
+    "id": "parse-garbage-003",
+    "input": "{intent: 'debugging', tasks: ['step1', 'step2']}",
+    "expected_success": false,
+    "expected_field": null,
+    "expected_value": null,
+    "format": "garbage",
+    "description": "JS object literal syntax (unquoted keys, single-quoted values) — invalid JSON"
+  },
+  {
+    "id": "parse-garbage-004",
+    "input": "ERROR: Connection timed out after 30 seconds. Please retry.",
+    "expected_success": false,
+    "expected_field": null,
+    "expected_value": null,
+    "format": "garbage",
+    "description": "Error message string — no JSON structure"
+  },
+  {
+    "id": "parse-garbage-005",
+    "input": "function greet(name) { console.log('Hello ' + name); }",
+    "expected_success": false,
+    "expected_field": null,
+    "expected_value": null,
+    "format": "garbage",
+    "description": "JavaScript function body — {…} present but not valid JSON"
+  },
+  {
+    "id": "parse-garbage-006",
+    "input": "---\ntitle: Analysis Report\nstatus: complete\nauthor: rlm-hook\n---",
+    "expected_success": false,
+    "expected_field": null,
+    "expected_value": null,
+    "format": "garbage",
+    "description": "YAML front-matter — no JSON structure, no curly braces"
+  }
+]

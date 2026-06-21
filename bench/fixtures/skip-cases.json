@@ -1,0 +1,352 @@
+[
+  {
+    "id": "skip-short-001",
+    "input": "ls",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (2 chars)"
+  },
+  {
+    "id": "skip-short-002",
+    "input": "pwd",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (3 chars)"
+  },
+  {
+    "id": "skip-short-003",
+    "input": "ok",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (2 chars)"
+  },
+  {
+    "id": "skip-short-004",
+    "input": "yes",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (3 chars)"
+  },
+  {
+    "id": "skip-short-005",
+    "input": "no",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (2 chars)"
+  },
+  {
+    "id": "skip-short-006",
+    "input": "thanks",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (6 chars)"
+  },
+  {
+    "id": "skip-short-007",
+    "input": "done",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (4 chars)"
+  },
+  {
+    "id": "skip-short-008",
+    "input": "help",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (4 chars)"
+  },
+  {
+    "id": "skip-short-009",
+    "input": "exit",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (4 chars)"
+  },
+  {
+    "id": "skip-short-010",
+    "input": "ok thanks a lot",
+    "expected_skip": true,
+    "category": "short",
+    "reason": "Too short (15 chars)"
+  },
+  {
+    "id": "skip-cli-001",
+    "input": "ls -la /home/coding/projects",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: ls — 28 chars, matches pattern"
+  },
+  {
+    "id": "skip-cli-002",
+    "input": "git status --short -b",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: git status — 21 chars, matches pattern"
+  },
+  {
+    "id": "skip-cli-003",
+    "input": "npm install --save-dev",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: npm — 22 chars, matches pattern"
+  },
+  {
+    "id": "skip-cli-004",
+    "input": "yarn add express --dev",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: yarn — 22 chars, matches pattern"
+  },
+  {
+    "id": "skip-cli-005",
+    "input": "cat /etc/nginx/nginx.conf",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: cat — 25 chars, matches pattern"
+  },
+  {
+    "id": "skip-cli-006",
+    "input": "echo hello world from shell",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: echo — 27 chars, matches pattern"
+  },
+  {
+    "id": "skip-cli-007",
+    "input": "cd /home/coding/claude-code-rlm",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: cd — 31 chars, matches pattern"
+  },
+  {
+    "id": "skip-cli-008",
+    "input": "npm run build --watch now",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: npm — 25 chars, matches pattern"
+  },
+  {
+    "id": "skip-cli-009",
+    "input": "git status --porcelain -u",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: git status — 25 chars, matches pattern"
+  },
+  {
+    "id": "skip-cli-010",
+    "input": "yarn install --frozen-lockfile",
+    "expected_skip": true,
+    "category": "cli-command",
+    "reason": "CLI command: yarn — 30 chars, matches pattern"
+  },
+  {
+    "id": "skip-slash-001",
+    "input": "/help",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20, also matches /^/\\w+$/)"
+  },
+  {
+    "id": "skip-slash-002",
+    "input": "/clear",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20)"
+  },
+  {
+    "id": "skip-slash-003",
+    "input": "/config",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20)"
+  },
+  {
+    "id": "skip-slash-004",
+    "input": "/exit",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20)"
+  },
+  {
+    "id": "skip-slash-005",
+    "input": "/status",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20)"
+  },
+  {
+    "id": "skip-slash-006",
+    "input": "/reset",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20)"
+  },
+  {
+    "id": "skip-slash-007",
+    "input": "/model",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20)"
+  },
+  {
+    "id": "skip-slash-008",
+    "input": "/compact",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20)"
+  },
+  {
+    "id": "skip-slash-009",
+    "input": "/history",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20)"
+  },
+  {
+    "id": "skip-slash-010",
+    "input": "/review",
+    "expected_skip": true,
+    "category": "slash-command",
+    "reason": "Slash command (length < 20)"
+  },
+  {
+    "id": "skip-complex-001",
+    "input": "How should I structure a React application with Redux for state management and TypeScript?",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "Architecture question — should NOT skip"
+  },
+  {
+    "id": "skip-complex-002",
+    "input": "Design a microservices architecture for a real-time financial trading platform with low latency.",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "System design question — should NOT skip"
+  },
+  {
+    "id": "skip-complex-003",
+    "input": "What are the best practices for securing a REST API with JWT tokens and rate limiting?",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "Security question — should NOT skip"
+  },
+  {
+    "id": "skip-complex-004",
+    "input": "Explain the tradeoffs between SQL and NoSQL databases when building a high-traffic e-commerce app.",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "Technical comparison — should NOT skip"
+  },
+  {
+    "id": "skip-complex-005",
+    "input": "How do I implement OAuth 2.0 with PKCE flow correctly in a mobile application?",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "Feature implementation question — should NOT skip"
+  },
+  {
+    "id": "skip-complex-006",
+    "input": "Refactor this service layer to use the repository pattern and add proper dependency injection.",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "Refactoring request — should NOT skip"
+  },
+  {
+    "id": "skip-complex-007",
+    "input": "Debug this race condition in the concurrent WebSocket message handler I have in my server.",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "Debugging request — should NOT skip"
+  },
+  {
+    "id": "skip-complex-008",
+    "input": "What is the optimal approach to building a data pipeline that handles one million events per second?",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "Performance architecture question — should NOT skip"
+  },
+  {
+    "id": "skip-complex-009",
+    "input": "Help me implement a zero-downtime blue-green deployment strategy for my Kubernetes application.",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "DevOps implementation question — should NOT skip"
+  },
+  {
+    "id": "skip-complex-010",
+    "input": "Explain how the CAP theorem applies to choosing between consistency and availability in my distributed system.",
+    "expected_skip": false,
+    "category": "complex-query",
+    "reason": "Distributed systems concept — should NOT skip"
+  },
+  {
+    "id": "skip-code-heavy-001",
+    "input": "Analyze these two sorting functions:\n\n```javascript\nfunction mergeSort(arr) {\n  if (arr.length <= 1) return arr;\n  const mid = Math.floor(arr.length / 2);\n  const left = mergeSort(arr.slice(0, mid));\n  const right = mergeSort(arr.slice(mid));\n  return merge(left, right);\n}\n```\n\nAnd the merge helper:\n\n```javascript\nfunction merge(left, right) {\n  const result = [];\n  let i = 0, j = 0;\n  while (i < left.length && j < right.length) {\n    if (left[i] <= right[j]) result.push(left[i++]);\n    else result.push(right[j++]);\n  }\n  return result.concat(left.slice(i)).concat(right.slice(j));\n}\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 JS code blocks, code >50% of input length"
+  },
+  {
+    "id": "skip-code-heavy-002",
+    "input": "Review these two data-processing functions:\n\n```python\ndef normalize_data(data, method='minmax'):\n    if method == 'minmax':\n        min_val = min(data)\n        max_val = max(data)\n        if max_val == min_val:\n            return [0.0] * len(data)\n        return [(x - min_val) / (max_val - min_val) for x in data]\n    elif method == 'zscore':\n        mean = sum(data) / len(data)\n        std = (sum((x - mean) ** 2 for x in data) / len(data)) ** 0.5\n        return [(x - mean) / std for x in data]\n    raise ValueError(f'Unknown method: {method}')\n```\n\nSecond function:\n\n```python\ndef batch_process(items, batch_size=100, transform=None):\n    if not items:\n        return []\n    results = []\n    for i in range(0, len(items), batch_size):\n        batch = items[i:i + batch_size]\n        if transform is not None:\n            batch = [transform(item) for item in batch]\n        results.extend(batch)\n    return results\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 Python code blocks, code >50% of input length"
+  },
+  {
+    "id": "skip-code-heavy-003",
+    "input": "Identify null-pointer risks in these TypeScript classes:\n\n```typescript\nclass UserRepository {\n  private readonly db: Database;\n  private cache: Map<string, User> = new Map();\n\n  constructor(db: Database) {\n    this.db = db;\n  }\n\n  async findById(id: string): Promise<User | null> {\n    if (this.cache.has(id)) {\n      return this.cache.get(id) ?? null;\n    }\n    const user = await this.db.query(id);\n    if (user) this.cache.set(id, user);\n    return user ?? null;\n  }\n}\n```\n\nAnd the service layer:\n\n```typescript\nclass AuthService {\n  private readonly repo: UserRepository;\n  private readonly secret: string;\n\n  constructor(repo: UserRepository, secret: string) {\n    this.repo = repo;\n    this.secret = secret;\n  }\n\n  async authenticate(userId: string, token: string): Promise<boolean> {\n    const user = await this.repo.findById(userId);\n    if (!user) return false;\n    return token.startsWith(this.secret + user.id);\n  }\n}\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 TypeScript code blocks, code >50% of input length"
+  },
+  {
+    "id": "skip-code-heavy-004",
+    "input": "What bugs do you see in these two async helpers?\n\n```javascript\nasync function fetchWithRetry(url, retries = 3) {\n  for (let attempt = 0; attempt < retries; attempt++) {\n    try {\n      const response = await fetch(url);\n      if (!response.ok) throw new Error(`HTTP ${response.status}`);\n      return await response.json();\n    } catch (err) {\n      if (attempt === retries - 1) throw err;\n      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));\n    }\n  }\n}\n```\n\nAnd its cache wrapper:\n\n```javascript\nasync function fetchCached(url, cache, ttlMs = 60000) {\n  const cached = cache.get(url);\n  if (cached && Date.now() < cached.expires) {\n    return cached.data;\n  }\n  const data = await fetchWithRetry(url);\n  cache.set(url, { data, expires: Date.now() + ttlMs });\n  return data;\n}\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 JS async code blocks, code >50% of input length"
+  },
+  {
+    "id": "skip-code-heavy-005",
+    "input": "Check these two Go functions for correctness:\n\n```go\nfunc binarySearch(arr []int, target int) int {\n\tleft, right := 0, len(arr)-1\n\tfor left <= right {\n\t\tmid := left + (right-left)/2\n\t\tif arr[mid] == target {\n\t\t\treturn mid\n\t\t} else if arr[mid] < target {\n\t\t\tleft = mid + 1\n\t\t} else {\n\t\t\tright = mid - 1\n\t\t}\n\t}\n\treturn -1\n}\n```\n\nAnd the insertion sort:\n\n```go\nfunc insertionSort(arr []int) []int {\n\tresult := make([]int, len(arr))\n\tcopy(result, arr)\n\tfor i := 1; i < len(result); i++ {\n\t\tkey := result[i]\n\t\tj := i - 1\n\t\tfor j >= 0 && result[j] > key {\n\t\t\tresult[j+1] = result[j]\n\t\t\tj--\n\t\t}\n\t\tresult[j+1] = key\n\t}\n\treturn result\n}\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 Go code blocks, code >50% of input length"
+  },
+  {
+    "id": "skip-code-heavy-006",
+    "input": "Spot any issues in these Rust functions:\n\n```rust\nfn fibonacci(n: u64) -> u64 {\n    if n <= 1 {\n        return n;\n    }\n    let mut prev = 0u64;\n    let mut curr = 1u64;\n    for _ in 2..=n {\n        let next = prev.saturating_add(curr);\n        prev = curr;\n        curr = next;\n    }\n    curr\n}\n```\n\nAnd the matrix multiplier:\n\n```rust\nfn matrix_multiply(a: &Vec<Vec<f64>>, b: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {\n    let rows = a.len();\n    let cols = b[0].len();\n    let inner = b.len();\n    let mut result = vec![vec![0.0f64; cols]; rows];\n    for i in 0..rows {\n        for k in 0..inner {\n            for j in 0..cols {\n                result[i][j] += a[i][k] * b[k][j];\n            }\n        }\n    }\n    result\n}\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 Rust code blocks, code >50% of input length"
+  },
+  {
+    "id": "skip-code-heavy-007",
+    "input": "Review these two shell utilities for portability issues:\n\n```bash\nbackup_dir() {\n  local src=\"$1\"\n  local dst=\"$2\"\n  local ts\n  ts=$(date +%Y%m%d_%H%M%S)\n  local archive=\"${dst}/backup_${ts}.tar.gz\"\n  mkdir -p \"$dst\"\n  tar -czf \"$archive\" -C \"$(dirname \"$src\")\" \"$(basename \"$src\")\"\n  echo \"Backup created: $archive\"\n}\n```\n\nAnd the restore helper:\n\n```bash\nrestore_dir() {\n  local archive=\"$1\"\n  local dst=\"$2\"\n  if [ ! -f \"$archive\" ]; then\n    echo \"Error: archive not found: $archive\" >&2\n    return 1\n  fi\n  mkdir -p \"$dst\"\n  tar -xzf \"$archive\" -C \"$dst\"\n  echo \"Restored to: $dst\"\n}\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 Bash code blocks, code >50% of input length"
+  },
+  {
+    "id": "skip-code-heavy-008",
+    "input": "Find edge cases in these Python request handlers:\n\n```python\ndef handle_register(data: dict) -> dict:\n    required = ['username', 'email', 'password']\n    for field in required:\n        if field not in data or not data[field]:\n            return {'error': f'Missing required field: {field}', 'status': 400}\n    if len(data['password']) < 8:\n        return {'error': 'Password too short', 'status': 400}\n    if '@' not in data['email']:\n        return {'error': 'Invalid email format', 'status': 400}\n    return {'status': 201, 'message': 'User created'}\n```\n\nAnd the login handler:\n\n```python\ndef handle_login(data: dict, users: dict) -> dict:\n    if 'username' not in data or 'password' not in data:\n        return {'error': 'Missing credentials', 'status': 400}\n    user = users.get(data['username'])\n    if not user or user['password'] != data['password']:\n        return {'error': 'Invalid credentials', 'status': 401}\n    token = generate_token(user['id'])\n    return {'token': token, 'status': 200}\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 Python handler code blocks, code >50% of input length"
+  },
+  {
+    "id": "skip-code-heavy-009",
+    "input": "Critique these two JavaScript event utilities:\n\n```javascript\nclass EventEmitter {\n  constructor() {\n    this._listeners = new Map();\n  }\n  on(event, listener) {\n    if (!this._listeners.has(event)) {\n      this._listeners.set(event, []);\n    }\n    this._listeners.get(event).push(listener);\n    return this;\n  }\n  emit(event, ...args) {\n    const listeners = this._listeners.get(event) || [];\n    listeners.forEach(fn => fn(...args));\n    return this;\n  }\n  off(event, listener) {\n    const list = this._listeners.get(event) || [];\n    this._listeners.set(event, list.filter(fn => fn !== listener));\n    return this;\n  }\n}\n```\n\nAnd the debounce utility:\n\n```javascript\nfunction debounce(fn, delayMs) {\n  let timerId = null;\n  return function debounced(...args) {\n    if (timerId !== null) clearTimeout(timerId);\n    timerId = setTimeout(() => {\n      timerId = null;\n      fn.apply(this, args);\n    }, delayMs);\n  };\n}\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 JS utility code blocks, code >50% of input length"
+  },
+  {
+    "id": "skip-code-heavy-010",
+    "input": "Audit these two Python CSV utilities for robustness:\n\n```python\ndef parse_csv(text: str, delimiter: str = ',') -> list:\n    rows = []\n    for line in text.strip().split('\\n'):\n        if not line.strip():\n            continue\n        fields = []\n        current = ''\n        in_quotes = False\n        for ch in line:\n            if ch == '\"':\n                in_quotes = not in_quotes\n            elif ch == delimiter and not in_quotes:\n                fields.append(current.strip())\n                current = ''\n            else:\n                current += ch\n        fields.append(current.strip())\n        rows.append(fields)\n    return rows\n```\n\nAnd the transformer:\n\n```python\ndef transform_records(rows: list, mapping: dict) -> list:\n    if not rows:\n        return []\n    headers = rows[0]\n    result = []\n    for row in rows[1:]:\n        record = {}\n        for i, header in enumerate(headers):\n            value = row[i] if i < len(row) else None\n            key = mapping.get(header, header)\n            record[key] = value\n        result.append(record)\n    return result\n```",
+    "expected_skip": true,
+    "category": "code-heavy",
+    "reason": "2 Python CSV code blocks, code >50% of input length"
+  }
+]
