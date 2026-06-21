@@ -14,7 +14,7 @@
 
 import { spawn, execSync } from 'child_process';
 import { createHash } from 'crypto';
-import { mkdir, readFile, writeFile, stat, rm } from 'fs/promises';
+import { mkdir, readFile, writeFile, stat, rm, rename } from 'fs/promises';
 import { join, basename } from 'path';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
@@ -25,6 +25,9 @@ if (process.argv.includes('--version')) {
   process.exit(0);
 }
 
+// Expand leading ~/ to the home directory (Node.js does not do shell tilde expansion)
+const expandTilde = p => (p && p.startsWith('~/')) ? join(homedir(), p.slice(2)) : p;
+
 // Configuration — all values overridable via environment variables
 const CONFIG = {
   minInputLength: parseInt(process.env.RLM_MIN_LENGTH || '20', 10),
@@ -32,8 +35,8 @@ const CONFIG = {
   cacheTTL: parseInt(process.env.RLM_CACHE_TTL || '3600', 10), // seconds
   haikuModel: process.env.RLM_MODEL || 'claude-haiku-4-5-20251001',
   timeout: parseInt(process.env.RLM_TIMEOUT || '60000', 10), // ms
-  cacheDir: process.env.RLM_CACHE_DIR || join(homedir(), '.cache', 'rlm-hook'),
-  logFile: process.env.RLM_LOG_FILE || join(homedir(), '.local', 'share', 'rlm-hook', 'rlm-hook.log'),
+  cacheDir: expandTilde(process.env.RLM_CACHE_DIR) || join(homedir(), '.cache', 'rlm-hook'),
+  logFile: expandTilde(process.env.RLM_LOG_FILE) || join(homedir(), '.local', 'share', 'rlm-hook', 'rlm-hook.log'),
   // Agentic mode: allow Haiku to use tools (Read, Glob, Grep, Write, Bash) to explore the codebase
   agenticMode: process.env.RLM_AGENTIC_MODE !== 'false',
   // Max turns for agentic exploration (each turn = one tool call cycle)
@@ -89,7 +92,9 @@ async function checkCache(key) {
 async function saveCache(key, data) {
   await mkdir(CONFIG.cacheDir, { recursive: true });
   const cacheFile = join(CONFIG.cacheDir, `${key}.json`);
-  await writeFile(cacheFile, JSON.stringify(data, null, 2));
+  const tmp = `${cacheFile}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify(data, null, 2));
+  await rename(tmp, cacheFile);
 }
 
 // =============================================================================
@@ -207,8 +212,11 @@ async function gatherConversationContext(transcriptPath, maxMessages = 5) {
       try {
         const entry = JSON.parse(line);
         if (entry.type === 'user' || entry.type === 'assistant') {
-          const text = entry.message?.content || entry.content || '';
-          if (text && typeof text === 'string') {
+          const raw = entry.message?.content || entry.content || '';
+          const text = Array.isArray(raw)
+            ? raw.filter(b => b.type === 'text').map(b => b.text).join(' ')
+            : (typeof raw === 'string' ? raw : '');
+          if (text) {
             messages.push({
               role: entry.type,
               preview: text.slice(0, 200) + (text.length > 200 ? '...' : '')
@@ -405,10 +413,9 @@ async function invokeHaiku(prompt, workingDir = null) {
     if (CONFIG.agenticMode) {
       // Enable file exploration tools + git + scratch file cleanup
       args.push('--allowedTools', 'Read,Glob,Grep,Write,Bash(git:*),Bash(rm:*)');
-    } else {
-      // No tools — pure text analysis
-      args.push('--allowedTools', '');
+      args.push('--max-turns', String(CONFIG.maxTurns));
     }
+    // Non-agentic: omit --allowedTools entirely — absence means no tools allowed
 
     const proc = spawn('claude', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -420,6 +427,7 @@ async function invokeHaiku(prompt, workingDir = null) {
 
     const timeoutId = setTimeout(() => {
       proc.kill('SIGTERM');
+      setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 2000);
       reject(new Error('Haiku invocation timed out'));
     }, CONFIG.timeout);
 
@@ -465,8 +473,8 @@ function parseHaikuResponse(response) {
     } catch {}
   }
 
-  // 3. Any JSON object in the response
-  const objectMatch = response.match(/\{[\s\S]*\}/);
+  // 3. Any JSON object in the response (non-greedy to avoid spanning multiple objects)
+  const objectMatch = response.match(/\{[\s\S]*?\}/);
   if (objectMatch) {
     try {
       return JSON.parse(objectMatch[0]);
@@ -595,8 +603,8 @@ async function main() {
       process.exit(0);
     }
 
-    // Cache lookup
-    const cacheKey = getCacheKey(userMessage);
+    // Cache lookup — include cwd so the same prompt in different projects doesn't collide
+    const cacheKey = getCacheKey(userMessage + '\0' + (cwd || ''));
     const cached = await checkCache(cacheKey);
     if (cached) {
       await log(`Cache hit for ${cacheKey.slice(0, 16)}...`);
@@ -621,16 +629,16 @@ async function main() {
       await log(`Project context: ${projectContext.projectType || 'unknown'} with ${projectContext.techStack.length} items in stack`);
     }
 
-    // Invoke Haiku
+    // Invoke Haiku — clean up scratch file in finally so it runs even on throw
     const prompt = buildRLMPrompt(truncatedMessage, projectContext, conversationContext);
-    const response = await invokeHaiku(prompt, cwd);
-
-    // Safety net: clean up scratch file if Haiku didn't delete it
-    if (CONFIG.agenticMode && cwd) {
-      const scratchFile = join(cwd, '.claude', 'rlm-scratch.md');
-      try {
-        await rm(scratchFile, { force: true });
-      } catch {}
+    const scratchFile = CONFIG.agenticMode && cwd ? join(cwd, '.claude', 'rlm-scratch.md') : null;
+    let response;
+    try {
+      response = await invokeHaiku(prompt, cwd);
+    } finally {
+      if (scratchFile) {
+        try { await rm(scratchFile, { force: true }); } catch {}
+      }
     }
 
     // Parse and validate
@@ -647,7 +655,7 @@ async function main() {
 
     await log('RLM analysis complete');
   } catch (error) {
-    await log(`ERROR: ${error.message}`);
+    await log(`ERROR: ${String(error?.message ?? error)}`);
     // Always exit 0 — never block the user's conversation
     process.exit(0);
   }
