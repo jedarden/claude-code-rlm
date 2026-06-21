@@ -1,0 +1,21 @@
+{
+  "name": "claude-code-rlm",
+  "version": "0.1.0",
+  "description": "Preresearch hook for Claude Code — runs Haiku to explore your codebase before Opus/Sonnet",
+  "type": "module",
+  "bin": {
+    "rlm-hook": "./rlm-hook.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/unit.test.mjs",
+    "test:integration": "RUN_INTEGRATION_TESTS=1 node --test test/integration.test.mjs",
+    "bench": "node bench/benchmark.mjs",
+    "install-hook": "bash install.sh"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["claude", "claude-code", "hook", "preresearch", "haiku", "llm"],
+  "license": "MIT",
+  "author": "jedarden"
+}
