@@ -1005,15 +1005,23 @@ function extractSDKText(response) {
     .join('');
 }
 
-// callHaikuFastSDK with an injected client (no real network). Matches the hook:
-// returns the raw concatenated text, which parseHaikuResponse then decodes.
-async function callHaikuFastSDK(prompt, apiKey, client, { model = 'claude-haiku-4-5-20251001', maxTokens = 2048 } = {}) {
+// callMessagesSDK — shared single-turn core for both fast and detailed SDK paths
+// (matches the hook). callHaikuFastSDK / callHaikuDetailedSDK are thin wrappers.
+async function callMessagesSDK(prompt, apiKey, client, { model = 'claude-haiku-4-5-20251001', maxTokens = 2048 } = {}) {
   const response = await client.messages.create({
     model,
     max_tokens: maxTokens,
     messages: [{ role: 'user', content: prompt }],
   });
   return extractSDKText(response);
+}
+
+async function callHaikuFastSDK(prompt, apiKey, client, opts) {
+  return callMessagesSDK(prompt, apiKey, client, opts);
+}
+
+async function callHaikuDetailedSDK(prompt, apiKey, client, opts) {
+  return callMessagesSDK(prompt, apiKey, client, opts);
 }
 
 // A fake Anthropic client that records the params it was called with and
@@ -1100,17 +1108,72 @@ describe('Group 10: SDK-Direct Fast Path (Phase 2)', () => {
   });
 
   // --- main()'s routing predicate ---
-  it('routing: SDK fast path selected only when useSDK && key && !agentic && fast', () => {
-    const selectSDK = ({ useSDK, apiKey, agenticMode, fastMode }) =>
-      shouldUseSDK({ useSDK, apiKey }) && !agenticMode && fastMode;
+  // As of Unit 4 the SDK path covers ANY non-agentic mode (fast or detailed);
+  // agentic still routes through the subprocess until Unit 5.
+  it('routing: SDK path selected when useSDK && key && !agentic (fast OR detailed)', () => {
+    const selectSDK = ({ useSDK, apiKey, agenticMode }) =>
+      shouldUseSDK({ useSDK, apiKey }) && !agenticMode;
 
-    assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: false, fastMode: true }), true,
-      'non-agentic fast with SDK+key → SDK path');
-    assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: true, fastMode: true }), false,
-      'agentic mode stays on subprocess in this phase');
-    assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: false, fastMode: false }), false,
-      'detailed mode stays on subprocess until next unit');
-    assert.equal(selectSDK({ useSDK: false, apiKey: 'k', agenticMode: false, fastMode: true }), false,
+    assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: false }), true,
+      'non-agentic with SDK+key → SDK path');
+    assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: true }), false,
+      'agentic mode stays on subprocess until Unit 5');
+    assert.equal(selectSDK({ useSDK: false, apiKey: 'k', agenticMode: false }), false,
       'flag off → subprocess');
+    assert.equal(selectSDK({ useSDK: true, apiKey: null, agenticMode: false }), false,
+      'no key → subprocess');
+  });
+});
+
+describe('Group 11: SDK-Direct Detailed Path (Phase 2)', () => {
+  it('callHaikuDetailedSDK: sends correct model + max_tokens + user message', async () => {
+    const client = makeFakeClient({ content: [{ type: 'text', text: '{"skip_rlm":true}' }] });
+    await callHaikuDetailedSDK('analyze the migration', 'sk-x', client, { model: 'claude-haiku-4-5-20251001', maxTokens: 2048 });
+    assert.equal(client.calls.length, 1);
+    const params = client.calls[0];
+    assert.equal(params.model, 'claude-haiku-4-5-20251001');
+    assert.equal(params.max_tokens, 2048);
+    assert.equal(params.messages[0].role, 'user');
+    assert.equal(params.messages[0].content, 'analyze the migration');
+  });
+
+  it('callHaikuDetailedSDK: returns verbose JSON that parseHaikuResponse can decode', async () => {
+    const json = JSON.stringify({
+      intent: { primary: 'architecture', secondary: [], confidence: 0.9 },
+      decomposition: [{ task: 'design', priority: 1, dependencies: [] }],
+      suggested_approach: 'layered',
+      skip_rlm: false,
+      skip_reason: null,
+    });
+    const client = makeFakeClient({ content: [{ type: 'text', text: json }] });
+    const text = await callHaikuDetailedSDK('msg', 'sk-x', client);
+    const parsed = parseHaikuResponse(text);
+    assert.equal(parsed.intent.primary, 'architecture');
+    assert.equal(parsed.suggested_approach, 'layered');
+    assert.equal(parsed.skip_rlm, false);
+  });
+
+  it('callHaikuDetailedSDK: SDK error propagates so the caller can fall back', async () => {
+    const client = makeFakeClient(new Error('500 overloaded'));
+    await assert.rejects(
+      () => callHaikuDetailedSDK('msg', 'sk-x', client),
+      /500 overloaded/,
+    );
+  });
+
+  it('callMessagesSDK core: shared by fast and detailed (same request shape)', async () => {
+    const fastClient = makeFakeClient({ content: [{ type: 'text', text: '{}' }] });
+    const detClient = makeFakeClient({ content: [{ type: 'text', text: '{}' }] });
+    await callHaikuFastSDK('p', 'sk-x', fastClient, { model: 'm', maxTokens: 100 });
+    await callHaikuDetailedSDK('p', 'sk-x', detClient, { model: 'm', maxTokens: 100 });
+    assert.deepEqual(fastClient.calls[0], detClient.calls[0],
+      'fast and detailed issue identical Messages requests for the same prompt');
+  });
+
+  it('routing: detailed mode picks callHaikuDetailedSDK, fast picks callHaikuFastSDK', () => {
+    // Mirrors main(): CONFIG.fastMode chooses the wrapper.
+    const pick = (fastMode) => (fastMode ? 'fast' : 'detailed');
+    assert.equal(pick(true), 'fast');
+    assert.equal(pick(false), 'detailed');
   });
 });

@@ -500,11 +500,13 @@ async function createAnthropicClient(apiKey) {
 }
 
 /**
- * callHaikuFastSDK — single-turn, tool-free Messages call. Mirrors invokeHaiku's
- * contract: returns the raw model text, which main() hands to parseHaikuResponse.
- * `client` is injectable for testing; in production it is created lazily.
+ * callMessagesSDK — shared single-turn, tool-free Messages call used by both the
+ * fast and detailed SDK paths (they differ only in the prompt buildRLMPrompt
+ * produced and the log label). Mirrors invokeHaiku's contract: returns the raw
+ * model text, which main() hands to parseHaikuResponse. `client` is injectable
+ * for testing; in production it is created lazily.
  */
-async function callHaikuFastSDK(prompt, apiKey, client = null) {
+async function callMessagesSDK(prompt, apiKey, client = null, label = 'single-turn') {
   const startTime = Date.now();
   const c = client || await createAnthropicClient(apiKey);
   const response = await c.messages.create({
@@ -512,8 +514,23 @@ async function callHaikuFastSDK(prompt, apiKey, client = null) {
     max_tokens: CONFIG.sdkMaxTokens,
     messages: [{ role: 'user', content: prompt }],
   });
-  await log(`Haiku SDK (fast) completed in ${Date.now() - startTime}ms`);
+  await log(`Haiku SDK (${label}) completed in ${Date.now() - startTime}ms`);
   return extractSDKText(response);
+}
+
+/**
+ * callHaikuFastSDK — single-turn fast-mode analysis via the SDK.
+ */
+async function callHaikuFastSDK(prompt, apiKey, client = null) {
+  return callMessagesSDK(prompt, apiKey, client, 'fast');
+}
+
+/**
+ * callHaikuDetailedSDK — single-turn detailed (verbose) analysis via the SDK.
+ * Mechanically identical to the fast path; the verbosity lives in the prompt.
+ */
+async function callHaikuDetailedSDK(prompt, apiKey, client = null) {
+  return callMessagesSDK(prompt, apiKey, client, 'detailed');
 }
 
 // =============================================================================
@@ -696,15 +713,19 @@ async function main() {
 
     let response = null;
 
-    // SDK-Direct fast path (Phase 2): non-agentic fast mode can skip the
-    // subprocess entirely. On any SDK error, fall through to the subprocess so
-    // the hook never breaks just because the SDK/key path is misconfigured.
-    if (shouldUseSDK() && !CONFIG.agenticMode && CONFIG.fastMode) {
+    // SDK-Direct path (Phase 2): any non-agentic mode (fast or detailed) can skip
+    // the subprocess entirely — both are single-turn, tool-free calls that differ
+    // only in the prompt. On any SDK error, fall through to the subprocess so the
+    // hook never breaks just because the SDK/key path is misconfigured.
+    if (shouldUseSDK() && !CONFIG.agenticMode) {
+      const label = CONFIG.fastMode ? 'fast' : 'detailed';
       try {
-        response = await callHaikuFastSDK(prompt, CONFIG.apiKey);
-        await log('Used SDK-Direct fast path');
+        response = CONFIG.fastMode
+          ? await callHaikuFastSDK(prompt, CONFIG.apiKey)
+          : await callHaikuDetailedSDK(prompt, CONFIG.apiKey);
+        await log(`Used SDK-Direct ${label} path`);
       } catch (err) {
-        await log(`SDK fast path failed, falling back to subprocess: ${String(err?.message ?? err)}`);
+        await log(`SDK ${label} path failed, falling back to subprocess: ${String(err?.message ?? err)}`);
         response = null;
       }
     }
