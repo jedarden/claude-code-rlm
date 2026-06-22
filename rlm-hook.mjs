@@ -45,6 +45,12 @@ const CONFIG = {
   fastMode: process.env.RLM_FAST_MODE !== 'false',
   // Context gathering: detect project type, git state, recent files
   gatherContext: process.env.RLM_GATHER_CONTEXT !== 'false',
+  // SDK-Direct mode (Phase 2): call the Anthropic API directly instead of the
+  // `claude` subprocess. Requires RLM_USE_SDK=true AND ANTHROPIC_API_KEY set —
+  // otherwise we fall back to the subprocess path (unchanged behavior).
+  useSDK: process.env.RLM_USE_SDK === 'true',
+  apiKey: process.env.ANTHROPIC_API_KEY || null,
+  sdkMaxTokens: parseInt(process.env.RLM_SDK_MAX_TOKENS || '2048', 10),
   // Debug mode
   debug: process.env.RLM_DEBUG === 'true',
 };
@@ -456,6 +462,61 @@ async function invokeHaiku(prompt, workingDir = null) {
 }
 
 // =============================================================================
+// SDK-DIRECT INVOCATION (Phase 2)
+// =============================================================================
+
+/**
+ * shouldUseSDK — true only when SDK-Direct mode is explicitly enabled AND an
+ * API key is present. Anything else routes through the subprocess path so the
+ * hook keeps working with a bare Max subscription (no key on disk).
+ */
+function shouldUseSDK() {
+  return CONFIG.useSDK && !!CONFIG.apiKey;
+}
+
+/**
+ * extractSDKText — concatenate the text from an Anthropic Messages response.
+ * The API returns `content` as an array of typed blocks; we want only the
+ * `text` blocks joined in order. Defensive against missing/partial shapes so a
+ * malformed response degrades to '' rather than throwing.
+ */
+function extractSDKText(response) {
+  if (!response || !Array.isArray(response.content)) return '';
+  return response.content
+    .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+    .map(b => b.text)
+    .join('');
+}
+
+/**
+ * createAnthropicClient — lazily import the SDK and construct a client. Kept
+ * separate so callers can inject a fake client in tests instead of importing
+ * the dependency. Throws if the SDK is not installed (caught by the caller,
+ * which falls back to the subprocess path).
+ */
+async function createAnthropicClient(apiKey) {
+  const { default: Anthropic } = await import('@anthropic-ai/sdk');
+  return new Anthropic({ apiKey });
+}
+
+/**
+ * callHaikuFastSDK — single-turn, tool-free Messages call. Mirrors invokeHaiku's
+ * contract: returns the raw model text, which main() hands to parseHaikuResponse.
+ * `client` is injectable for testing; in production it is created lazily.
+ */
+async function callHaikuFastSDK(prompt, apiKey, client = null) {
+  const startTime = Date.now();
+  const c = client || await createAnthropicClient(apiKey);
+  const response = await c.messages.create({
+    model: CONFIG.haikuModel,
+    max_tokens: CONFIG.sdkMaxTokens,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  await log(`Haiku SDK (fast) completed in ${Date.now() - startTime}ms`);
+  return extractSDKText(response);
+}
+
+// =============================================================================
 // RESPONSE PARSING
 // =============================================================================
 
@@ -632,12 +693,29 @@ async function main() {
     // Invoke Haiku — clean up scratch file in finally so it runs even on throw
     const prompt = buildRLMPrompt(truncatedMessage, projectContext, conversationContext);
     const scratchFile = CONFIG.agenticMode && cwd ? join(cwd, '.claude', 'rlm-scratch.md') : null;
-    let response;
-    try {
-      response = await invokeHaiku(prompt, cwd);
-    } finally {
-      if (scratchFile) {
-        try { await rm(scratchFile, { force: true }); } catch {}
+
+    let response = null;
+
+    // SDK-Direct fast path (Phase 2): non-agentic fast mode can skip the
+    // subprocess entirely. On any SDK error, fall through to the subprocess so
+    // the hook never breaks just because the SDK/key path is misconfigured.
+    if (shouldUseSDK() && !CONFIG.agenticMode && CONFIG.fastMode) {
+      try {
+        response = await callHaikuFastSDK(prompt, CONFIG.apiKey);
+        await log('Used SDK-Direct fast path');
+      } catch (err) {
+        await log(`SDK fast path failed, falling back to subprocess: ${String(err?.message ?? err)}`);
+        response = null;
+      }
+    }
+
+    if (response === null) {
+      try {
+        response = await invokeHaiku(prompt, cwd);
+      } finally {
+        if (scratchFile) {
+          try { await rm(scratchFile, { force: true }); } catch {}
+        }
       }
     }
 

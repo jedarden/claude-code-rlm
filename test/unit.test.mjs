@@ -984,3 +984,133 @@ describe('Group 9: RLM Prompt Building (buildRLMPrompt)', () => {
     assert.doesNotThrow(() => buildRLMPrompt(msg, null, null, { agenticMode: false, fastMode: false }));
   });
 });
+
+// ============================================================================
+// GROUP 10: SDK-DIRECT FAST PATH (Phase 2)
+// ============================================================================
+
+// Inlined from rlm-hook.mjs. shouldUseSDK takes explicit config so we can probe
+// each combination without mutating process.env.
+function shouldUseSDK({ useSDK, apiKey }) {
+  return !!useSDK && !!apiKey;
+}
+
+// extractSDKText — concatenate text blocks from an Anthropic Messages response,
+// ignoring non-text blocks and degrading to '' on a malformed shape.
+function extractSDKText(response) {
+  if (!response || !Array.isArray(response.content)) return '';
+  return response.content
+    .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+    .map(b => b.text)
+    .join('');
+}
+
+// callHaikuFastSDK with an injected client (no real network). Matches the hook:
+// returns the raw concatenated text, which parseHaikuResponse then decodes.
+async function callHaikuFastSDK(prompt, apiKey, client, { model = 'claude-haiku-4-5-20251001', maxTokens = 2048 } = {}) {
+  const response = await client.messages.create({
+    model,
+    max_tokens: maxTokens,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  return extractSDKText(response);
+}
+
+// A fake Anthropic client that records the params it was called with and
+// returns a canned content-block response (or throws a canned error).
+function makeFakeClient(responseOrError) {
+  const calls = [];
+  return {
+    calls,
+    messages: {
+      create: async (params) => {
+        calls.push(params);
+        if (responseOrError instanceof Error) throw responseOrError;
+        return responseOrError;
+      },
+    },
+  };
+}
+
+describe('Group 10: SDK-Direct Fast Path (Phase 2)', () => {
+  // --- shouldUseSDK gating ---
+  it('shouldUseSDK: true only when useSDK AND apiKey present', () => {
+    assert.equal(shouldUseSDK({ useSDK: true, apiKey: 'sk-x' }), true);
+    assert.equal(shouldUseSDK({ useSDK: true, apiKey: null }), false, 'no key → false');
+    assert.equal(shouldUseSDK({ useSDK: false, apiKey: 'sk-x' }), false, 'flag off → false');
+    assert.equal(shouldUseSDK({ useSDK: false, apiKey: null }), false);
+  });
+
+  it('shouldUseSDK: empty-string key counts as absent', () => {
+    assert.equal(shouldUseSDK({ useSDK: true, apiKey: '' }), false);
+  });
+
+  // --- extractSDKText ---
+  it('extractSDKText: joins text blocks in order', () => {
+    const resp = { content: [
+      { type: 'text', text: 'Hello ' },
+      { type: 'text', text: 'world' },
+    ] };
+    assert.equal(extractSDKText(resp), 'Hello world');
+  });
+
+  it('extractSDKText: ignores non-text blocks (tool_use etc.)', () => {
+    const resp = { content: [
+      { type: 'text', text: '{"intent":' },
+      { type: 'tool_use', id: 't1', name: 'Glob', input: {} },
+      { type: 'text', text: '"debugging"}' },
+    ] };
+    assert.equal(extractSDKText(resp), '{"intent":"debugging"}');
+  });
+
+  it('extractSDKText: missing/empty content → empty string (no throw)', () => {
+    assert.equal(extractSDKText(null), '');
+    assert.equal(extractSDKText({}), '');
+    assert.equal(extractSDKText({ content: [] }), '');
+    assert.equal(extractSDKText({ content: [{ type: 'image' }] }), '');
+  });
+
+  // --- callHaikuFastSDK ---
+  it('callHaikuFastSDK: sends correct model + max_tokens + user message', async () => {
+    const client = makeFakeClient({ content: [{ type: 'text', text: '{"skip":true}' }] });
+    await callHaikuFastSDK('explore the auth module', 'sk-x', client, { model: 'claude-haiku-4-5-20251001', maxTokens: 1024 });
+    assert.equal(client.calls.length, 1);
+    const params = client.calls[0];
+    assert.equal(params.model, 'claude-haiku-4-5-20251001');
+    assert.equal(params.max_tokens, 1024);
+    assert.equal(params.messages[0].role, 'user');
+    assert.equal(params.messages[0].content, 'explore the auth module');
+  });
+
+  it('callHaikuFastSDK: returns raw text that parseHaikuResponse can decode', async () => {
+    const json = '{"intent":"code_writing","tasks":["a","b"]}';
+    const client = makeFakeClient({ content: [{ type: 'text', text: json }] });
+    const text = await callHaikuFastSDK('msg', 'sk-x', client);
+    const parsed = parseHaikuResponse(text);
+    assert.equal(parsed.intent, 'code_writing');
+    assert.deepEqual(parsed.tasks, ['a', 'b']);
+  });
+
+  it('callHaikuFastSDK: SDK error propagates so the caller can fall back', async () => {
+    const client = makeFakeClient(new Error('429 rate limit'));
+    await assert.rejects(
+      () => callHaikuFastSDK('msg', 'sk-x', client),
+      /429 rate limit/,
+    );
+  });
+
+  // --- main()'s routing predicate ---
+  it('routing: SDK fast path selected only when useSDK && key && !agentic && fast', () => {
+    const selectSDK = ({ useSDK, apiKey, agenticMode, fastMode }) =>
+      shouldUseSDK({ useSDK, apiKey }) && !agenticMode && fastMode;
+
+    assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: false, fastMode: true }), true,
+      'non-agentic fast with SDK+key → SDK path');
+    assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: true, fastMode: true }), false,
+      'agentic mode stays on subprocess in this phase');
+    assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: false, fastMode: false }), false,
+      'detailed mode stays on subprocess until next unit');
+    assert.equal(selectSDK({ useSDK: false, apiKey: 'k', agenticMode: false, fastMode: true }), false,
+      'flag off → subprocess');
+  });
+});
