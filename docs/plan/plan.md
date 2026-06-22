@@ -33,7 +33,7 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 
 ---
 
-## Phase 1 — Core Hook (COMPLETE ✅)
+## Phase 1 — Core Hook (COMPLETE ✅) `[x]`
 
 **Deliverables:**
 - `rlm-hook.mjs`: main hook implementation
@@ -59,7 +59,7 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 
 ---
 
-## Phase 2 — SDK-Direct Mode
+## Phase 2 — SDK-Direct Mode `[ ]`
 
 **Goal:** Bypass the `claude` subprocess and call the Anthropic API directly, reducing latency from ~4s to ~800ms.
 
@@ -86,7 +86,7 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 
 ---
 
-## Phase 3 — Semantic Caching
+## Phase 3 — Semantic Caching `[ ]`
 
 **Goal:** Cache hits based on semantic similarity, not exact SHA-256 match. Two prompts that are 90% similar should reuse the same analysis.
 
@@ -114,7 +114,7 @@ cache/
 
 ---
 
-## Phase 4 — Conversation Context Awareness
+## Phase 4 — Conversation Context Awareness `[ ]`
 
 **Goal:** Read the recent conversation transcript and use it to skip redundant exploration. If Haiku explored `src/auth/` two turns ago and the user is still working on auth, don't re-explore.
 
@@ -135,7 +135,7 @@ cache/
 
 ---
 
-## Phase 5 — Metrics Dashboard
+## Phase 5 — Metrics Dashboard `[ ]`
 
 **Goal:** Understand hook performance in production: hit rate, skip rate, latency distribution, model cost.
 
