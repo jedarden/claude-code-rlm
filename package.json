@@ -15,7 +15,17 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "keywords": ["claude", "claude-code", "hook", "preresearch", "haiku", "llm"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "hook",
+    "preresearch",
+    "haiku",
+    "llm"
+  ],
   "license": "MIT",
-  "author": "jedarden"
+  "author": "jedarden",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.105.0"
+  }
 }
