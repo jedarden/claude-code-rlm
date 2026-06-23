@@ -1747,3 +1747,131 @@ describe('Group 13: SDK Routing & Client Hardening (Phase 2)', () => {
     assert.equal(takeSubprocess(null), true, 'null response → subprocess runs');
   });
 });
+
+// ============================================================================
+// PHASE 3 — SEMANTIC CACHE: embedding helper (inlined from rlm-hook.mjs)
+// ============================================================================
+
+// embedText — faithful copy of the hook's embedText. `fetchImpl` is injected so
+// tests drive it without a network; throws on every failure mode so the caller
+// can degrade to plain SHA-256 lookup.
+async function embedText(text, apiKey, {
+  fetchImpl,
+  model = 'text-embedding-3-small',
+  baseUrl = 'https://api.openai.com/v1',
+} = {}) {
+  if (!apiKey) throw new Error('embedText: no embedding API key');
+  if (typeof text !== 'string' || text.length === 0) {
+    throw new Error('embedText: empty input');
+  }
+  const res = await fetchImpl(`${baseUrl}/embeddings`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ model, input: text }),
+  });
+  if (!res || !res.ok) {
+    throw new Error(`embedText: HTTP ${res ? res.status : 'no-response'}`);
+  }
+  const json = await res.json();
+  const vec = json && json.data && json.data[0] && json.data[0].embedding;
+  if (!Array.isArray(vec) || vec.length === 0) {
+    throw new Error('embedText: malformed embedding response');
+  }
+  return Float32Array.from(vec);
+}
+
+// makeFakeFetch — records the (url, init) it was called with and returns a
+// canned Response-like object. Pass an Error to make the fetch itself reject, or
+// `{ ok, status, body }` to shape the HTTP response.
+function makeFakeFetch(spec) {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    if (spec instanceof Error) throw spec;
+    return {
+      ok: spec.ok !== undefined ? spec.ok : true,
+      status: spec.status !== undefined ? spec.status : 200,
+      json: async () => spec.body,
+    };
+  };
+  fetchImpl.calls = calls;
+  return fetchImpl;
+}
+
+describe('Group 14: Semantic Cache — embedText (Phase 3)', () => {
+  const okBody = { data: [{ embedding: [0.1, -0.2, 0.3, 0.4] }] };
+
+  it('returns a Float32Array of the embedding vector', async () => {
+    const fetchImpl = makeFakeFetch({ body: okBody });
+    const vec = await embedText('explore auth', 'sk-openai', { fetchImpl });
+    assert.ok(vec instanceof Float32Array, 'is a Float32Array');
+    assert.equal(vec.length, 4);
+    // Float32 narrows precision — compare with a tolerance.
+    assert.ok(Math.abs(vec[0] - 0.1) < 1e-6);
+    assert.ok(Math.abs(vec[1] - -0.2) < 1e-6);
+    assert.ok(Math.abs(vec[3] - 0.4) < 1e-6);
+  });
+
+  it('POSTs to <baseUrl>/embeddings with model, input and bearer auth', async () => {
+    const fetchImpl = makeFakeFetch({ body: okBody });
+    await embedText('the prompt text', 'sk-openai', { fetchImpl });
+    assert.equal(fetchImpl.calls.length, 1);
+    const { url, init } = fetchImpl.calls[0];
+    assert.equal(url, 'https://api.openai.com/v1/embeddings');
+    assert.equal(init.method, 'POST');
+    assert.equal(init.headers.Authorization, 'Bearer sk-openai');
+    assert.equal(init.headers['Content-Type'], 'application/json');
+    const sent = JSON.parse(init.body);
+    assert.equal(sent.model, 'text-embedding-3-small');
+    assert.equal(sent.input, 'the prompt text');
+  });
+
+  it('honors injected model and baseUrl', async () => {
+    const fetchImpl = makeFakeFetch({ body: okBody });
+    await embedText('x', 'sk-x', { fetchImpl, model: 'nomic-embed-text', baseUrl: 'http://localhost:11434/v1' });
+    const { url, init } = fetchImpl.calls[0];
+    assert.equal(url, 'http://localhost:11434/v1/embeddings');
+    assert.equal(JSON.parse(init.body).model, 'nomic-embed-text');
+  });
+
+  it('throws when no API key is provided (degrades to SHA-256)', async () => {
+    const fetchImpl = makeFakeFetch({ body: okBody });
+    await assert.rejects(() => embedText('x', null, { fetchImpl }), /no embedding API key/);
+    await assert.rejects(() => embedText('x', '', { fetchImpl }), /no embedding API key/);
+    assert.equal(fetchImpl.calls.length, 0, 'never hits the network without a key');
+  });
+
+  it('throws on empty / non-string input', async () => {
+    const fetchImpl = makeFakeFetch({ body: okBody });
+    await assert.rejects(() => embedText('', 'sk-x', { fetchImpl }), /empty input/);
+    await assert.rejects(() => embedText(null, 'sk-x', { fetchImpl }), /empty input/);
+  });
+
+  it('throws on a non-2xx HTTP response', async () => {
+    const fetchImpl = makeFakeFetch({ ok: false, status: 429, body: {} });
+    await assert.rejects(() => embedText('x', 'sk-x', { fetchImpl }), /HTTP 429/);
+  });
+
+  it('throws when fetch itself rejects (network error)', async () => {
+    const fetchImpl = makeFakeFetch(new Error('ECONNREFUSED'));
+    await assert.rejects(() => embedText('x', 'sk-x', { fetchImpl }), /ECONNREFUSED/);
+  });
+
+  it('throws on a malformed body (no data/embedding)', async () => {
+    await assert.rejects(
+      () => embedText('x', 'sk-x', { fetchImpl: makeFakeFetch({ body: {} }) }),
+      /malformed embedding response/,
+    );
+    await assert.rejects(
+      () => embedText('x', 'sk-x', { fetchImpl: makeFakeFetch({ body: { data: [] } }) }),
+      /malformed embedding response/,
+    );
+    await assert.rejects(
+      () => embedText('x', 'sk-x', { fetchImpl: makeFakeFetch({ body: { data: [{ embedding: [] }] } }) }),
+      /malformed embedding response/,
+    );
+  });
+});
