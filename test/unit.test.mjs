@@ -1783,6 +1783,21 @@ async function embedText(text, apiKey, {
   return Float32Array.from(vec);
 }
 
+// cosineSimilarity — faithful copy of the hook's cosineSimilarity. Pure math.
+function cosineSimilarity(a, b) {
+  if (a.length !== b.length) {
+    throw new Error(`cosineSimilarity: length mismatch (${a.length} vs ${b.length})`);
+  }
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  if (magA === 0 || magB === 0) return 0;
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
 // makeFakeFetch — records the (url, init) it was called with and returns a
 // canned Response-like object. Pass an Error to make the fetch itself reject, or
 // `{ ok, status, body }` to shape the HTTP response.
@@ -1873,5 +1888,48 @@ describe('Group 14: Semantic Cache — embedText (Phase 3)', () => {
       () => embedText('x', 'sk-x', { fetchImpl: makeFakeFetch({ body: { data: [{ embedding: [] }] } }) }),
       /malformed embedding response/,
     );
+  });
+});
+
+describe('Group 15: Semantic Cache — cosineSimilarity (Phase 3)', () => {
+  it('returns 1 for identical vectors', () => {
+    const a = [1, 2, 3, 4];
+    assert.ok(Math.abs(cosineSimilarity(a, a) - 1) < 1e-9);
+    assert.ok(Math.abs(cosineSimilarity(a, [...a]) - 1) < 1e-9);
+  });
+
+  it('returns 0 for orthogonal vectors', () => {
+    assert.equal(cosineSimilarity([1, 0], [0, 1]), 0);
+    assert.equal(cosineSimilarity([1, 0, 0], [0, 5, 0]), 0);
+  });
+
+  it('returns -1 for opposite (antiparallel) vectors', () => {
+    assert.ok(Math.abs(cosineSimilarity([1, 2, 3], [-1, -2, -3]) - -1) < 1e-9);
+    assert.ok(Math.abs(cosineSimilarity([2, 0], [-3, 0]) - -1) < 1e-9);
+  });
+
+  it('matches a hand-computed pair', () => {
+    // a=[1,2,3], b=[4,5,6]: dot=32, ‖a‖=√14, ‖b‖=√77 → 32/√1078 ≈ 0.974631846
+    const cos = cosineSimilarity([1, 2, 3], [4, 5, 6]);
+    assert.ok(Math.abs(cos - 0.9746318461970762) < 1e-12, `got ${cos}`);
+  });
+
+  it('returns 0 when either vector has zero magnitude (no NaN)', () => {
+    assert.equal(cosineSimilarity([0, 0, 0], [1, 2, 3]), 0);
+    assert.equal(cosineSimilarity([1, 2, 3], [0, 0, 0]), 0);
+    assert.equal(cosineSimilarity([0, 0], [0, 0]), 0);
+    assert.ok(!Number.isNaN(cosineSimilarity([0, 0, 0], [1, 2, 3])));
+  });
+
+  it('throws on a length mismatch (corrupt/foreign vector)', () => {
+    assert.throws(() => cosineSimilarity([1, 2], [1, 2, 3]), /length mismatch \(2 vs 3\)/);
+    assert.throws(() => cosineSimilarity([1, 2, 3], [1]), /length mismatch \(3 vs 1\)/);
+  });
+
+  it('accepts Float32Array inputs', () => {
+    const a = Float32Array.from([1, 0, 0]);
+    const b = Float32Array.from([1, 0, 0]);
+    assert.ok(Math.abs(cosineSimilarity(a, b) - 1) < 1e-6);
+    assert.equal(cosineSimilarity(Float32Array.from([1, 0]), Float32Array.from([0, 1])), 0);
   });
 });

@@ -881,6 +881,32 @@ async function embedText(text, apiKey, {
   return Float32Array.from(vec);
 }
 
+/**
+ * cosineSimilarity — cosine of the angle between two equal-length numeric
+ * vectors: (a · b) / (‖a‖ · ‖b‖). Pure math, no deps; accepts Float32Array or
+ * plain number arrays. Returns a value in [-1, 1].
+ *
+ * Edge-case contract:
+ *  - Length mismatch → THROWS. Embeddings are fixed-dimension, so unequal
+ *    lengths signal a corrupt or foreign vector; fail loudly rather than
+ *    silently scoring a truncated overlap.
+ *  - Either vector has zero magnitude → returns 0. The angle is undefined; 0
+ *    keeps the pair below any positive similarity threshold instead of NaN.
+ */
+function cosineSimilarity(a, b) {
+  if (a.length !== b.length) {
+    throw new Error(`cosineSimilarity: length mismatch (${a.length} vs ${b.length})`);
+  }
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  if (magA === 0 || magB === 0) return 0;
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
 // =============================================================================
 // RESPONSE PARSING
 // =============================================================================
