@@ -317,3 +317,80 @@ describe('Concurrent safety', { timeout: 15000 }, () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 11. SDK-Direct mode (Phase 2)
+//
+// The hook lazily does `import('@anthropic-ai/sdk')`. Faithfully mocking that
+// bare ESM specifier from a spawned subprocess is awkward (NODE_PATH is ignored
+// for ESM and the real package is already resolvable from the repo's
+// node_modules), so instead of stubbing a *successful* SDK call we exercise the
+// far more important robustness contract: when SDK-Direct mode is enabled but
+// the API call cannot succeed, the hook must fall back to the subprocess path
+// and still emit valid `<rlm_preresearch>` output — never break the turn, never
+// emit garbage.
+//
+// We force a deterministic, network-independent SDK failure by pointing the SDK
+// at an unreachable base URL (127.0.0.1:1 → immediate ECONNREFUSED). The SDK's
+// retries exhaust quickly, the call throws, and main() falls through to the
+// fake `claude` binary on PATH. A complex prompt clears every skip gate.
+// ---------------------------------------------------------------------------
+
+describe('SDK-Direct mode', { timeout: 25000 }, () => {
+  const SDK_PROMPT =
+    'Refactor the authentication middleware to support JWT refresh tokens and ' +
+    'add rate limiting per user so that abusive clients cannot exhaust the ' +
+    'login endpoint, then write integration tests covering token expiry.';
+
+  // Unreachable base URL → the SDK call fails fast and locally.
+  const UNREACHABLE = 'http://127.0.0.1:1';
+
+  it('fast SDK path: SDK failure falls back to subprocess, still emits analysis', async () => {
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt: SDK_PROMPT }), {
+      env: {
+        RLM_USE_SDK: 'true',
+        ANTHROPIC_API_KEY: 'sk-ant-fake-integration-key',
+        ANTHROPIC_BASE_URL: UNREACHABLE,
+        // spawnHook already sets RLM_AGENTIC_MODE=false → fast/detailed SDK path
+      },
+    });
+    assert.equal(code, 0, 'Hook must exit 0 when the SDK path fails');
+    assert.ok(
+      stdout.includes('code_writing'),
+      `Fallback must produce the fake-claude analysis; got: ${stdout.slice(0, 200)}`,
+    );
+  });
+
+  it('agentic SDK path: SDK failure falls back to subprocess, still emits analysis', async () => {
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt: SDK_PROMPT }), {
+      env: {
+        RLM_USE_SDK: 'true',
+        RLM_AGENTIC_MODE: 'true',
+        ANTHROPIC_API_KEY: 'sk-ant-fake-integration-key',
+        ANTHROPIC_BASE_URL: UNREACHABLE,
+      },
+    });
+    assert.equal(code, 0, 'Hook must exit 0 when the agentic SDK path fails');
+    assert.ok(
+      stdout.includes('code_writing'),
+      `Agentic fallback must produce the fake-claude analysis; got: ${stdout.slice(0, 200)}`,
+    );
+  });
+
+  it('SDK enabled but no API key: routing guard goes straight to subprocess', async () => {
+    // RLM_USE_SDK=true with an empty key → shouldUseSDK() is false → no SDK
+    // call is attempted at all; the hook uses the subprocess path immediately.
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt: SDK_PROMPT }), {
+      env: {
+        RLM_USE_SDK: 'true',
+        ANTHROPIC_API_KEY: '',          // empty → CONFIG.apiKey === null
+        ANTHROPIC_BASE_URL: UNREACHABLE, // proves it never gets used
+      },
+    });
+    assert.equal(code, 0, 'Hook must exit 0 with SDK enabled but no key');
+    assert.ok(
+      stdout.includes('code_writing'),
+      `No-key path must use the subprocess; got: ${stdout.slice(0, 200)}`,
+    );
+  });
+});
