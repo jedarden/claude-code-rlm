@@ -10,11 +10,12 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, rm, writeFile, readFile, stat } from 'fs/promises';
-import { join } from 'path';
+import { mkdir, rm, writeFile, readFile, stat, readdir } from 'fs/promises';
+import { join, resolve, relative, isAbsolute } from 'path';
 import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
+import { execSync } from 'child_process';
 
 // ============================================================================
 // INLINED LOGIC FROM rlm-hook.mjs
@@ -1107,17 +1108,18 @@ describe('Group 10: SDK-Direct Fast Path (Phase 2)', () => {
     );
   });
 
-  // --- main()'s routing predicate ---
-  // As of Unit 4 the SDK path covers ANY non-agentic mode (fast or detailed);
-  // agentic still routes through the subprocess until Unit 5.
-  it('routing: SDK path selected when useSDK && key && !agentic (fast OR detailed)', () => {
+  // --- main()'s routing predicate (non-agentic branch) ---
+  // This is the fast/detailed SDK branch predicate: shouldUseSDK() && !agentic.
+  // As of Unit 5 agentic ALSO has an SDK path, but it is a separate branch with
+  // its own predicate (shouldUseSDK() && agentic) — exercised in Group 12.
+  it('routing: fast/detailed SDK branch selected when useSDK && key && !agentic', () => {
     const selectSDK = ({ useSDK, apiKey, agenticMode }) =>
       shouldUseSDK({ useSDK, apiKey }) && !agenticMode;
 
     assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: false }), true,
-      'non-agentic with SDK+key → SDK path');
+      'non-agentic with SDK+key → fast/detailed SDK path');
     assert.equal(selectSDK({ useSDK: true, apiKey: 'k', agenticMode: true }), false,
-      'agentic mode stays on subprocess until Unit 5');
+      'agentic does not use the fast/detailed branch (it has its own — Group 12)');
     assert.equal(selectSDK({ useSDK: false, apiKey: 'k', agenticMode: false }), false,
       'flag off → subprocess');
     assert.equal(selectSDK({ useSDK: true, apiKey: null, agenticMode: false }), false,
@@ -1175,5 +1177,418 @@ describe('Group 11: SDK-Direct Detailed Path (Phase 2)', () => {
     const pick = (fastMode) => (fastMode ? 'fast' : 'detailed');
     assert.equal(pick(true), 'fast');
     assert.equal(pick(false), 'detailed');
+  });
+});
+
+// ============================================================================
+// GROUP 12: SDK-DIRECT AGENTIC PATH (Phase 2, Unit 5)
+// ============================================================================
+//
+// Inlined from rlm-hook.mjs. The tool-use loop and the tool implementations are
+// faithful copies; callHaikuAgenticSDK takes model/maxTokens/maxTurns via opts
+// (the hook reads them from CONFIG) and an injectable `dispatch` + `client`.
+
+// --- tool schema (faithful copy) ---
+const AGENTIC_TOOLS = [
+  { name: 'Glob', description: 'glob', input_schema: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } },
+  { name: 'Grep', description: 'grep', input_schema: { type: 'object', properties: { pattern: { type: 'string' }, path: { type: 'string' } }, required: ['pattern'] } },
+  { name: 'Read', description: 'read', input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+  { name: 'Write', description: 'write', input_schema: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] } },
+  { name: 'Bash', description: 'bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+];
+
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+function resolveWithin(root, p) {
+  const full = isAbsolute(p) ? p : resolve(root, p);
+  const rel = relative(root, full);
+  if (rel === '') return full;
+  if (rel.startsWith('..') || isAbsolute(rel)) return null;
+  return full;
+}
+
+function isAllowedGitCommand(command) {
+  const cmd = String(command || '').trim();
+  if (!/^git(\s|$)/.test(cmd)) return false;
+  if (/[;&|`$()<>{}\n]/.test(cmd)) return false;
+  return true;
+}
+
+function globToRegExp(pattern) {
+  let re = '';
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === '*') {
+      if (pattern[i + 1] === '*') {
+        re += '.*';
+        i += 2;
+        if (pattern[i] === '/') i++;
+      } else {
+        re += '[^/]*';
+        i++;
+      }
+    } else if (ch === '?') {
+      re += '[^/]';
+      i++;
+    } else if ('.+^${}()|[]\\'.includes(ch)) {
+      re += '\\' + ch;
+      i++;
+    } else {
+      re += ch;
+      i++;
+    }
+  }
+  return new RegExp('^' + re + '$');
+}
+
+const GLOB_SKIP_DIRS = new Set(['node_modules', '.git']);
+
+async function toolGlob(pattern, cwd, limit = 100) {
+  if (!pattern) return 'Error: Glob requires a pattern';
+  const root = cwd || process.cwd();
+  const re = globToRegExp(pattern);
+  const matches = [];
+  async function walk(dir, rel) {
+    if (matches.length >= limit) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (matches.length >= limit) return;
+      const relPath = rel ? `${rel}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) {
+        if (GLOB_SKIP_DIRS.has(ent.name)) continue;
+        await walk(join(dir, ent.name), relPath);
+      } else if (ent.isFile() && re.test(relPath)) {
+        matches.push(relPath);
+      }
+    }
+  }
+  await walk(root, '');
+  return matches.length ? matches.join('\n') : 'No files matched.';
+}
+
+function toolGrep(pattern, path, cwd) {
+  if (!pattern) return 'Error: Grep requires a pattern';
+  const root = cwd || process.cwd();
+  const target = path ? (resolveWithin(root, path) || root) : root;
+  try {
+    const out = execSync(
+      `grep -rn --exclude-dir=node_modules --exclude-dir=.git -e ${shellQuote(pattern)} ${shellQuote(target)} 2>/dev/null | head -50`,
+      { timeout: 5000, maxBuffer: 1024 * 1024 }
+    ).toString().trim();
+    return out || 'No matches found.';
+  } catch (err) {
+    if (err && err.status === 1) return 'No matches found.';
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+async function toolRead(path, cwd, maxBytes = 16000) {
+  if (!path) return 'Error: Read requires a path';
+  const root = cwd || process.cwd();
+  const full = resolveWithin(root, path);
+  if (!full) return `Error: path escapes project root: ${path}`;
+  try {
+    let content = await readFile(full, 'utf-8');
+    if (content.length > maxBytes) content = content.slice(0, maxBytes) + '\n... [truncated]';
+    return content;
+  } catch (err) {
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+function sdkScratchPath(cwd) {
+  return join(cwd || process.cwd(), '.claude', `rlm-scratch-${process.pid}.md`);
+}
+
+async function toolWrite(content, cwd) {
+  const root = cwd || process.cwd();
+  const scratch = sdkScratchPath(root);
+  const text = String(content ?? '');
+  try {
+    await mkdir(join(root, '.claude'), { recursive: true });
+    await writeFile(scratch, text);
+    return `Wrote ${text.length} chars to ${scratch}`;
+  } catch (err) {
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+function toolBashGit(command, cwd) {
+  if (!command) return 'Error: Bash requires a command';
+  if (!isAllowedGitCommand(command)) {
+    return `Error: only read-only "git ..." commands are permitted (rejected: ${String(command).trim().slice(0, 60)})`;
+  }
+  try {
+    const out = execSync(String(command).trim(), {
+      cwd: cwd || process.cwd(),
+      timeout: 5000,
+      maxBuffer: 1024 * 1024,
+    }).toString();
+    return out.slice(0, 8000) || '(no output)';
+  } catch (err) {
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+async function dispatchAgenticTool(name, input, cwd) {
+  const args = input || {};
+  try {
+    switch (name) {
+      case 'Glob': return await toolGlob(args.pattern, cwd);
+      case 'Grep': return toolGrep(args.pattern, args.path, cwd);
+      case 'Read': return await toolRead(args.path, cwd);
+      case 'Write': return await toolWrite(args.content, cwd);
+      case 'Bash': return toolBashGit(args.command, cwd);
+      default: return `Error: unknown tool "${name}"`;
+    }
+  } catch (err) {
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+async function callHaikuAgenticSDK(
+  prompt, apiKey, cwd, client, dispatch,
+  { model = 'claude-haiku-4-5-20251001', maxTokens = 2048, maxTurns = 10 } = {}
+) {
+  const messages = [{ role: 'user', content: prompt }];
+  let lastText = '';
+  for (let turn = 0; turn < maxTurns; turn++) {
+    const response = await client.messages.create({ model, max_tokens: maxTokens, tools: AGENTIC_TOOLS, messages });
+    const text = extractSDKText(response);
+    if (text) lastText = text;
+    if (response.stop_reason !== 'tool_use') return text || lastText;
+    messages.push({ role: 'assistant', content: response.content });
+    const toolResults = [];
+    for (const block of response.content || []) {
+      if (block && block.type === 'tool_use') {
+        const result = await dispatch(block.name, block.input, cwd);
+        toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result });
+      }
+    }
+    messages.push({ role: 'user', content: toolResults });
+  }
+  return lastText;
+}
+
+// A fake client that returns a SEQUENCE of responses (one per turn), recording
+// the params for each create() call. The last response repeats if exhausted.
+function makeSequenceClient(responses) {
+  const calls = [];
+  let i = 0;
+  return {
+    calls,
+    messages: {
+      create: async (params) => {
+        calls.push(params);
+        const r = responses[Math.min(i, responses.length - 1)];
+        i++;
+        if (r instanceof Error) throw r;
+        return r;
+      },
+    },
+  };
+}
+
+// A fake dispatch that records (name, input, cwd) and returns a canned string.
+function makeRecordingDispatch(resultFn = () => 'TOOL_OK') {
+  const calls = [];
+  const dispatch = async (name, input, cwd) => {
+    calls.push({ name, input, cwd });
+    return resultFn(name, input);
+  };
+  return { dispatch, calls };
+}
+
+describe('Group 12: SDK-Direct Agentic Path (Phase 2)', () => {
+  let dir;
+  beforeEach(async () => {
+    dir = join(tmpdir(), `rlm-agentic-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(dir, { recursive: true });
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // --- the tool-use loop ---
+  it('loop: dispatches tool_use blocks, threads tool_results, returns final text', async () => {
+    const client = makeSequenceClient([
+      { stop_reason: 'tool_use', content: [
+        { type: 'text', text: 'looking' },
+        { type: 'tool_use', id: 't1', name: 'Glob', input: { pattern: '**/*.js' } },
+      ] },
+      { stop_reason: 'tool_use', content: [
+        { type: 'tool_use', id: 't2', name: 'Read', input: { path: 'a.js' } },
+      ] },
+      { stop_reason: 'end_turn', content: [{ type: 'text', text: '{"intent":"code_writing"}' }] },
+    ]);
+    const { dispatch, calls } = makeRecordingDispatch((name) => `${name} result`);
+
+    const out = await callHaikuAgenticSDK('explore', 'sk-x', '/proj', client, dispatch);
+
+    assert.equal(out, '{"intent":"code_writing"}', 'returns final non-tool_use text');
+    assert.equal(client.calls.length, 3, 'three Messages calls (2 tool turns + final)');
+    assert.deepEqual(calls.map(c => c.name), ['Glob', 'Read'], 'each tool dispatched once, in order');
+    assert.equal(calls[0].input.pattern, '**/*.js');
+    assert.equal(calls[0].cwd, '/proj', 'cwd threaded to dispatch');
+
+    // Second create() must carry the assistant tool_use turn + a tool_result for t1.
+    const secondMsgs = client.calls[1].messages;
+    assert.equal(secondMsgs[1].role, 'assistant');
+    const userTurn = secondMsgs[2];
+    assert.equal(userTurn.role, 'user');
+    assert.equal(userTurn.content[0].type, 'tool_result');
+    assert.equal(userTurn.content[0].tool_use_id, 't1', 'tool_result keyed by the originating tool_use id');
+    assert.equal(userTurn.content[0].content, 'Glob result');
+  });
+
+  it('loop: every create() advertises the tools array', async () => {
+    const client = makeSequenceClient([{ stop_reason: 'end_turn', content: [{ type: 'text', text: '{}' }] }]);
+    const { dispatch } = makeRecordingDispatch();
+    await callHaikuAgenticSDK('p', 'sk-x', dir, client, dispatch);
+    assert.ok(Array.isArray(client.calls[0].tools));
+    assert.deepEqual(client.calls[0].tools.map(t => t.name), ['Glob', 'Grep', 'Read', 'Write', 'Bash']);
+  });
+
+  it('loop: honors the turn cap when the model never stops calling tools', async () => {
+    const toolTurn = { stop_reason: 'tool_use', content: [
+      { type: 'text', text: 'partial' },
+      { type: 'tool_use', id: 'tx', name: 'Glob', input: { pattern: '*' } },
+    ] };
+    const client = makeSequenceClient([toolTurn]); // repeats forever
+    const { dispatch, calls } = makeRecordingDispatch();
+
+    const out = await callHaikuAgenticSDK('p', 'sk-x', dir, client, dispatch, { maxTurns: 3 });
+
+    assert.equal(client.calls.length, 3, 'stops after maxTurns Messages calls');
+    assert.equal(calls.length, 3, 'dispatches a tool each capped turn');
+    assert.equal(out, 'partial', 'returns best text seen so far on cap');
+  });
+
+  it('loop: passes model/maxTokens through to the API', async () => {
+    const client = makeSequenceClient([{ stop_reason: 'end_turn', content: [{ type: 'text', text: '{}' }] }]);
+    const { dispatch } = makeRecordingDispatch();
+    await callHaikuAgenticSDK('p', 'sk-x', dir, client, dispatch, { model: 'm-1', maxTokens: 512 });
+    assert.equal(client.calls[0].model, 'm-1');
+    assert.equal(client.calls[0].max_tokens, 512);
+  });
+
+  it('loop: SDK error propagates so main() can fall back to subprocess', async () => {
+    const client = makeSequenceClient([new Error('503 service unavailable')]);
+    const { dispatch } = makeRecordingDispatch();
+    await assert.rejects(
+      () => callHaikuAgenticSDK('p', 'sk-x', dir, client, dispatch),
+      /503 service unavailable/,
+    );
+  });
+
+  // --- git command guard ---
+  it('isAllowedGitCommand: accepts read-only git, rejects everything else', () => {
+    assert.equal(isAllowedGitCommand('git log --oneline -10'), true);
+    assert.equal(isAllowedGitCommand('git diff HEAD~1'), true);
+    assert.equal(isAllowedGitCommand('git show HEAD:src/a.js'), true);
+    assert.equal(isAllowedGitCommand('rm -rf /'), false, 'non-git rejected');
+    assert.equal(isAllowedGitCommand('gitfoo'), false, 'must be the git binary, not a prefix');
+    assert.equal(isAllowedGitCommand('git log; rm -rf /'), false, 'no command chaining');
+    assert.equal(isAllowedGitCommand('git log && evil'), false, 'no &&');
+    assert.equal(isAllowedGitCommand('git log | sh'), false, 'no pipes');
+    assert.equal(isAllowedGitCommand('git $(whoami)'), false, 'no command substitution');
+    assert.equal(isAllowedGitCommand('git log > /etc/passwd'), false, 'no redirection');
+    assert.equal(isAllowedGitCommand(''), false);
+  });
+
+  // --- dispatch routing ---
+  it('dispatchAgenticTool: Bash refuses non-git commands', async () => {
+    const out = await dispatchAgenticTool('Bash', { command: 'rm -rf /' }, dir);
+    assert.match(out, /only read-only "git \.\.\." commands/);
+  });
+
+  it('dispatchAgenticTool: unknown tool name returns an error string (no throw)', async () => {
+    const out = await dispatchAgenticTool('Telepathy', { foo: 1 }, dir);
+    assert.match(out, /unknown tool "Telepathy"/);
+  });
+
+  // --- globToRegExp ---
+  it('globToRegExp: * stays within a path segment, ** crosses segments', () => {
+    assert.ok(globToRegExp('**/*.js').test('a.js'));
+    assert.ok(globToRegExp('**/*.js').test('src/deep/a.js'));
+    assert.ok(!globToRegExp('**/*.js').test('a.ts'));
+    assert.ok(globToRegExp('src/*.ts').test('src/a.ts'));
+    assert.ok(!globToRegExp('src/*.ts').test('src/nested/a.ts'), '* must not cross /');
+    assert.ok(globToRegExp('**/auth*').test('auth.js'));
+    assert.ok(globToRegExp('**/auth*').test('src/auth.controller.ts'));
+  });
+
+  // --- real tool implementations against a temp dir ---
+  it('toolGlob: finds matching files and skips node_modules', async () => {
+    await writeFile(join(dir, 'index.js'), 'x');
+    await mkdir(join(dir, 'src'), { recursive: true });
+    await writeFile(join(dir, 'src', 'auth.js'), 'x');
+    await writeFile(join(dir, 'src', 'auth.ts'), 'x');
+    await mkdir(join(dir, 'node_modules', 'pkg'), { recursive: true });
+    await writeFile(join(dir, 'node_modules', 'pkg', 'ignored.js'), 'x');
+
+    const out = await toolGlob('**/*.js', dir);
+    const lines = out.split('\n').sort();
+    assert.deepEqual(lines, ['index.js', 'src/auth.js']);
+  });
+
+  it('toolGlob: no matches → friendly message', async () => {
+    const out = await toolGlob('**/*.rs', dir);
+    assert.equal(out, 'No files matched.');
+  });
+
+  it('toolRead: reads a project file and refuses traversal outside root', async () => {
+    await writeFile(join(dir, 'hello.txt'), 'hello world');
+    assert.equal(await toolRead('hello.txt', dir), 'hello world');
+    const escaped = await toolRead('../../../etc/passwd', dir);
+    assert.match(escaped, /escapes project root/);
+  });
+
+  it('toolRead: truncates very long files', async () => {
+    await writeFile(join(dir, 'big.txt'), 'a'.repeat(20000));
+    const out = await toolRead('big.txt', dir, 100);
+    assert.ok(out.length < 20000);
+    assert.match(out, /\[truncated\]$/);
+  });
+
+  it('toolWrite: writes to the pid-scoped scratch file (never user code)', async () => {
+    const out = await toolWrite('# notes\nsome findings', dir);
+    assert.match(out, /Wrote \d+ chars to/);
+    const scratch = sdkScratchPath(dir);
+    assert.ok(existsSync(scratch));
+    assert.equal(await readFile(scratch, 'utf-8'), '# notes\nsome findings');
+  });
+
+  it('toolBashGit: runs git but rejects non-git via dispatch', async () => {
+    const version = toolBashGit('git --version', dir);
+    assert.match(version, /git version/);
+    const rejected = toolBashGit('ls -la', dir);
+    assert.match(rejected, /only read-only "git \.\.\." commands/);
+  });
+
+  it('toolGrep: finds a matching line in the temp dir', async () => {
+    await writeFile(join(dir, 'code.js'), 'function authenticate() {}\nconst x = 1;\n');
+    const out = toolGrep('authenticate', null, dir);
+    assert.match(out, /authenticate/);
+    const none = toolGrep('zzz_no_such_token_zzz', null, dir);
+    assert.equal(none, 'No matches found.');
+  });
+
+  // --- tool schema sanity ---
+  it('AGENTIC_TOOLS: five tools with required input schemas', () => {
+    assert.equal(AGENTIC_TOOLS.length, 5);
+    for (const t of AGENTIC_TOOLS) {
+      assert.equal(typeof t.name, 'string');
+      assert.equal(t.input_schema.type, 'object');
+      assert.ok(Array.isArray(t.input_schema.required));
+    }
   });
 });
