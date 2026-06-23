@@ -51,6 +51,18 @@ const CONFIG = {
   useSDK: process.env.RLM_USE_SDK === 'true',
   apiKey: process.env.ANTHROPIC_API_KEY || null,
   sdkMaxTokens: parseInt(process.env.RLM_SDK_MAX_TOKENS || '2048', 10),
+  // Semantic caching (Phase 3): reuse a cached analysis when a new prompt is
+  // cosine-similar (not just SHA-256 identical) to a cached one. Gated behind
+  // RLM_SEMANTIC_CACHE=true; default off until embedding latency/quality are
+  // validated. Embeddings come from an OpenAI-compatible endpoint
+  // (text-embedding-3-small) using OPENAI_API_KEY — the Anthropic SDK does not
+  // expose embeddings. Whenever embedding is unavailable or fails, the cache
+  // layer degrades to plain SHA-256 lookup (the hook never breaks).
+  semanticCache: process.env.RLM_SEMANTIC_CACHE === 'true',
+  semanticThreshold: parseFloat(process.env.RLM_SEMANTIC_THRESHOLD || '0.92'),
+  embedModel: process.env.RLM_EMBED_MODEL || 'text-embedding-3-small',
+  embedApiKey: process.env.OPENAI_API_KEY || null,
+  embedBaseUrl: process.env.RLM_EMBED_BASE_URL || 'https://api.openai.com/v1',
   // Debug mode
   debug: process.env.RLM_DEBUG === 'true',
 };
@@ -823,6 +835,50 @@ async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch 
 
   await log(`Haiku SDK (agentic) hit turn cap (${CONFIG.maxTurns}) in ${Date.now() - startTime}ms`);
   return lastText;
+}
+
+// =============================================================================
+// SEMANTIC CACHE — EMBEDDINGS (Phase 3, Unit 1)
+// =============================================================================
+
+/**
+ * embedText — embed `text` into a vector via an OpenAI-compatible embeddings
+ * endpoint (default model text-embedding-3-small). Returns a Float32Array.
+ *
+ * The Anthropic SDK does not expose embeddings, so this hits the OpenAI HTTP API
+ * directly with `fetch` (global in Node 18+) and an `OPENAI_API_KEY`. `fetchImpl`
+ * is injectable so unit tests can drive it without a network. THROWS on any
+ * failure (no key, non-2xx, malformed body) — the semantic-cache layer catches
+ * the throw and degrades to plain SHA-256 lookup, so the hook never breaks.
+ */
+async function embedText(text, apiKey, {
+  fetchImpl = fetch,
+  model = CONFIG.embedModel,
+  baseUrl = CONFIG.embedBaseUrl,
+} = {}) {
+  if (!apiKey) throw new Error('embedText: no embedding API key');
+  if (typeof text !== 'string' || text.length === 0) {
+    throw new Error('embedText: empty input');
+  }
+  const startTime = Date.now();
+  const res = await fetchImpl(`${baseUrl}/embeddings`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ model, input: text }),
+  });
+  if (!res || !res.ok) {
+    throw new Error(`embedText: HTTP ${res ? res.status : 'no-response'}`);
+  }
+  const json = await res.json();
+  const vec = json && json.data && json.data[0] && json.data[0].embedding;
+  if (!Array.isArray(vec) || vec.length === 0) {
+    throw new Error('embedText: malformed embedding response');
+  }
+  await log(`Embedding (${model}, dim ${vec.length}) completed in ${Date.now() - startTime}ms`);
+  return Float32Array.from(vec);
 }
 
 // =============================================================================
