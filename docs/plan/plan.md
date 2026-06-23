@@ -59,7 +59,7 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 
 ---
 
-## Phase 2 — SDK-Direct Mode `[ ]`
+## Phase 2 — SDK-Direct Mode (COMPLETE ✅) `[x]`
 
 **Goal:** Bypass the `claude` subprocess and call the Anthropic API directly, reducing latency from ~4s to ~800ms.
 
