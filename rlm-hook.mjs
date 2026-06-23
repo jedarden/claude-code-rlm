@@ -950,6 +950,82 @@ async function saveCacheEmbedding(key, text, { embedImpl = embedText } = {}) {
   }
 }
 
+/**
+ * semanticLookup — Phase 3, Unit 4. On a SHA-256 cache miss, scan the cache
+ * directory for `<hash>.embedding` sidecars, score each against the query's
+ * embedding via cosine similarity, and return the best-matching cache entry
+ * when its similarity meets CONFIG.semanticThreshold (default 0.92). Returns
+ * null on any miss or failure, so the caller falls through to invoking Haiku.
+ *
+ * Fully gated behind CONFIG.semanticCache + an embedding API key: with the flag
+ * off (or no key) it returns null immediately doing zero I/O, so default
+ * behavior is byte-identical to before. The whole body is best-effort — any
+ * failure (embed throw, readdir error, every vector corrupt) degrades to a
+ * plain miss and never throws.
+ *
+ * Per-file robustness: each `.embedding` is read and scored inside its own
+ * try/catch, so one corrupt/short/foreign-dimension vector (cosineSimilarity
+ * throws on length mismatch) is skipped without aborting the scan.
+ *
+ * Caveat: embeddings are keyed by `userMessage` only, but cache keys also fold
+ * in cwd, so a high-similarity hit can come from a different cwd. Acceptable for
+ * now — the analysis is file-pointer guidance the main model re-validates; a
+ * cwd sidecar could tighten this later. `embedText` is fed `userMessage` here,
+ * matching exactly what saveCacheEmbedding (Unit 3) stored.
+ *
+ * Injectables (embedImpl / simImpl / checkImpl) keep it unit-testable.
+ */
+async function semanticLookup(queryText, {
+  embedImpl = embedText,
+  simImpl = cosineSimilarity,
+  checkImpl = checkCache,
+} = {}) {
+  if (!CONFIG.semanticCache) return null;
+  if (!CONFIG.embedApiKey) return null;
+  try {
+    const queryVec = await embedImpl(queryText, CONFIG.embedApiKey);
+    let files;
+    try {
+      files = await readdir(CONFIG.cacheDir);
+    } catch {
+      return null; // cache dir absent → nothing to match against
+    }
+    let bestKey = null;
+    let bestScore = -Infinity;
+    for (const f of files) {
+      if (!f.endsWith('.embedding')) continue;
+      try {
+        const buf = await readFile(join(CONFIG.cacheDir, f));
+        if (buf.length === 0 || buf.length % 4 !== 0) continue; // truncated tail
+        const vec = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+        const score = simImpl(queryVec, vec);
+        if (score > bestScore) {
+          bestScore = score;
+          bestKey = f.slice(0, -('.embedding'.length));
+        }
+      } catch {
+        // corrupt/foreign vector — skip this file, keep scanning
+      }
+    }
+    if (bestKey === null || bestScore < CONFIG.semanticThreshold) {
+      const shown = bestScore === -Infinity ? 'n/a' : bestScore.toFixed(4);
+      await log(`Semantic cache miss (best ${shown} < ${CONFIG.semanticThreshold})`);
+      return null;
+    }
+    const entry = await checkImpl(bestKey);
+    if (!entry) {
+      // matched an embedding whose JSON expired or vanished — treat as a miss
+      await log(`Semantic match ${bestKey.slice(0, 16)}... (${bestScore.toFixed(4)}) but entry gone`);
+      return null;
+    }
+    await log(`Semantic cache hit ${bestKey.slice(0, 16)}... (cosine ${bestScore.toFixed(4)} ≥ ${CONFIG.semanticThreshold})`);
+    return entry;
+  } catch (err) {
+    await log(`Semantic lookup failed (degrading to Haiku): ${String(err?.message ?? err)}`);
+    return null;
+  }
+}
+
 // =============================================================================
 // RESPONSE PARSING
 // =============================================================================
@@ -1104,6 +1180,17 @@ async function main() {
     if (cached) {
       await log(`Cache hit for ${cacheKey.slice(0, 16)}...`);
       console.log(formatOutput(cached));
+      process.exit(0);
+    }
+
+    // Semantic cache lookup (Phase 3, Unit 4) — on a SHA-256 miss, score the
+    // query against stored embeddings and reuse the nearest analysis above
+    // threshold. Fully gated + best-effort: returns null (proceed to Haiku)
+    // when semantic caching is off, keyless, or on any failure. Embeds
+    // `userMessage` to match what saveCacheEmbedding stored.
+    const semanticHit = await semanticLookup(userMessage);
+    if (semanticHit) {
+      console.log(formatOutput(semanticHit));
       process.exit(0);
     }
 

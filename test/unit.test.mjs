@@ -2045,3 +2045,167 @@ describe('Group 16: Semantic Cache — .embedding writes (Phase 3)', () => {
     assert.ok(!entries.some(e => e.includes('.tmp')), 'temp file was renamed away');
   });
 });
+
+// ============================================================================
+// GROUP 17: SEMANTIC CACHE — semanticLookup (Phase 3, Unit 4)
+// ============================================================================
+
+// semanticLookup — faithful copy of the hook's, with CONFIG and the embed /
+// checkCache helpers injected via `cfg` so tests drive it without globals or a
+// network. Mirrors the hook: fully gated behind cfg.semanticCache + a key
+// (returns null with zero I/O when off), per-file try/catch so one corrupt
+// vector doesn't abort the scan, and a top-level catch so any failure degrades
+// to a plain miss (null) rather than throwing.
+async function semanticLookup(queryText, cfg) {
+  if (!cfg.semanticCache) return null;
+  if (!cfg.embedApiKey) return null;
+  try {
+    const queryVec = await cfg.embedImpl(queryText, cfg.embedApiKey);
+    let files;
+    try {
+      files = await readdir(cfg.cacheDir);
+    } catch {
+      return null;
+    }
+    let bestKey = null;
+    let bestScore = -Infinity;
+    for (const f of files) {
+      if (!f.endsWith('.embedding')) continue;
+      try {
+        const buf = await readFile(join(cfg.cacheDir, f));
+        if (buf.length === 0 || buf.length % 4 !== 0) continue;
+        const vec = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+        const score = cosineSimilarity(queryVec, vec);
+        if (score > bestScore) {
+          bestScore = score;
+          bestKey = f.slice(0, -('.embedding'.length));
+        }
+      } catch {
+        // corrupt/foreign vector — skip, keep scanning
+      }
+    }
+    if (bestKey === null || bestScore < cfg.semanticThreshold) return null;
+    const entry = await cfg.checkImpl(bestKey);
+    if (!entry) return null;
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+describe('Group 17: Semantic Cache — semanticLookup (Phase 3)', () => {
+  let testCacheDir;
+
+  // Persist a `<key>.embedding` (raw float32) and optional `<key>.json` entry.
+  async function writeEntry(key, vecLike, json) {
+    const vec = Float32Array.from(vecLike);
+    const buf = Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
+    await writeFile(join(testCacheDir, `${key}.embedding`), buf);
+    if (json !== undefined) {
+      await writeFile(join(testCacheDir, `${key}.json`), JSON.stringify(json));
+    }
+  }
+
+  // checkImpl that reads the sibling JSON entry (stand-in for checkCache).
+  const checkImpl = async (key) => {
+    try {
+      return JSON.parse(await readFile(join(testCacheDir, `${key}.json`), 'utf-8'));
+    } catch {
+      return null;
+    }
+  };
+
+  // embedImpl returning a fixed query vector, ignoring the text (the actual
+  // embedding model is exercised by Group 14).
+  const fixedVec = v => async () => Float32Array.from(v);
+
+  const baseCfg = overrides => ({
+    semanticCache: true,
+    embedApiKey: 'sk-x',
+    cacheDir: testCacheDir,
+    semanticThreshold: 0.92,
+    checkImpl,
+    ...overrides,
+  });
+
+  beforeEach(async () => {
+    testCacheDir = join(tmpdir(), `rlm-sem-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testCacheDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try { await rm(testCacheDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('returns the nearest entry when one embedding is above threshold', async () => {
+    const A = 'a'.repeat(64), B = 'b'.repeat(64), C = 'c'.repeat(64);
+    await writeEntry(A, [0.99, 0.1, 0], { intent: 'auth-flow', who: 'A' }); // ~0.995 vs query
+    await writeEntry(B, [0, 1, 0], { intent: 'unrelated', who: 'B' });      // 0
+    await writeEntry(C, [0.5, 0.866, 0], { intent: 'other', who: 'C' });    // ~0.5
+    const hit = await semanticLookup('explore auth', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.ok(hit, 'a semantic hit is returned');
+    assert.equal(hit.who, 'A', 'returns the closest entry (A), not B or C');
+    assert.equal(hit.intent, 'auth-flow');
+  });
+
+  it('returns null when every embedding is below threshold', async () => {
+    await writeEntry('d'.repeat(64), [0, 1, 0], { who: 'D' });        // cos 0
+    await writeEntry('e'.repeat(64), [0.5, 0.866, 0], { who: 'E' });  // cos ~0.5
+    const hit = await semanticLookup('q', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.equal(hit, null, 'nothing close enough → miss');
+  });
+
+  it('skips corrupt / foreign-dimension embeddings without aborting the scan', async () => {
+    const GOOD = 'f'.repeat(64);
+    await writeEntry(GOOD, [0.98, 0.2, 0], { who: 'GOOD' }); // ~0.98 vs query, above threshold
+    // 3-byte file → not a multiple of 4 → guarded skip
+    await writeFile(join(testCacheDir, `${'g'.repeat(64)}.embedding`), Buffer.from([1, 2, 3]));
+    // 2-dim vector → cosineSimilarity length-mismatch throw → per-file catch skip
+    const two = Float32Array.from([1, 0]);
+    await writeFile(join(testCacheDir, `${'h'.repeat(64)}.embedding`),
+      Buffer.from(two.buffer, two.byteOffset, two.byteLength));
+    const hit = await semanticLookup('q', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.ok(hit, 'the good entry still matches despite corrupt siblings');
+    assert.equal(hit.who, 'GOOD');
+  });
+
+  it('returns null without scanning when semanticCache is off', async () => {
+    await writeEntry('a'.repeat(64), [1, 0, 0], { who: 'A' });
+    let called = false;
+    const embedImpl = async () => { called = true; return Float32Array.from([1, 0, 0]); };
+    const hit = await semanticLookup('q', baseCfg({ semanticCache: false, embedImpl }));
+    assert.equal(hit, null);
+    assert.equal(called, false, 'flag off → never even embeds the query');
+  });
+
+  it('returns null without scanning when no embedding API key is available', async () => {
+    await writeEntry('a'.repeat(64), [1, 0, 0], { who: 'A' });
+    let called = false;
+    const embedImpl = async () => { called = true; return Float32Array.from([1, 0, 0]); };
+    const hit = await semanticLookup('q', baseCfg({ embedApiKey: null, embedImpl }));
+    assert.equal(hit, null);
+    assert.equal(called, false, 'no key → no embedding call, no scan');
+  });
+
+  it('treats a matched embedding whose JSON entry is gone as a miss', async () => {
+    // embedding present and above threshold, but no sibling .json (expired/TTL'd)
+    await writeEntry('a'.repeat(64), [1, 0, 0] /* no json */);
+    const hit = await semanticLookup('q', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.equal(hit, null, 'matched vector but absent entry → fall through to Haiku');
+  });
+
+  it('degrades to a miss (null) when the embedder throws', async () => {
+    await writeEntry('a'.repeat(64), [1, 0, 0], { who: 'A' });
+    const embedImpl = async () => { throw new Error('embedText: HTTP 429'); };
+    const hit = await semanticLookup('q', baseCfg({ embedImpl }));
+    assert.equal(hit, null, 'embed failure never throws — degrades to miss');
+  });
+
+  it('returns null when the cache directory does not exist yet', async () => {
+    const hit = await semanticLookup('q', baseCfg({
+      cacheDir: join(testCacheDir, 'nope'),
+      embedImpl: fixedVec([1, 0, 0]),
+    }));
+    assert.equal(hit, null, 'absent cache dir → miss, not a throw');
+  });
+});
