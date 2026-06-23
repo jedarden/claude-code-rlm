@@ -223,7 +223,21 @@ async function gatherProjectContext(cwd) {
   return context;
 }
 
-async function gatherConversationContext(transcriptPath, maxMessages = 5) {
+/**
+ * Read the recent transcript for two purposes:
+ *   - `messages`: a short, truncated preview of the last few user/assistant
+ *     turns, fed into the Haiku prompt for conversational grounding.
+ *   - `priorBlocks`: the FULL <rlm_preresearch>/<rlm_analysis> blocks this hook
+ *     injected on earlier turns, recovered un-truncated and stamped with each
+ *     record's own timestamp (Phase 4). These drive the conversation-aware
+ *     early-exit (classifyIntentLocal → computeChangedFiles → findReusablePriorBlock).
+ *
+ * `maxMessages` defaults to CONFIG.contextWindow (RLM_CONTEXT_WINDOW, default 5)
+ * and bounds both the preview tail and the combined block window. Returns null
+ * only when there is no readable transcript; otherwise `{ messages, priorBlocks }`
+ * (either array may be empty). Never throws.
+ */
+async function gatherConversationContext(transcriptPath, maxMessages = CONFIG.contextWindow) {
   if (!transcriptPath || !existsSync(transcriptPath)) return null;
 
   try {
@@ -249,7 +263,11 @@ async function gatherConversationContext(transcriptPath, maxMessages = 5) {
       } catch {}
     }
 
-    return messages.slice(-maxMessages);
+    // Recover prior RLM blocks from the FULL transcript (not the truncated
+    // previews above) so the early-exit can reuse earlier exploration.
+    const priorBlocks = extractPriorBlocksFromTranscript(content, { window: maxMessages });
+
+    return { messages: messages.slice(-maxMessages), priorBlocks };
   } catch (err) {
     await log(`Transcript read error: ${err.message}`);
     return null;
@@ -353,6 +371,74 @@ function extractPriorRLMBlocks(transcriptText, { window = CONFIG.contextWindow, 
   blocks.reverse();
   const limit = Number.isFinite(window) && window > 0 ? window : blocks.length;
   return blocks.slice(0, limit);
+}
+
+/**
+ * JSONL-aware wrapper around extractPriorRLMBlocks.
+ *
+ * gatherConversationContext only keeps a 200-char `preview` of each message —
+ * far too short to hold a whole <rlm_preresearch> block. This reads the raw
+ * transcript JSONL, decodes each record's message text IN FULL, and runs the
+ * pure extractor per record with that record's own `timestamp` as `ts`. The
+ * per-record stamp matters: computeChangedFiles needs each recovered block's
+ * production time to judge whether its files have since changed, and stamping
+ * the whole transcript blob with one `ts` (the alternative) would be wrong.
+ *
+ * We do NOT filter by entry.type: the hook's injected output can be stored under
+ * a user turn, an assistant turn, or a synthetic record depending on Claude
+ * Code internals, so we scan every parseable record's text content. The window
+ * caps the COMBINED result (newest-first), not each record individually —
+ * roughly "the last N turns' worth of blocks" since a turn yields ≤1 block.
+ *
+ * Pure: string in → array out. Never throws; unparseable lines are skipped.
+ *
+ * @param {string} transcriptText  raw transcript file contents (JSONL)
+ * @param {{window?: number}} opts  look-back depth (combined block cap)
+ * @returns {Array<{intent: string|null, relevant_files: string[], ts: number|null, raw: object}>}
+ */
+function extractPriorBlocksFromTranscript(transcriptText, { window = CONFIG.contextWindow } = {}) {
+  if (typeof transcriptText !== 'string' || transcriptText.length === 0) return [];
+
+  const all = []; // accumulate chronological (oldest → newest), reverse once at end
+  for (const line of transcriptText.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      continue; // not a JSONL record (or truncated mid-write)
+    }
+    if (!entry || typeof entry !== 'object') continue;
+
+    const raw = entry.message?.content ?? entry.content ?? '';
+    const text = Array.isArray(raw)
+      ? raw.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n')
+      : (typeof raw === 'string' ? raw : '');
+    if (!text) continue;
+
+    // Records carry an ISO-string timestamp; tolerate a numeric epoch too. An
+    // unparseable/absent timestamp ⇒ undefined ⇒ extractor stamps ts:null ⇒
+    // computeChangedFiles treats those files as changed (fail-safe).
+    let ts;
+    const t = entry.timestamp;
+    if (typeof t === 'number' && Number.isFinite(t)) {
+      ts = t;
+    } else if (typeof t === 'string') {
+      const p = Date.parse(t);
+      ts = Number.isFinite(p) ? p : undefined;
+    }
+
+    // Pure extractor returns this record's blocks newest-first; re-reverse to
+    // chronological so the single reverse below yields a clean global order.
+    const blocks = extractPriorRLMBlocks(text, { window: Infinity, ts });
+    blocks.reverse();
+    for (const b of blocks) all.push(b);
+  }
+
+  all.reverse(); // newest-first overall
+  const limit = Number.isFinite(window) && window > 0 ? window : all.length;
+  return all.slice(0, limit);
 }
 
 /**
@@ -528,9 +614,14 @@ function buildRLMPrompt(userMessage, projectContext, conversationContext) {
     }
   }
 
-  if (conversationContext && conversationContext.length > 0) {
+  // gatherConversationContext returns { messages, priorBlocks } (Phase 4); older
+  // callers may still pass a bare messages array, so accept both shapes.
+  const convMessages = Array.isArray(conversationContext)
+    ? conversationContext
+    : (conversationContext?.messages ?? null);
+  if (convMessages && convMessages.length > 0) {
     contextSection += `\nRecent conversation:`;
-    for (const msg of conversationContext.slice(-3)) {
+    for (const msg of convMessages.slice(-3)) {
       contextSection += `\n- ${msg.role}: ${msg.preview.slice(0, 100)}`;
     }
   }

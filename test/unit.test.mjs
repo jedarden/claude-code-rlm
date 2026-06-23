@@ -2904,3 +2904,174 @@ describe('Group 21: Conversation Context Awareness — computeChangedFiles (Phas
     assert.deepEqual(changed, ['real.js']);
   });
 });
+
+// ============================================================================
+// Group 22: Conversation Context Awareness — extractPriorBlocksFromTranscript
+// (Phase 4, Unit 4). Faithful inline copy of the JSONL-aware wrapper around
+// extractPriorRLMBlocks_copy (reused from Group 19), plus preBlock (Group 19).
+// ============================================================================
+
+function extractPriorBlocksFromTranscript_copy(transcriptText, { window = 5 } = {}) {
+  if (typeof transcriptText !== 'string' || transcriptText.length === 0) return [];
+
+  const all = [];
+  for (const line of transcriptText.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!entry || typeof entry !== 'object') continue;
+
+    const raw = entry.message?.content ?? entry.content ?? '';
+    const text = Array.isArray(raw)
+      ? raw.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n')
+      : (typeof raw === 'string' ? raw : '');
+    if (!text) continue;
+
+    let ts;
+    const t = entry.timestamp;
+    if (typeof t === 'number' && Number.isFinite(t)) {
+      ts = t;
+    } else if (typeof t === 'string') {
+      const p = Date.parse(t);
+      ts = Number.isFinite(p) ? p : undefined;
+    }
+
+    const blocks = extractPriorRLMBlocks_copy(text, { window: Infinity, ts });
+    blocks.reverse();
+    for (const b of blocks) all.push(b);
+  }
+
+  all.reverse();
+  const limit = Number.isFinite(window) && window > 0 ? window : all.length;
+  return all.slice(0, limit);
+}
+
+// Build one JSONL transcript record. `content` is the decoded message text (a
+// string) or an array of content blocks; `timestamp` is omitted when undefined.
+function jsonlLine(type, content, timestamp) {
+  const entry = { type, message: { content } };
+  if (timestamp !== undefined) entry.timestamp = timestamp;
+  return JSON.stringify(entry);
+}
+
+describe('Group 22: Conversation Context Awareness — extractPriorBlocksFromTranscript (Phase 4)', () => {
+  const ISO = '2026-06-23T10:00:00.000Z';
+  const ISO_MS = Date.parse(ISO);
+
+  it('extracts a block from a single record and stamps it with the record timestamp', () => {
+    const text = preBlock({ intent: 'debugging', relevant_files: ['src/a.js'] });
+    const transcript = jsonlLine('user', text, ISO);
+    const blocks = extractPriorBlocksFromTranscript_copy(transcript);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].intent, 'debugging');
+    assert.deepEqual(blocks[0].relevant_files, ['src/a.js']);
+    assert.equal(blocks[0].ts, ISO_MS);
+  });
+
+  it('a missing/unparseable timestamp yields ts:null (fail-safe)', () => {
+    const text = preBlock({ intent: 'debugging', relevant_files: ['a.js'] });
+    assert.equal(extractPriorBlocksFromTranscript_copy(jsonlLine('user', text))[0].ts, null);
+    assert.equal(
+      extractPriorBlocksFromTranscript_copy(jsonlLine('user', text, 'not-a-date'))[0].ts,
+      null,
+    );
+  });
+
+  it('accepts a numeric epoch timestamp', () => {
+    const text = preBlock({ intent: 'debugging', relevant_files: ['a.js'] });
+    const blocks = extractPriorBlocksFromTranscript_copy(jsonlLine('user', text, 1700000000000));
+    assert.equal(blocks[0].ts, 1700000000000);
+  });
+
+  it('returns blocks newest-first across multiple records', () => {
+    const older = jsonlLine('user', preBlock({ intent: 'refactoring', relevant_files: ['old.js'] }), '2026-06-23T09:00:00.000Z');
+    const newer = jsonlLine('assistant', preBlock({ intent: 'debugging', relevant_files: ['new.js'] }), '2026-06-23T11:00:00.000Z');
+    const blocks = extractPriorBlocksFromTranscript_copy([older, newer].join('\n'));
+    assert.equal(blocks.length, 2);
+    assert.deepEqual(blocks[0].relevant_files, ['new.js']); // most recent first
+    assert.deepEqual(blocks[1].relevant_files, ['old.js']);
+  });
+
+  it('caps the combined result to the window (newest kept)', () => {
+    const lines = [
+      jsonlLine('user', preBlock({ intent: 'a', relevant_files: ['1.js'] }), '2026-06-23T08:00:00.000Z'),
+      jsonlLine('user', preBlock({ intent: 'b', relevant_files: ['2.js'] }), '2026-06-23T09:00:00.000Z'),
+      jsonlLine('user', preBlock({ intent: 'c', relevant_files: ['3.js'] }), '2026-06-23T10:00:00.000Z'),
+    ].join('\n');
+    const blocks = extractPriorBlocksFromTranscript_copy(lines, { window: 2 });
+    assert.equal(blocks.length, 2);
+    assert.deepEqual(blocks.map((b) => b.relevant_files[0]), ['3.js', '2.js']);
+  });
+
+  it('window <= 0 or Infinity returns all blocks', () => {
+    const lines = [
+      jsonlLine('user', preBlock({ intent: 'a', relevant_files: ['1.js'] }), ISO),
+      jsonlLine('user', preBlock({ intent: 'b', relevant_files: ['2.js'] }), ISO),
+    ].join('\n');
+    assert.equal(extractPriorBlocksFromTranscript_copy(lines, { window: 0 }).length, 2);
+    assert.equal(extractPriorBlocksFromTranscript_copy(lines, { window: -3 }).length, 2);
+    assert.equal(extractPriorBlocksFromTranscript_copy(lines, { window: Infinity }).length, 2);
+  });
+
+  it('skips unparseable / blank lines and records with no text', () => {
+    const text = preBlock({ intent: 'debugging', relevant_files: ['a.js'] });
+    const transcript = [
+      'not json at all',
+      '',
+      JSON.stringify({ type: 'user', message: { content: '' } }), // empty text
+      jsonlLine('user', text, ISO),
+      '   ',
+    ].join('\n');
+    const blocks = extractPriorBlocksFromTranscript_copy(transcript);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].intent, 'debugging');
+  });
+
+  it('decodes message content given as an array of text blocks', () => {
+    const text = preBlock({ intent: 'debugging', relevant_files: ['a.js'] });
+    const content = [
+      { type: 'text', text: 'preamble ' },
+      { type: 'image', source: {} },        // non-text block ignored
+      { type: 'text', text },
+    ];
+    const blocks = extractPriorBlocksFromTranscript_copy(jsonlLine('assistant', content, ISO));
+    assert.equal(blocks.length, 1);
+    assert.deepEqual(blocks[0].relevant_files, ['a.js']);
+  });
+
+  it('extracts blocks regardless of entry.type (not just user/assistant)', () => {
+    const text = preBlock({ intent: 'debugging', relevant_files: ['a.js'] });
+    const transcript = JSON.stringify({ type: 'system', content: text, timestamp: ISO });
+    const blocks = extractPriorBlocksFromTranscript_copy(transcript);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].ts, ISO_MS);
+  });
+
+  it('records without an RLM block contribute nothing', () => {
+    const transcript = [
+      jsonlLine('user', 'just a normal question about the weather', ISO),
+      jsonlLine('assistant', 'a normal answer', ISO),
+    ].join('\n');
+    assert.deepEqual(extractPriorBlocksFromTranscript_copy(transcript), []);
+  });
+
+  it('returns [] for empty / non-string input', () => {
+    assert.deepEqual(extractPriorBlocksFromTranscript_copy(''), []);
+    assert.deepEqual(extractPriorBlocksFromTranscript_copy(null), []);
+    assert.deepEqual(extractPriorBlocksFromTranscript_copy(undefined), []);
+    assert.deepEqual(extractPriorBlocksFromTranscript_copy(42), []);
+  });
+
+  it('also recognizes <rlm_analysis> (fast/detailed) blocks in the transcript', () => {
+    const text = `<rlm_analysis>\n${JSON.stringify({ intent: 'debugging', files: ['x.js'] }, null, 2)}\n</rlm_analysis>`;
+    const blocks = extractPriorBlocksFromTranscript_copy(jsonlLine('user', text, ISO));
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].intent, 'debugging');
+    assert.deepEqual(blocks[0].relevant_files, ['x.js']);
+  });
+});
