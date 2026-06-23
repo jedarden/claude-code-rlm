@@ -3075,3 +3075,154 @@ describe('Group 22: Conversation Context Awareness — extractPriorBlocksFromTra
     assert.deepEqual(blocks[0].relevant_files, ['x.js']);
   });
 });
+
+// ============================================================================
+// Group 23: Conversation Context Awareness — main() early-exit (Phase 4, Unit 5)
+// The reuse-vs-explore decision and the re-emitted "continuing" block live
+// inside main() (which auto-runs on import and so can't be imported), so these
+// are faithful inline copies of findReusablePriorBlockWithMtime and the
+// reused-analysis construction. Reuses intentsOverlap_copy /
+// computeChangedFiles_copy / fakeStat from Groups 20–21.
+// ============================================================================
+
+async function findReusablePriorBlockWithMtime_copy(
+  currentIntent,
+  priorBlocks,
+  { cwd = process.cwd(), statImpl = stat } = {}
+) {
+  if (!Array.isArray(priorBlocks) || priorBlocks.length === 0) return null;
+  if (typeof currentIntent !== 'string' || !currentIntent.trim()) return null;
+  if (currentIntent.trim().toLowerCase() === 'other') return null;
+
+  for (const block of priorBlocks) {
+    if (!block || typeof block !== 'object') continue;
+    if (!intentsOverlap_copy(currentIntent, block.intent)) continue;
+    const files = Array.isArray(block.relevant_files) ? block.relevant_files : [];
+    if (files.length === 0) continue;
+    let changed;
+    try {
+      changed = await computeChangedFiles_copy(files, block.ts, { cwd, statImpl });
+    } catch {
+      continue;
+    }
+    if (changed.length === 0) return block;
+  }
+  return null;
+}
+
+// Faithful copy of main()'s reused-analysis construction (the lightweight
+// "continuing" marker prepended to the recovered raw analysis).
+function buildReusedAnalysis_copy(reusable) {
+  const base = reusable.raw && typeof reusable.raw === 'object' ? reusable.raw : {};
+  return {
+    ...base,
+    summary: `[Continuing from prior pre-research — files unchanged since last turn] ${base.summary || ''}`.trim(),
+  };
+}
+
+// Helper: build a prior block as extractPriorBlocksFromTranscript would return.
+function blk(intent, files, ts) {
+  return { intent, relevant_files: files, ts, raw: { intent, relevant_files: files, summary: '' } };
+}
+
+describe('Group 23: Conversation Context Awareness — main() early-exit (Phase 4)', () => {
+  const CWD = '/repo';
+
+  it('reuses the most-recent matching block when all its files are unchanged', async () => {
+    const blocks = [
+      blk('debugging', ['src/auth.js', 'src/db.js'], 2000), // newest, unchanged
+      blk('code_writing', ['src/ui.js'], 2000),
+    ];
+    const statImpl = fakeStat({ '/repo/src/auth.js': 1000, '/repo/src/db.js': 1500 });
+    const hit = await findReusablePriorBlockWithMtime_copy('debugging', blocks, { cwd: CWD, statImpl });
+    assert.ok(hit);
+    assert.equal(hit.intent, 'debugging');
+    assert.deepEqual(hit.relevant_files, ['src/auth.js', 'src/db.js']);
+  });
+
+  it('does NOT reuse when the current intent diverges from all priors', async () => {
+    const blocks = [blk('debugging', ['a.js'], 2000)];
+    const statImpl = fakeStat({ '/repo/a.js': 1000 });
+    assert.equal(await findReusablePriorBlockWithMtime_copy('architecture', blocks, { cwd: CWD, statImpl }), null);
+  });
+
+  it('does NOT reuse when a referenced file changed after the block', async () => {
+    const blocks = [blk('debugging', ['a.js', 'b.js'], 1000)];
+    const statImpl = fakeStat({ '/repo/a.js': 500, '/repo/b.js': 1500 }); // b edited after ts=1000
+    assert.equal(await findReusablePriorBlockWithMtime_copy('debugging', blocks, { cwd: CWD, statImpl }), null);
+  });
+
+  it('applies each block its OWN ts window (skip newer-but-stale, reuse older-fresh)', async () => {
+    // x.js was last edited at mtime 800. For the newest block (ts=500) that edit
+    // is AFTER the block → changed → skip. For the older block (ts=1500) the edit
+    // is BEFORE the block → unchanged → reuse. A flat changedFiles set could not
+    // express this; per-block ts is exactly what this helper adds.
+    const blocks = [blk('debugging', ['x.js'], 500), blk('debugging', ['x.js'], 1500)];
+    const statImpl = fakeStat({ '/repo/x.js': 800 });
+    const hit = await findReusablePriorBlockWithMtime_copy('debugging', blocks, { cwd: CWD, statImpl });
+    assert.ok(hit);
+    assert.equal(hit.ts, 1500);
+  });
+
+  it('does NOT reuse a block with unknown production time (ts:null ⇒ fail-safe)', async () => {
+    const blocks = [blk('debugging', ['x.js'], null)];
+    const statImpl = fakeStat({ '/repo/x.js': 100 }); // would be unchanged IF ts were known
+    assert.equal(await findReusablePriorBlockWithMtime_copy('debugging', blocks, { cwd: CWD, statImpl }), null);
+  });
+
+  it('does NOT reuse the catch-all "other" intent', async () => {
+    const blocks = [blk('other', ['x.js'], 2000)];
+    const statImpl = fakeStat({ '/repo/x.js': 1000 });
+    assert.equal(await findReusablePriorBlockWithMtime_copy('other', blocks, { cwd: CWD, statImpl }), null);
+  });
+
+  it('does NOT reuse a matching block that recorded no files', async () => {
+    const blocks = [blk('debugging', [], 2000)];
+    const statImpl = fakeStat({});
+    assert.equal(await findReusablePriorBlockWithMtime_copy('debugging', blocks, { cwd: CWD, statImpl }), null);
+  });
+
+  it('returns null for empty / non-array / non-string-intent inputs', async () => {
+    assert.equal(await findReusablePriorBlockWithMtime_copy('debugging', [], {}), null);
+    assert.equal(await findReusablePriorBlockWithMtime_copy('debugging', null, {}), null);
+    assert.equal(await findReusablePriorBlockWithMtime_copy('', [blk('x', ['a.js'], 1)], {}), null);
+  });
+
+  it('tolerates malformed entries in the priors array', async () => {
+    const blocks = [null, 'nope', 42, blk('debugging', ['ok.js'], 2000)];
+    const statImpl = fakeStat({ '/repo/ok.js': 1000 });
+    const hit = await findReusablePriorBlockWithMtime_copy('debugging', blocks, { cwd: CWD, statImpl });
+    assert.ok(hit);
+    assert.deepEqual(hit.relevant_files, ['ok.js']);
+  });
+
+  it('skips a block whose stat impl throws, falling through to the next match', async () => {
+    const throwingStat = async () => { throw new Error('boom'); };
+    // First block's computeChangedFiles will report its files changed (stat
+    // throws → changed), so it is not reusable; helper returns null overall.
+    const blocks = [blk('debugging', ['a.js'], 2000)];
+    assert.equal(await findReusablePriorBlockWithMtime_copy('debugging', blocks, { cwd: CWD, statImpl: throwingStat }), null);
+  });
+
+  // --- re-emitted "continuing" block shape ---
+  it('prepends a continuation marker to the reused analysis summary', () => {
+    const reusable = blk('debugging', ['a.js'], 2000);
+    reusable.raw.summary = 'auth flow lives in src/auth.js';
+    const out = buildReusedAnalysis_copy(reusable);
+    assert.match(out.summary, /^\[Continuing from prior pre-research/);
+    assert.match(out.summary, /auth flow lives in src\/auth\.js$/);
+    assert.equal(out.intent, 'debugging', 'preserves the rest of the prior analysis');
+    assert.deepEqual(out.relevant_files, ['a.js']);
+  });
+
+  it('handles a reusable block with a missing/empty raw summary', () => {
+    const out = buildReusedAnalysis_copy({ raw: { intent: 'debugging' } });
+    assert.equal(out.summary, '[Continuing from prior pre-research — files unchanged since last turn]');
+    assert.equal(out.intent, 'debugging');
+  });
+
+  it('handles a reusable block with no usable raw object', () => {
+    const out = buildReusedAnalysis_copy({ raw: null });
+    assert.equal(out.summary, '[Continuing from prior pre-research — files unchanged since last turn]');
+  });
+});
