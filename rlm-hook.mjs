@@ -591,6 +591,59 @@ async function computeChangedFiles(relevantFiles, sinceMs, { cwd = process.cwd()
   return changed;
 }
 
+/**
+ * Phase 4 early-exit decision: the most-recent prior RLM block reusable for the
+ * current turn, accounting for each block's OWN mtime-staleness window.
+ *
+ * This is the mtime-aware sibling of findReusablePriorBlock. That helper takes a
+ * single flat `changedFiles` set, but every recovered block carries its own
+ * production timestamp (`block.ts`), so "which files changed since this block"
+ * must be computed PER block. We iterate newest-first (the order
+ * extractPriorBlocksFromTranscript returns) and return the first block that:
+ *   1. has an intent overlapping the current intent (intentsOverlap),
+ *   2. whose intent is NOT the catch-all `other`,
+ *   3. recorded at least one relevant file, and
+ *   4. has NONE of those files changed since it was produced
+ *      (computeChangedFiles, with the block's own `ts` as the reference time).
+ *
+ * Returns the reusable block (so the caller can re-emit its `raw` analysis), or
+ * null when nothing qualifies — in which case the caller falls through to Haiku.
+ *
+ * Best-effort: aside from the injected stat (threaded into computeChangedFiles)
+ * it is pure, and any error judging a single block just skips that block rather
+ * than throwing. A `ts:null` block (unknown production time) yields "all files
+ * changed" from computeChangedFiles, so it is never reused — fail-safe.
+ *
+ * @param {string} currentIntent  classifyIntentLocal output for this turn
+ * @param {Array<{intent, relevant_files, ts, raw}>} priorBlocks  newest-first
+ * @param {{cwd?: string, statImpl?: Function}} opts
+ * @returns {Promise<{intent, relevant_files, ts, raw}|null>}
+ */
+async function findReusablePriorBlockWithMtime(
+  currentIntent,
+  priorBlocks,
+  { cwd = process.cwd(), statImpl = stat } = {}
+) {
+  if (!Array.isArray(priorBlocks) || priorBlocks.length === 0) return null;
+  if (typeof currentIntent !== 'string' || !currentIntent.trim()) return null;
+  if (currentIntent.trim().toLowerCase() === 'other') return null;
+
+  for (const block of priorBlocks) {
+    if (!block || typeof block !== 'object') continue;
+    if (!intentsOverlap(currentIntent, block.intent)) continue;
+    const files = Array.isArray(block.relevant_files) ? block.relevant_files : [];
+    if (files.length === 0) continue; // nothing concrete to reuse
+    let changed;
+    try {
+      changed = await computeChangedFiles(files, block.ts, { cwd, statImpl });
+    } catch {
+      continue; // can't judge this block safely → skip it (fall through)
+    }
+    if (changed.length === 0) return block; // all referenced files unchanged
+  }
+  return null;
+}
+
 // =============================================================================
 // PROMPT BUILDING
 // =============================================================================
@@ -1663,6 +1716,39 @@ async function main() {
 
     if (projectContext) {
       await log(`Project context: ${projectContext.projectType || 'unknown'} with ${projectContext.techStack.length} items in stack`);
+    }
+
+    // Phase 4 early-exit: if conversation context is on and the current turn's
+    // intent matches a prior <rlm_preresearch> block whose referenced files are
+    // ALL unchanged since that turn, skip Haiku entirely and re-affirm the prior
+    // analysis. This is the "eliminate redundant re-exploration" payoff (plan
+    // Phase 4). Fully best-effort: wrapped so any failure here just falls through
+    // to normal Haiku exploration and never blocks the user.
+    if (CONFIG.gatherContext) {
+      try {
+        const currentIntent = classifyIntentLocal(userMessage);
+        const priorBlocks = conversationContext?.priorBlocks ?? [];
+        const reusable = await findReusablePriorBlockWithMtime(currentIntent, priorBlocks, {
+          cwd: cwd || process.cwd(),
+        });
+        if (reusable) {
+          // Re-emit the prior analysis, lightly marked as a continuation so the
+          // main model knows this is reused (not freshly explored) context. The
+          // recovered `raw` already has the right shape for formatOutput.
+          const base = reusable.raw && typeof reusable.raw === 'object' ? reusable.raw : {};
+          const reusedAnalysis = {
+            ...base,
+            summary: `[Continuing from prior pre-research — files unchanged since last turn] ${base.summary || ''}`.trim(),
+          };
+          await log(
+            `Phase 4 early-exit: reusing prior analysis (intent=${currentIntent}, ${reusable.relevant_files.length} file(s) unchanged)`
+          );
+          console.log(formatOutput(reusedAnalysis));
+          process.exit(0);
+        }
+      } catch (err) {
+        await log(`Phase 4 early-exit skipped: ${String(err?.message ?? err)}`);
+      }
     }
 
     // Invoke Haiku — clean up scratch file in finally so it runs even on throw
