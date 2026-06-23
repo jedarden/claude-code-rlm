@@ -2470,9 +2470,10 @@ function normalizeRelevantFiles_copy(analysis) {
   return out;
 }
 
-function extractPriorRLMBlocks_copy(transcriptText, { window = 5 } = {}) {
+function extractPriorRLMBlocks_copy(transcriptText, { window = 5, ts } = {}) {
   if (typeof transcriptText !== 'string' || transcriptText.length === 0) return [];
 
+  const stamp = typeof ts === 'number' && Number.isFinite(ts) ? ts : null;
   const tagRe = /<rlm_(?:preresearch|analysis)>([\s\S]*?)<\/rlm_(?:preresearch|analysis)>/g;
   const blocks = [];
   let m;
@@ -2489,6 +2490,7 @@ function extractPriorRLMBlocks_copy(transcriptText, { window = 5 } = {}) {
     blocks.push({
       intent: normalizeIntent_copy(parsed),
       relevant_files: normalizeRelevantFiles_copy(parsed),
+      ts: stamp,
       raw: parsed,
     });
   }
@@ -2515,6 +2517,14 @@ describe('Group 19: Conversation Context Awareness — extractPriorRLMBlocks (Ph
     assert.equal(blocks[0].intent, 'debugging');
     assert.deepEqual(blocks[0].relevant_files, ['src/auth.js', 'src/db.js']);
     assert.equal(blocks[0].raw.summary, 'fixing the login flow');
+  });
+
+  it('stamps a provided ts onto every block; defaults to null when absent/non-finite', () => {
+    const text = preBlock({ intent: 'debugging', relevant_files: ['a.js'] });
+    assert.equal(extractPriorRLMBlocks_copy(text, { ts: 1700000000000 })[0].ts, 1700000000000);
+    assert.equal(extractPriorRLMBlocks_copy(text)[0].ts, null, 'no ts ⇒ null');
+    assert.equal(extractPriorRLMBlocks_copy(text, { ts: Infinity })[0].ts, null, 'non-finite ⇒ null');
+    assert.equal(extractPriorRLMBlocks_copy(text, { ts: 'x' })[0].ts, null, 'non-number ⇒ null');
   });
 
   it('returns multiple blocks newest-first', () => {
@@ -2773,5 +2783,124 @@ describe('Group 20: Conversation Context Awareness — intent-overlap early-exit
     const hit = findReusablePriorBlock_copy('debugging', blocks, {});
     assert.ok(hit);
     assert.deepEqual(hit.relevant_files, ['ok.js']);
+  });
+});
+
+// ============================================================================
+// Group 21: Conversation Context Awareness — computeChangedFiles (Phase 4)
+// Faithful inline copy of computeChangedFiles from rlm-hook.mjs. A path counts
+// as "changed" if stat fails (missing/unreadable) or mtimeMs > sinceMs. Tests
+// inject a fake statImpl so no real filesystem is touched.
+// ============================================================================
+
+async function computeChangedFiles_copy(relevantFiles, sinceMs, { cwd = process.cwd(), statImpl = stat } = {}) {
+  if (!Array.isArray(relevantFiles) || relevantFiles.length === 0) return [];
+  const files = relevantFiles.filter((f) => typeof f === 'string' && f);
+  if (files.length === 0) return [];
+
+  if (typeof sinceMs !== 'number' || !Number.isFinite(sinceMs)) {
+    return [...new Set(files)];
+  }
+
+  const changed = [];
+  const seen = new Set();
+  for (const f of files) {
+    if (seen.has(f)) continue;
+    seen.add(f);
+    const abs = isAbsolute(f) ? f : resolve(cwd, f);
+    try {
+      const st = await statImpl(abs);
+      if (!st || typeof st.mtimeMs !== 'number' || st.mtimeMs > sinceMs) {
+        changed.push(f);
+      }
+    } catch {
+      changed.push(f);
+    }
+  }
+  return changed;
+}
+
+// statImpl backed by a { path → mtimeMs } map; absent path throws (ENOENT-like).
+function fakeStat(mtimes) {
+  return async (p) => {
+    if (Object.prototype.hasOwnProperty.call(mtimes, p)) return { mtimeMs: mtimes[p] };
+    const err = new Error(`ENOENT: no such file: ${p}`);
+    err.code = 'ENOENT';
+    throw err;
+  };
+}
+
+describe('Group 21: Conversation Context Awareness — computeChangedFiles (Phase 4)', () => {
+  const SINCE = 1000;
+  const CWD = '/repo';
+
+  it('an unchanged file (mtime <= since) is NOT reported as changed', async () => {
+    const statImpl = fakeStat({ '/repo/a.js': 500, '/repo/b.js': 1000 });
+    const changed = await computeChangedFiles_copy(['a.js', 'b.js'], SINCE, { cwd: CWD, statImpl });
+    assert.deepEqual(changed, [], 'mtime < since and mtime == since both count as unchanged');
+  });
+
+  it('a modified file (mtime > since) is reported as changed', async () => {
+    const statImpl = fakeStat({ '/repo/a.js': 1500 });
+    const changed = await computeChangedFiles_copy(['a.js'], SINCE, { cwd: CWD, statImpl });
+    assert.deepEqual(changed, ['a.js']);
+  });
+
+  it('a missing file (stat throws) is reported as changed', async () => {
+    const statImpl = fakeStat({}); // nothing exists
+    const changed = await computeChangedFiles_copy(['gone.js'], SINCE, { cwd: CWD, statImpl });
+    assert.deepEqual(changed, ['gone.js']);
+  });
+
+  it('returns only the changed subset of a mixed list, preserving original paths', async () => {
+    const statImpl = fakeStat({
+      '/repo/keep.js': 800,    // unchanged
+      '/repo/edited.js': 2000, // changed (newer)
+      // missing.js absent      → changed
+    });
+    const changed = await computeChangedFiles_copy(
+      ['keep.js', 'edited.js', 'missing.js'], SINCE, { cwd: CWD, statImpl });
+    assert.deepEqual(changed, ['edited.js', 'missing.js']);
+  });
+
+  it('resolves relative paths against cwd, leaves absolute paths untouched', async () => {
+    const statImpl = fakeStat({ '/repo/rel.js': 2000, '/abs/x.js': 500 });
+    const changed = await computeChangedFiles_copy(['rel.js', '/abs/x.js'], SINCE, { cwd: CWD, statImpl });
+    assert.deepEqual(changed, ['rel.js'], 'rel.js resolved under cwd is newer; /abs/x.js is unchanged');
+  });
+
+  it('an empty / non-array / all-empty-string list yields []', async () => {
+    const statImpl = fakeStat({});
+    assert.deepEqual(await computeChangedFiles_copy([], SINCE, { statImpl }), []);
+    assert.deepEqual(await computeChangedFiles_copy(null, SINCE, { statImpl }), []);
+    assert.deepEqual(await computeChangedFiles_copy('not-an-array', SINCE, { statImpl }), []);
+    assert.deepEqual(await computeChangedFiles_copy(['', ''], SINCE, { statImpl }), []);
+  });
+
+  it('a non-finite sinceMs reports every (deduped) path as changed — fail safe', async () => {
+    const statImpl = fakeStat({ '/repo/a.js': 1, '/repo/b.js': 1 }); // would be "unchanged"
+    assert.deepEqual(await computeChangedFiles_copy(['a.js', 'b.js'], null, { cwd: CWD, statImpl }), ['a.js', 'b.js']);
+    assert.deepEqual(await computeChangedFiles_copy(['a.js', 'b.js'], NaN, { cwd: CWD, statImpl }), ['a.js', 'b.js']);
+    assert.deepEqual(await computeChangedFiles_copy(['a.js', 'a.js', 'b.js'], Infinity, { cwd: CWD, statImpl }), ['a.js', 'b.js'],
+      'duplicates collapse even on the no-reference-time path');
+  });
+
+  it('de-dupes repeated paths, reporting each at most once', async () => {
+    const statImpl = fakeStat({ '/repo/dup.js': 2000 });
+    const changed = await computeChangedFiles_copy(['dup.js', 'dup.js', 'dup.js'], SINCE, { cwd: CWD, statImpl });
+    assert.deepEqual(changed, ['dup.js']);
+  });
+
+  it('a stat that returns no usable mtimeMs counts as changed', async () => {
+    const statImpl = async () => ({}); // object without mtimeMs
+    const changed = await computeChangedFiles_copy(['weird.js'], SINCE, { cwd: CWD, statImpl });
+    assert.deepEqual(changed, ['weird.js']);
+  });
+
+  it('drops non-string entries before statting', async () => {
+    const statImpl = fakeStat({ '/repo/real.js': 2000 });
+    const changed = await computeChangedFiles_copy(
+      ['real.js', 42, null, { path: 'obj.js' }], SINCE, { cwd: CWD, statImpl });
+    assert.deepEqual(changed, ['real.js']);
   });
 });
