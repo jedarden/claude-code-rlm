@@ -19,6 +19,9 @@ import { execSync } from 'child_process';
 // parse-log.mjs has NO main()-on-import side effect (CLI is guarded by
 // import.meta.url), so unlike rlm-hook.mjs we import its real exports directly.
 import { parseLog, aggregate, percentile, summarize } from '../bench/parse-log.mjs';
+// dashboard.mjs is likewise side-effect-free on import (CLI/server guarded by
+// import.meta.url) — renderHTML / esc are pure string fns.
+import { renderHTML, esc } from '../bench/dashboard.mjs';
 
 // ============================================================================
 // INLINED LOGIC FROM rlm-hook.mjs
@@ -3540,5 +3543,105 @@ describe('Group 25: Metrics log parse & aggregate (Phase 5)', () => {
     assert.deepEqual(aggregate(null).days, []);
     assert.equal(aggregate(undefined).overall.total, 0);
     assert.equal(aggregate('nope').overall.total, 0);
+  });
+});
+
+// ============================================================================
+// Group 26: Metrics dashboard HTML render — bench/dashboard.mjs (Phase 5, Unit 3)
+// Imported directly (CLI/server guarded by import.meta.url, no side effects).
+// Exercises the REAL pure exports: renderHTML / esc. No FS, no socket.
+// ============================================================================
+
+describe('Group 26: Metrics dashboard renderHTML (Phase 5)', () => {
+  // Build a realistic aggregate via the real aggregate() over a few records.
+  function sampleAgg() {
+    const day = '2026-06-23';
+    const recs = [
+      { ts: Date.parse(`${day}T01:00:00Z`), event: 'cache_hit', cache_hit: true, source: 'sha', mode: 'agentic', latency_ms: 30 },
+      { ts: Date.parse(`${day}T02:00:00Z`), event: 'complete', cache_hit: false, mode: 'agentic', latency_ms: 120 },
+      { ts: Date.parse(`${day}T03:00:00Z`), event: 'skip', cache_hit: false, reason: 'too short', mode: 'fast' },
+      { ts: Date.parse(`${day}T04:00:00Z`), event: 'error', cache_hit: false, reason: 'boom', mode: 'fast', latency_ms: 5 },
+    ];
+    return aggregate(recs);
+  }
+
+  it('esc escapes & < > " (and coerces null/undefined to empty)', () => {
+    assert.equal(esc('<a href="x">&'), '&lt;a href=&quot;x&quot;&gt;&amp;');
+    assert.equal(esc(null), '');
+    assert.equal(esc(undefined), '');
+    assert.equal(esc(42), '42');
+  });
+
+  it('renders a complete HTML document', () => {
+    const html = renderHTML(sampleAgg());
+    assert.match(html, /^<!doctype html>/i);
+    assert.match(html, /<\/html>\s*$/i);
+    assert.match(html, /<title>claude-code-rlm/);
+    assert.match(html, /<style>/); // inline CSS, no external assets
+  });
+
+  it('includes the overall summary cards (hit/skip/error rates as %)', () => {
+    const html = renderHTML(sampleAgg());
+    // 1 of 4 cache_hit -> 25.0%; 1 of 4 skip -> 25.0%; 1 of 4 error -> 25.0%
+    assert.match(html, /Hit rate/);
+    assert.match(html, /Skip rate/);
+    assert.match(html, /Error rate/);
+    assert.match(html, /25\.0%/);
+  });
+
+  it('renders a per-day row for each agg.days entry', () => {
+    const html = renderHTML(sampleAgg());
+    assert.match(html, /2026-06-23/);
+    // p50 over [30,120,5] -> ceil(.5*3)=2 -> idx1 of sorted [5,30,120] -> 30
+    assert.match(html, /30/);
+  });
+
+  it('renders null latencies as an em dash, not "null"', () => {
+    // a single skip record -> no latency_ms anywhere -> p50/p95/p99 all null
+    const agg = aggregate([
+      { ts: Date.parse('2026-06-23T01:00:00Z'), event: 'skip', cache_hit: false, reason: 'x' },
+    ]);
+    const html = renderHTML(agg);
+    assert.match(html, /—/);
+    assert.doesNotMatch(html, />null</);
+  });
+
+  it('renders skip-reasons and mode breakdown rows', () => {
+    const html = renderHTML(sampleAgg());
+    assert.match(html, /too short/);
+    assert.match(html, /agentic/);
+    assert.match(html, /fast/);
+  });
+
+  it('escapes interpolated text (a malicious skip reason cannot inject markup)', () => {
+    const agg = aggregate([
+      {
+        ts: Date.parse('2026-06-23T01:00:00Z'),
+        event: 'skip',
+        cache_hit: false,
+        reason: '<script>alert(1)</script>',
+      },
+    ]);
+    const html = renderHTML(agg);
+    assert.doesNotMatch(html, /<script>alert/);
+    assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  });
+
+  it('renders an empty aggregate without throwing', () => {
+    const html = renderHTML(aggregate([]));
+    assert.match(html, /^<!doctype html>/i);
+    assert.match(html, /No metrics recorded yet\./);
+  });
+
+  it('tolerates missing/partial agg (null, {}, no overall)', () => {
+    for (const bad of [null, undefined, {}, { days: null }, { overall: {} }]) {
+      const html = renderHTML(bad);
+      assert.match(html, /<!doctype html>/i);
+    }
+  });
+
+  it('shows the log path in the subheader when provided', () => {
+    const html = renderHTML(aggregate([]), { logPath: '/tmp/metrics.jsonl' });
+    assert.match(html, /Source: \/tmp\/metrics\.jsonl/);
   });
 });
