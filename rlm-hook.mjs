@@ -37,6 +37,9 @@ const CONFIG = {
   timeout: parseInt(process.env.RLM_TIMEOUT || '60000', 10), // ms
   cacheDir: expandTilde(process.env.RLM_CACHE_DIR) || join(homedir(), '.cache', 'rlm-hook'),
   logFile: expandTilde(process.env.RLM_LOG_FILE) || join(homedir(), '.local', 'share', 'rlm-hook', 'rlm-hook.log'),
+  // Metrics JSONL log (Phase 5): one JSON line per hook outcome for the
+  // dashboard. Same dir family as logFile; best-effort write, never blocks.
+  metricsFile: expandTilde(process.env.RLM_METRICS_FILE) || join(homedir(), '.local', 'share', 'rlm-hook', 'metrics.jsonl'),
   // Agentic mode: allow Haiku to use tools (Read, Glob, Grep, Write, Bash) to explore the codebase
   agenticMode: process.env.RLM_AGENTIC_MODE !== 'false',
   // Max turns for agentic exploration (each turn = one tool call cycle)
@@ -85,6 +88,35 @@ async function log(message) {
     await writeFile(CONFIG.logFile, entry, { flag: 'a' });
   } catch {
     // Ignore logging errors — never block the conversation
+  }
+}
+
+// =============================================================================
+// METRICS (Phase 5)
+// =============================================================================
+
+// Resolve the active mode label (agentic | fast | detailed) for metrics,
+// mirroring the precedence the SDK dispatch / formatOutput use: agentic wins,
+// else fast vs detailed.
+function currentMode() {
+  if (CONFIG.agenticMode) return 'agentic';
+  return CONFIG.fastMode ? 'fast' : 'detailed';
+}
+
+// Append one JSON line to the metrics JSONL log. Bullet-proof exactly like
+// log(): wrapped in try/catch, swallows every error, never throws, never blocks
+// the user — a metrics failure must never change the hook's exit behavior.
+// Stamps `ts` (epoch ms) at write time. Dependency-free (fs/promises appendFile
+// via writeFile flag:'a'). The caller's fields (event, latency_ms, mode,
+// input_len, cache_hit, …) are spread after ts.
+async function appendMetric(metric) {
+  try {
+    const line = JSON.stringify({ ts: Date.now(), ...metric }) + '\n';
+    const dir = join(homedir(), '.local', 'share', 'rlm-hook');
+    await mkdir(dir, { recursive: true });
+    await writeFile(CONFIG.metricsFile, line, { flag: 'a' });
+  } catch {
+    // Never let a metrics failure change the hook's behavior
   }
 }
 
@@ -1655,10 +1687,26 @@ async function readStdin() {
 // =============================================================================
 
 async function main() {
+  // Captured at the very top so latency_ms covers the whole hook invocation
+  // (incl. stdin read). userMessage is hoisted so the error path can record
+  // input_len even if stdin parsing failed.
+  const start = Date.now();
+  let userMessage = '';
+  // Sugar over appendMetric: stamps latency/mode/input_len for every exit point.
+  const recordMetric = (event, cache_hit, extra = {}) =>
+    appendMetric({
+      event,
+      latency_ms: Date.now() - start,
+      mode: currentMode(),
+      input_len: userMessage.length,
+      cache_hit,
+      ...extra,
+    });
+
   try {
     const input = await readStdin();
 
-    let userMessage = input;
+    userMessage = input;
     let cwd = null;
     let transcriptPath = null;
 
@@ -1678,6 +1726,7 @@ async function main() {
     const skipCheck = shouldSkipRLM(userMessage);
     if (skipCheck.skip) {
       await log(`Skipping RLM: ${skipCheck.reason}`);
+      await recordMetric('skip', false, { reason: skipCheck.reason });
       process.exit(0);
     }
 
@@ -1687,6 +1736,7 @@ async function main() {
     if (cached) {
       await log(`Cache hit for ${cacheKey.slice(0, 16)}...`);
       console.log(formatOutput(cached));
+      await recordMetric('cache_hit', true, { source: 'sha' });
       process.exit(0);
     }
 
@@ -1698,6 +1748,7 @@ async function main() {
     const semanticHit = await semanticLookup(userMessage);
     if (semanticHit) {
       console.log(formatOutput(semanticHit));
+      await recordMetric('cache_hit', true, { source: 'semantic' });
       process.exit(0);
     }
 
@@ -1744,6 +1795,7 @@ async function main() {
             `Phase 4 early-exit: reusing prior analysis (intent=${currentIntent}, ${reusable.relevant_files.length} file(s) unchanged)`
           );
           console.log(formatOutput(reusedAnalysis));
+          await recordMetric('context_reuse', true, { intent: currentIntent });
           process.exit(0);
         }
       } catch (err) {
@@ -1804,6 +1856,7 @@ async function main() {
 
     if (analysis.skip_rlm || analysis.skip) {
       await log(`RLM skipped by Haiku: ${analysis.skip_reason || analysis.reason}`);
+      await recordMetric('haiku_skip', false, { reason: analysis.skip_reason || analysis.reason });
       process.exit(0);
     }
 
@@ -1814,8 +1867,10 @@ async function main() {
     console.log(formatOutput(analysis));
 
     await log('RLM analysis complete');
+    await recordMetric('complete', false);
   } catch (error) {
     await log(`ERROR: ${String(error?.message ?? error)}`);
+    await recordMetric('error', false, { reason: String(error?.message ?? error) });
     // Always exit 0 — never block the user's conversation
     process.exit(0);
   }

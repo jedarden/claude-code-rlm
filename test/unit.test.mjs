@@ -3226,3 +3226,114 @@ describe('Group 23: Conversation Context Awareness — main() early-exit (Phase 
     assert.equal(out.summary, '[Continuing from prior pre-research — files unchanged since last turn]');
   });
 });
+
+// ============================================================================
+// Group 24: Metrics JSONL append (Phase 5, Unit 1)
+// appendMetric() and currentMode() are module-scope helpers in rlm-hook.mjs,
+// but main() auto-runs on import so we can't import them. These are faithful
+// inline copies, parameterized on the file path + a writer seam so a write
+// failure can be exercised without a real FS fault. The real helper hardcodes
+// the dir/path from CONFIG and uses fs/promises writeFile(flag:'a').
+// ============================================================================
+
+// Faithful copy of appendMetric(): stamps ts at write time, spreads caller
+// fields, writes one JSON line, swallows every error. The `writeImpl` seam
+// stands in for `mkdir`+`writeFile(flag:'a')` so tests can inject a thrower.
+async function appendMetric_copy(metric, { metricsFile, writeImpl, now = Date.now } = {}) {
+  try {
+    const line = JSON.stringify({ ts: now(), ...metric }) + '\n';
+    await writeImpl(metricsFile, line);
+  } catch {
+    // Never let a metrics failure change the hook's behavior
+  }
+}
+
+// Faithful copy of currentMode(): agentic wins, else fast vs detailed.
+function currentMode_copy(cfg) {
+  if (cfg.agenticMode) return 'agentic';
+  return cfg.fastMode ? 'fast' : 'detailed';
+}
+
+describe('Group 24: Metrics JSONL append (Phase 5)', () => {
+  let testDir;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `rlm-metrics-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  // Real append writer mirroring the production helper (writeFile flag:'a').
+  const realAppend = async (file, line) => { await writeFile(file, line, { flag: 'a' }); };
+
+  it('writes one JSON line with ts stamped at write time and all caller fields', async () => {
+    const metricsFile = join(testDir, 'metrics.jsonl');
+    await appendMetric_copy(
+      { event: 'complete', latency_ms: 1234, mode: 'agentic', input_len: 42, cache_hit: false },
+      { metricsFile, writeImpl: realAppend, now: () => 1700000000000 }
+    );
+    const content = await readFile(metricsFile, 'utf-8');
+    assert.equal(content.endsWith('\n'), true, 'line is newline-terminated');
+    const lines = content.trim().split('\n');
+    assert.equal(lines.length, 1);
+    const rec = JSON.parse(lines[0]);
+    assert.equal(rec.ts, 1700000000000, 'ts stamped at write time');
+    assert.equal(rec.event, 'complete');
+    assert.equal(rec.latency_ms, 1234);
+    assert.equal(rec.mode, 'agentic');
+    assert.equal(rec.input_len, 42);
+    assert.equal(rec.cache_hit, false);
+  });
+
+  it('appends (does not overwrite) across multiple calls — one JSONL line each', async () => {
+    const metricsFile = join(testDir, 'metrics.jsonl');
+    await appendMetric_copy({ event: 'skip', cache_hit: false }, { metricsFile, writeImpl: realAppend, now: () => 1 });
+    await appendMetric_copy({ event: 'cache_hit', cache_hit: true }, { metricsFile, writeImpl: realAppend, now: () => 2 });
+    await appendMetric_copy({ event: 'context_reuse', cache_hit: true }, { metricsFile, writeImpl: realAppend, now: () => 3 });
+    const lines = (await readFile(metricsFile, 'utf-8')).trim().split('\n');
+    assert.equal(lines.length, 3);
+    assert.deepEqual(lines.map(l => JSON.parse(l).event), ['skip', 'cache_hit', 'context_reuse']);
+    assert.deepEqual(lines.map(l => JSON.parse(l).ts), [1, 2, 3]);
+  });
+
+  it('carries extra fields (reason/source/intent) through the spread', async () => {
+    const metricsFile = join(testDir, 'metrics.jsonl');
+    await appendMetric_copy(
+      { event: 'skip', cache_hit: false, reason: 'too short' },
+      { metricsFile, writeImpl: realAppend, now: () => 9 }
+    );
+    const rec = JSON.parse((await readFile(metricsFile, 'utf-8')).trim());
+    assert.equal(rec.reason, 'too short');
+  });
+
+  it('swallows a write failure — never throws, never propagates', async () => {
+    const throwingWrite = async () => { throw new Error('disk full'); };
+    // Must resolve (not reject) despite the writer throwing.
+    await assert.doesNotReject(
+      appendMetric_copy(
+        { event: 'error', cache_hit: false },
+        { metricsFile: join(testDir, 'metrics.jsonl'), writeImpl: throwingWrite, now: () => 1 }
+      )
+    );
+    // And nothing was written.
+    assert.equal(existsSync(join(testDir, 'metrics.jsonl')), false);
+  });
+
+  it('swallows a JSON.stringify failure (circular metric) without throwing', async () => {
+    const circular = { event: 'complete', cache_hit: false };
+    circular.self = circular; // JSON.stringify throws on this
+    await assert.doesNotReject(
+      appendMetric_copy(circular, { metricsFile: join(testDir, 'metrics.jsonl'), writeImpl: realAppend, now: () => 1 })
+    );
+  });
+
+  it('currentMode resolves agentic > fast > detailed by the same precedence as main()', () => {
+    assert.equal(currentMode_copy({ agenticMode: true, fastMode: true }), 'agentic', 'agentic wins');
+    assert.equal(currentMode_copy({ agenticMode: true, fastMode: false }), 'agentic');
+    assert.equal(currentMode_copy({ agenticMode: false, fastMode: true }), 'fast');
+    assert.equal(currentMode_copy({ agenticMode: false, fastMode: false }), 'detailed');
+  });
+});
