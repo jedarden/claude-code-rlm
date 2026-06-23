@@ -342,6 +342,100 @@ function extractPriorRLMBlocks(transcriptText, { window = CONFIG.contextWindow }
   return blocks.slice(0, limit);
 }
 
+/**
+ * Cheap, dependency-free intent classifier for the *current* user message.
+ *
+ * DECISION (Phase 4 open question — "where does current intent come from before
+ * we run Haiku?"): option (a). We classify the raw user message locally with a
+ * keyword heuristic so the early-exit can fire on the *current* turn rather than
+ * waiting for a subsequent one. Misclassification is safe: it can only cause a
+ * MISSED reuse (we just fall through and run Haiku as normal) — never a wrong
+ * reuse, because reuse additionally requires the prior block's files to be
+ * unchanged (see findReusablePriorBlock).
+ *
+ * Labels are drawn from the agentic-mode enum (the default mode), which is a
+ * superset of the fast-mode enum, so the output can match prior blocks from
+ * either mode. First match wins; order is by signal strength.
+ *
+ * @param {string} userMessage
+ * @returns {'code_writing'|'debugging'|'refactoring'|'architecture'|'learning'|'other'}
+ */
+const INTENT_KEYWORDS = [
+  ['debugging', /\b(bug|bugs|debug|error|errors|crash(?:es|ed|ing)?|broken|fails?|failing|failed|stack ?trace|traceback|exception|regression|not working|doesn'?t work|isn'?t working)\b/i],
+  ['refactoring', /\b(refactor(?:ing)?|clean ?up|cleanup|rename|renaming|restructure|reorganize|simplify|extract|deduplicate|de-?dupe|tidy)\b/i],
+  ['code_writing', /\b(add|implement|create|build|write|introduce|generate|scaffold|new feature|support for|set up|wire up)\b/i],
+  ['architecture', /\b(architect\w*|design|structure|best way|approach|trade-?offs?|scalab\w*|high-level)\b/i],
+  ['learning', /\b(what (?:is|are|does|do)|how (?:do|does|can|should)|explain|understand|why (?:is|are|does|do)|where (?:is|are)|tell me about)\b/i],
+];
+
+function classifyIntentLocal(userMessage) {
+  if (typeof userMessage !== 'string' || !userMessage.trim()) return 'other';
+  for (const [label, re] of INTENT_KEYWORDS) {
+    if (re.test(userMessage)) return label;
+  }
+  return 'other';
+}
+
+/**
+ * Do two intent labels refer to the same root task?
+ *
+ * Strict, case-insensitive equality of the normalized label. Strictness is
+ * deliberate: the plan warns against injecting stale/wrong context, so we only
+ * treat clearly-identical intents as overlapping. Null/empty/non-string on
+ * either side ⇒ no overlap.
+ *
+ * @param {*} a
+ * @param {*} b
+ * @returns {boolean}
+ */
+function intentsOverlap(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const na = a.trim().toLowerCase();
+  const nb = b.trim().toLowerCase();
+  if (!na || !nb) return false;
+  return na === nb;
+}
+
+/**
+ * Find the most-recent prior RLM block that can be reused for the current turn.
+ *
+ * A block is reusable when ALL hold:
+ *   1. its intent overlaps the current intent (intentsOverlap),
+ *   2. that intent is NOT the catch-all `other` (too low-confidence to reuse —
+ *      two unrelated "other" tasks must not collapse together),
+ *   3. it recorded at least one relevant file (something concrete to reuse), and
+ *   4. NONE of its relevant files appear in `changedFiles`.
+ *
+ * `priorBlocks` is expected newest-first (as extractPriorRLMBlocks returns), so
+ * the first qualifying block is the most recent. `changedFiles` is supplied by
+ * the caller (Unit 3 computes it via mtime comparison); absent ⇒ treat nothing
+ * as changed. Pure; never throws.
+ *
+ * @param {string} currentIntent  classifyIntentLocal output (or a prior label)
+ * @param {Array<{intent: string|null, relevant_files: string[]}>} priorBlocks
+ * @param {{changedFiles?: string[]}} opts
+ * @returns {{intent: string|null, relevant_files: string[]}|null}
+ */
+function findReusablePriorBlock(currentIntent, priorBlocks, { changedFiles = [] } = {}) {
+  if (!Array.isArray(priorBlocks) || priorBlocks.length === 0) return null;
+  if (typeof currentIntent !== 'string' || !currentIntent.trim()) return null;
+  if (currentIntent.trim().toLowerCase() === 'other') return null;
+
+  const changed = new Set(
+    (Array.isArray(changedFiles) ? changedFiles : []).filter((f) => typeof f === 'string')
+  );
+
+  for (const block of priorBlocks) {
+    if (!block || typeof block !== 'object') continue;
+    if (!intentsOverlap(currentIntent, block.intent)) continue;
+    const files = Array.isArray(block.relevant_files) ? block.relevant_files : [];
+    if (files.length === 0) continue; // nothing concrete to reuse
+    if (files.some((f) => changed.has(f))) continue; // a referenced file changed
+    return block;
+  }
+  return null;
+}
+
 // =============================================================================
 // PROMPT BUILDING
 // =============================================================================
