@@ -2439,3 +2439,170 @@ describe('Group 18: Semantic Cache — index.json reverse index (Phase 3)', () =
     assert.equal(hit.who, 'GOOD');
   });
 });
+
+// ============================================================================
+// Group 19: Conversation Context Awareness — extractPriorRLMBlocks (Phase 4)
+// Faithful inline copies of normalizeIntent / normalizeRelevantFiles /
+// extractPriorRLMBlocks from rlm-hook.mjs.
+// ============================================================================
+
+function normalizeIntent_copy(analysis) {
+  const intent = analysis?.intent;
+  if (typeof intent === 'string') return intent || null;
+  if (intent && typeof intent === 'object' && typeof intent.primary === 'string') {
+    return intent.primary || null;
+  }
+  return null;
+}
+
+function normalizeRelevantFiles_copy(analysis) {
+  const raw = Array.isArray(analysis?.relevant_files)
+    ? analysis.relevant_files
+    : (Array.isArray(analysis?.files) ? analysis.files : []);
+  const out = [];
+  for (const f of raw) {
+    if (typeof f === 'string') {
+      if (f) out.push(f);
+    } else if (f && typeof f === 'object' && typeof f.path === 'string' && f.path) {
+      out.push(f.path);
+    }
+  }
+  return out;
+}
+
+function extractPriorRLMBlocks_copy(transcriptText, { window = 5 } = {}) {
+  if (typeof transcriptText !== 'string' || transcriptText.length === 0) return [];
+
+  const tagRe = /<rlm_(?:preresearch|analysis)>([\s\S]*?)<\/rlm_(?:preresearch|analysis)>/g;
+  const blocks = [];
+  let m;
+  while ((m = tagRe.exec(transcriptText)) !== null) {
+    const body = m[1].trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+
+    blocks.push({
+      intent: normalizeIntent_copy(parsed),
+      relevant_files: normalizeRelevantFiles_copy(parsed),
+      raw: parsed,
+    });
+  }
+
+  blocks.reverse();
+  const limit = Number.isFinite(window) && window > 0 ? window : blocks.length;
+  return blocks.slice(0, limit);
+}
+
+// Build a decoded <rlm_preresearch> block exactly as formatOutput emits it.
+function preBlock(analysis, trailer = 'PRERESEARCH COMPLETE:\nIntent: x') {
+  return `<rlm_preresearch>\n${JSON.stringify(analysis, null, 2)}\n</rlm_preresearch>\n\n${trailer}`;
+}
+
+describe('Group 19: Conversation Context Awareness — extractPriorRLMBlocks (Phase 4)', () => {
+  it('parses a single agentic block: intent + relevant_files (strings & objects)', () => {
+    const text = preBlock({
+      intent: 'debugging',
+      summary: 'fixing the login flow',
+      relevant_files: ['src/auth.js', { path: 'src/db.js', purpose: 'queries' }],
+    });
+    const blocks = extractPriorRLMBlocks_copy(text);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].intent, 'debugging');
+    assert.deepEqual(blocks[0].relevant_files, ['src/auth.js', 'src/db.js']);
+    assert.equal(blocks[0].raw.summary, 'fixing the login flow');
+  });
+
+  it('returns multiple blocks newest-first', () => {
+    const text = [
+      preBlock({ intent: 'oldest', relevant_files: ['a.js'] }),
+      preBlock({ intent: 'middle', relevant_files: ['b.js'] }),
+      preBlock({ intent: 'newest', relevant_files: ['c.js'] }),
+    ].join('\n\n--- turn boundary ---\n\n');
+    const blocks = extractPriorRLMBlocks_copy(text);
+    assert.deepEqual(blocks.map(b => b.intent), ['newest', 'middle', 'oldest']);
+  });
+
+  it('caps results to the look-back window (most recent N)', () => {
+    const text = Array.from({ length: 6 }, (_, i) =>
+      preBlock({ intent: `turn${i}`, relevant_files: [] })).join('\n');
+    const blocks = extractPriorRLMBlocks_copy(text, { window: 2 });
+    assert.equal(blocks.length, 2);
+    assert.deepEqual(blocks.map(b => b.intent), ['turn5', 'turn4']);
+  });
+
+  it('window <= 0 or non-finite returns all blocks', () => {
+    const text = [
+      preBlock({ intent: 'a', relevant_files: [] }),
+      preBlock({ intent: 'b', relevant_files: [] }),
+    ].join('\n');
+    assert.equal(extractPriorRLMBlocks_copy(text, { window: 0 }).length, 2);
+    assert.equal(extractPriorRLMBlocks_copy(text, { window: -1 }).length, 2);
+    assert.equal(extractPriorRLMBlocks_copy(text, { window: Infinity }).length, 2);
+  });
+
+  it('also recognizes <rlm_analysis> (fast/detailed) blocks', () => {
+    const fast = `<rlm_analysis>\n${JSON.stringify({ intent: 'code_writing', files: ['x.ts', 'y.ts'] }, null, 2)}\n</rlm_analysis>`;
+    const blocks = extractPriorRLMBlocks_copy(fast);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].intent, 'code_writing');
+    assert.deepEqual(blocks[0].relevant_files, ['x.ts', 'y.ts']);
+  });
+
+  it('reads detailed-mode intent shape { primary }', () => {
+    const detailed = `<rlm_analysis>\n${JSON.stringify({
+      intent: { primary: 'architecture', confidence: 'high' },
+    }, null, 2)}\n</rlm_analysis>`;
+    const blocks = extractPriorRLMBlocks_copy(detailed);
+    assert.equal(blocks[0].intent, 'architecture');
+    assert.deepEqual(blocks[0].relevant_files, []);
+  });
+
+  it('skips a block with a malformed JSON body but keeps the valid ones', () => {
+    const text = [
+      '<rlm_preresearch>\n{ this is : not json,, }\n</rlm_preresearch>',
+      preBlock({ intent: 'valid', relevant_files: ['ok.js'] }),
+    ].join('\n\n');
+    const blocks = extractPriorRLMBlocks_copy(text);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].intent, 'valid');
+  });
+
+  it('skips a block whose JSON root is an array (not an object)', () => {
+    const arrBlock = '<rlm_preresearch>\n[1, 2, 3]\n</rlm_preresearch>';
+    assert.deepEqual(extractPriorRLMBlocks_copy(arrBlock), []);
+  });
+
+  it('returns [] for transcript with no RLM blocks (plain conversation turns)', () => {
+    const text = 'user: please add a logout button\nassistant: sure, here is the diff ...';
+    assert.deepEqual(extractPriorRLMBlocks_copy(text), []);
+  });
+
+  it('returns [] for absent / empty / non-string input', () => {
+    assert.deepEqual(extractPriorRLMBlocks_copy(''), []);
+    assert.deepEqual(extractPriorRLMBlocks_copy(null), []);
+    assert.deepEqual(extractPriorRLMBlocks_copy(undefined), []);
+    assert.deepEqual(extractPriorRLMBlocks_copy(42), []);
+  });
+
+  it('tolerates a missing intent / missing files (degrades, does not throw)', () => {
+    const text = preBlock({ summary: 'no intent and no files here' });
+    const blocks = extractPriorRLMBlocks_copy(text);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].intent, null);
+    assert.deepEqual(blocks[0].relevant_files, []);
+  });
+
+  it('drops empty-string paths and non-string/objectless file entries', () => {
+    const text = preBlock({
+      intent: 'x',
+      relevant_files: ['real.js', '', 0, null, { purpose: 'no path' }, { path: '' }, { path: 'kept.js' }],
+    });
+    const blocks = extractPriorRLMBlocks_copy(text);
+    assert.deepEqual(blocks[0].relevant_files, ['real.js', 'kept.js']);
+  });
+});
