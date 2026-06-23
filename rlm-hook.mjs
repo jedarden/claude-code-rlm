@@ -14,8 +14,8 @@
 
 import { spawn, execSync } from 'child_process';
 import { createHash } from 'crypto';
-import { mkdir, readFile, writeFile, stat, rm, rename } from 'fs/promises';
-import { join, basename } from 'path';
+import { mkdir, readFile, writeFile, stat, rm, rename, readdir } from 'fs/promises';
+import { join, basename, resolve, relative, isAbsolute } from 'path';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
 
@@ -534,6 +534,298 @@ async function callHaikuDetailedSDK(prompt, apiKey, client = null) {
 }
 
 // =============================================================================
+// SDK AGENTIC MODE — TOOL DISPATCH (Phase 2, Unit 5)
+// =============================================================================
+//
+// In agentic mode the CLI runs the tool-use loop for us; via the SDK we have to
+// drive it explicitly: send a `tools` array, and whenever Haiku replies with
+// `tool_use` blocks, run each tool locally and feed back a matching
+// `tool_result`. Tools are dependency-free Node built-ins (Glob/Read/Write) plus
+// `child_process` (Grep/git), constrained so the preresearch agent can only read
+// the project and run git — never mutate the working tree (Write goes to a
+// pid-scoped scratch file) or run arbitrary shell.
+
+/** The tool schema advertised to Haiku. Mirrors the agentic prompt's tool list. */
+const AGENTIC_TOOLS = [
+  {
+    name: 'Glob',
+    description: 'Find files by glob pattern (e.g. "src/**/*.ts", "**/auth*"). Returns matching paths relative to the project root.',
+    input_schema: {
+      type: 'object',
+      properties: { pattern: { type: 'string', description: 'Glob pattern' } },
+      required: ['pattern'],
+    },
+  },
+  {
+    name: 'Grep',
+    description: 'Search file contents for a pattern (fixed string or regex). Returns matching lines with file:line prefixes.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Search pattern' },
+        path: { type: 'string', description: 'Optional sub-path to scope the search' },
+      },
+      required: ['pattern'],
+    },
+  },
+  {
+    name: 'Read',
+    description: 'Read a file (relative to the project root). Long files are truncated.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'File path to read' } },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'Write',
+    description: 'Append/overwrite intermediate research notes to a scratch file. Pass the full note content; the path is managed for you.',
+    input_schema: {
+      type: 'object',
+      properties: { content: { type: 'string', description: 'Note content to write' } },
+      required: ['content'],
+    },
+  },
+  {
+    name: 'Bash',
+    description: 'Run a read-only git command ONLY (e.g. "git log --oneline -10", "git diff", "git show", "git blame"). Non-git commands are rejected.',
+    input_schema: {
+      type: 'object',
+      properties: { command: { type: 'string', description: 'A git command' } },
+      required: ['command'],
+    },
+  },
+];
+
+/** Single-quote a string for safe use as one shell argument. */
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * resolveWithin — resolve `p` against `root` and refuse anything that escapes
+ * the project root (path traversal / absolute paths pointing elsewhere).
+ * Returns the absolute path, or null if it escapes.
+ */
+function resolveWithin(root, p) {
+  const full = isAbsolute(p) ? p : resolve(root, p);
+  const rel = relative(root, full);
+  if (rel === '' ) return full;
+  if (rel.startsWith('..') || isAbsolute(rel)) return null;
+  return full;
+}
+
+/**
+ * isAllowedGitCommand — the Bash tool only permits read-only git invocations.
+ * The command must start with `git` and contain no shell metacharacters that
+ * would allow chaining, redirection, or substitution (the command is run via a
+ * shell, so this guard is what prevents `git log; rm -rf /`).
+ */
+function isAllowedGitCommand(command) {
+  const cmd = String(command || '').trim();
+  if (!/^git(\s|$)/.test(cmd)) return false;
+  if (/[;&|`$()<>{}\n]/.test(cmd)) return false;
+  return true;
+}
+
+/** glob → anchored RegExp. `**` crosses directory separators, `*`/`?` do not. */
+function globToRegExp(pattern) {
+  let re = '';
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === '*') {
+      if (pattern[i + 1] === '*') {
+        re += '.*';
+        i += 2;
+        if (pattern[i] === '/') i++; // "**/x" should also match "x" at the root
+      } else {
+        re += '[^/]*';
+        i++;
+      }
+    } else if (ch === '?') {
+      re += '[^/]';
+      i++;
+    } else if ('.+^${}()|[]\\'.includes(ch)) {
+      re += '\\' + ch;
+      i++;
+    } else {
+      re += ch;
+      i++;
+    }
+  }
+  return new RegExp('^' + re + '$');
+}
+
+const GLOB_SKIP_DIRS = new Set(['node_modules', '.git']);
+
+/** Glob tool — recursive readdir (fs.glob is Node 22+; we target Node 20). */
+async function toolGlob(pattern, cwd, limit = 100) {
+  if (!pattern) return 'Error: Glob requires a pattern';
+  const root = cwd || process.cwd();
+  const re = globToRegExp(pattern);
+  const matches = [];
+  async function walk(dir, rel) {
+    if (matches.length >= limit) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (matches.length >= limit) return;
+      const relPath = rel ? `${rel}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) {
+        if (GLOB_SKIP_DIRS.has(ent.name)) continue;
+        await walk(join(dir, ent.name), relPath);
+      } else if (ent.isFile() && re.test(relPath)) {
+        matches.push(relPath);
+      }
+    }
+  }
+  await walk(root, '');
+  return matches.length ? matches.join('\n') : 'No files matched.';
+}
+
+/** Grep tool — delegates to system grep (recursive, skipping node_modules/.git). */
+function toolGrep(pattern, path, cwd) {
+  if (!pattern) return 'Error: Grep requires a pattern';
+  const root = cwd || process.cwd();
+  const target = path ? (resolveWithin(root, path) || root) : root;
+  try {
+    const out = execSync(
+      `grep -rn --exclude-dir=node_modules --exclude-dir=.git -e ${shellQuote(pattern)} ${shellQuote(target)} 2>/dev/null | head -50`,
+      { timeout: 5000, maxBuffer: 1024 * 1024 }
+    ).toString().trim();
+    return out || 'No matches found.';
+  } catch (err) {
+    // grep exits 1 on no matches; the head pipe usually masks this, but be safe.
+    if (err && err.status === 1) return 'No matches found.';
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+/** Read tool — read a file inside the project root, truncating long content. */
+async function toolRead(path, cwd, maxBytes = 16000) {
+  if (!path) return 'Error: Read requires a path';
+  const root = cwd || process.cwd();
+  const full = resolveWithin(root, path);
+  if (!full) return `Error: path escapes project root: ${path}`;
+  try {
+    let content = await readFile(full, 'utf-8');
+    if (content.length > maxBytes) content = content.slice(0, maxBytes) + '\n... [truncated]';
+    return content;
+  } catch (err) {
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+/** pid-scoped scratch path — avoids collisions between concurrent hook runs. */
+function sdkScratchPath(cwd) {
+  return join(cwd || process.cwd(), '.claude', `rlm-scratch-${process.pid}.md`);
+}
+
+/** Write tool — always targets the pid-scoped scratch file (never user code). */
+async function toolWrite(content, cwd) {
+  const root = cwd || process.cwd();
+  const scratch = sdkScratchPath(root);
+  const text = String(content ?? '');
+  try {
+    await mkdir(join(root, '.claude'), { recursive: true });
+    await writeFile(scratch, text);
+    return `Wrote ${text.length} chars to ${scratch}`;
+  } catch (err) {
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+/** Bash tool — read-only git commands only. */
+function toolBashGit(command, cwd) {
+  if (!command) return 'Error: Bash requires a command';
+  if (!isAllowedGitCommand(command)) {
+    return `Error: only read-only "git ..." commands are permitted (rejected: ${String(command).trim().slice(0, 60)})`;
+  }
+  try {
+    const out = execSync(String(command).trim(), {
+      cwd: cwd || process.cwd(),
+      timeout: 5000,
+      maxBuffer: 1024 * 1024,
+    }).toString();
+    return out.slice(0, 8000) || '(no output)';
+  } catch (err) {
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+/**
+ * dispatchAgenticTool — route a single tool_use block to its implementation and
+ * return a string result for the tool_result block. Never throws: any failure
+ * becomes an "Error: ..." string so the loop can continue and Haiku can react.
+ */
+async function dispatchAgenticTool(name, input, cwd) {
+  const args = input || {};
+  try {
+    switch (name) {
+      case 'Glob': return await toolGlob(args.pattern, cwd);
+      case 'Grep': return toolGrep(args.pattern, args.path, cwd);
+      case 'Read': return await toolRead(args.path, cwd);
+      case 'Write': return await toolWrite(args.content, cwd);
+      case 'Bash': return toolBashGit(args.command, cwd);
+      default: return `Error: unknown tool "${name}"`;
+    }
+  } catch (err) {
+    return `Error: ${String(err?.message ?? err)}`;
+  }
+}
+
+/**
+ * callHaikuAgenticSDK — the explicit tool-use loop. Sends the agentic prompt with
+ * the AGENTIC_TOOLS schema; while Haiku replies with `tool_use`, run each tool
+ * and feed back a `tool_result` keyed by `tool_use_id`, then re-call. Stops when
+ * `stop_reason !== 'tool_use'` (returns that turn's text) or when CONFIG.maxTurns
+ * is hit (returns the best text seen so far). `client` and `dispatch` are
+ * injectable for tests; in production they default to the real implementations.
+ */
+async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch = dispatchAgenticTool) {
+  const startTime = Date.now();
+  const c = client || await createAnthropicClient(apiKey);
+  const messages = [{ role: 'user', content: prompt }];
+  let lastText = '';
+
+  for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
+    const response = await c.messages.create({
+      model: CONFIG.haikuModel,
+      max_tokens: CONFIG.sdkMaxTokens,
+      tools: AGENTIC_TOOLS,
+      messages,
+    });
+
+    const text = extractSDKText(response);
+    if (text) lastText = text;
+
+    if (response.stop_reason !== 'tool_use') {
+      await log(`Haiku SDK (agentic) completed in ${Date.now() - startTime}ms over ${turn + 1} turn(s)`);
+      return text || lastText;
+    }
+
+    // Echo the assistant's tool_use turn back, then answer each tool call.
+    messages.push({ role: 'assistant', content: response.content });
+    const toolResults = [];
+    for (const block of response.content || []) {
+      if (block && block.type === 'tool_use') {
+        const result = await dispatch(block.name, block.input, cwd);
+        toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result });
+      }
+    }
+    messages.push({ role: 'user', content: toolResults });
+  }
+
+  await log(`Haiku SDK (agentic) hit turn cap (${CONFIG.maxTurns}) in ${Date.now() - startTime}ms`);
+  return lastText;
+}
+
+// =============================================================================
 // RESPONSE PARSING
 // =============================================================================
 
@@ -727,6 +1019,21 @@ async function main() {
       } catch (err) {
         await log(`SDK ${label} path failed, falling back to subprocess: ${String(err?.message ?? err)}`);
         response = null;
+      }
+    }
+
+    // SDK-Direct agentic path (Phase 2, Unit 5): drive the tool-use loop directly
+    // instead of spawning the CLI. Cleans up its own pid-scoped scratch file. On
+    // any SDK error, fall through to the subprocess path below.
+    if (response === null && shouldUseSDK() && CONFIG.agenticMode) {
+      try {
+        response = await callHaikuAgenticSDK(prompt, CONFIG.apiKey, cwd);
+        await log('Used SDK-Direct agentic path');
+      } catch (err) {
+        await log(`SDK agentic path failed, falling back to subprocess: ${String(err?.message ?? err)}`);
+        response = null;
+      } finally {
+        try { await rm(sdkScratchPath(cwd), { force: true }); } catch {}
       }
     }
 
