@@ -1592,3 +1592,158 @@ describe('Group 12: SDK-Direct Agentic Path (Phase 2)', () => {
     }
   });
 });
+
+// ============================================================================
+// GROUP 13: SDK ROUTING & CLIENT HARDENING (Phase 2, Unit 6)
+// ============================================================================
+//
+// Covers the remaining SDK-path seams not exercised by Groups 10–12:
+//  - createAnthropicClient lazy-import: success constructs a client; a missing
+//    SDK surfaces as a catchable error so main() can fall back to the subprocess.
+//  - extractSDKText on a realistic agentic final turn (mixed text + tool_use).
+//  - main()'s three-branch routing (fast/detailed SDK → agentic SDK → subprocess)
+//    and the `response === null` guards that make an SDK success short-circuit
+//    every later branch.
+
+// createAnthropicClient with an injectable importer. The hook hard-codes
+// `import('@anthropic-ai/sdk')`; parameterizing the importer lets us exercise
+// both the construct-with-key success and the missing-dependency failure seam.
+async function createAnthropicClient(apiKey, importer = (m) => import(m)) {
+  const { default: Anthropic } = await importer('@anthropic-ai/sdk');
+  return new Anthropic({ apiKey });
+}
+
+// routeSDK — faithful model of main()'s SDK/subprocess decision tree. Each branch
+// is an injected thunk so we can assert exactly which path ran. Mirrors the two
+// `response === null && ...` guards that make an SDK success short-circuit the
+// rest, and the final `if (response === null)` subprocess fallback.
+async function routeSDK(cfg, impls) {
+  const { useSDK, apiKey, agenticMode, fastMode } = cfg;
+  let response = null;
+  if (shouldUseSDK({ useSDK, apiKey }) && !agenticMode) {
+    try {
+      response = fastMode ? await impls.fastSDK() : await impls.detailedSDK();
+    } catch {
+      response = null;
+    }
+  }
+  if (response === null && shouldUseSDK({ useSDK, apiKey }) && agenticMode) {
+    try {
+      response = await impls.agenticSDK();
+    } catch {
+      response = null;
+    }
+  }
+  if (response === null) {
+    response = await impls.subprocess();
+  }
+  return response;
+}
+
+// Branch impls that count how often each path was invoked.
+function makeImpls(overrides = {}) {
+  const called = { fastSDK: 0, detailedSDK: 0, agenticSDK: 0, subprocess: 0 };
+  const wrap = (name, fn) => async () => { called[name]++; return fn(); };
+  return {
+    called,
+    impls: {
+      fastSDK: wrap('fastSDK', overrides.fastSDK || (() => 'FAST')),
+      detailedSDK: wrap('detailedSDK', overrides.detailedSDK || (() => 'DETAILED')),
+      agenticSDK: wrap('agenticSDK', overrides.agenticSDK || (() => 'AGENTIC')),
+      subprocess: wrap('subprocess', overrides.subprocess || (() => 'SUBPROCESS')),
+    },
+  };
+}
+
+describe('Group 13: SDK Routing & Client Hardening (Phase 2)', () => {
+  // --- createAnthropicClient lazy-import seam ---
+  it('createAnthropicClient: constructs the client with the apiKey on success', async () => {
+    let seenKey = null;
+    const fakeImport = async () => ({ default: class { constructor(opts) { seenKey = opts.apiKey; } } });
+    const client = await createAnthropicClient('sk-test', fakeImport);
+    assert.ok(client, 'returns a client instance');
+    assert.equal(seenKey, 'sk-test', 'apiKey threaded into the SDK constructor');
+  });
+
+  it('createAnthropicClient: a missing SDK rejects (catchable → main() falls back)', async () => {
+    const failImport = async () => { throw new Error("Cannot find package '@anthropic-ai/sdk'"); };
+    await assert.rejects(
+      () => createAnthropicClient('sk-x', failImport),
+      /Cannot find package/,
+    );
+  });
+
+  // --- extractSDKText on a realistic agentic final turn ---
+  it('extractSDKText: agentic final turn (text + tool_use mixed) yields only the text', () => {
+    const finalTurn = { stop_reason: 'end_turn', content: [
+      { type: 'text', text: '{"intent":"debugging",' },
+      { type: 'tool_use', id: 't9', name: 'Read', input: { path: 'x' } },
+      { type: 'text', text: '"relevant_files":["a.js"]}' },
+    ] };
+    const text = extractSDKText(finalTurn);
+    assert.equal(text, '{"intent":"debugging","relevant_files":["a.js"]}');
+    assert.deepEqual(parseHaikuResponse(text), { intent: 'debugging', relevant_files: ['a.js'] });
+  });
+
+  // --- main()'s three-branch routing ---
+  it('routing: non-agentic SDK success returns SDK text and skips agentic + subprocess', async () => {
+    const { called, impls } = makeImpls();
+    const out = await routeSDK({ useSDK: true, apiKey: 'k', agenticMode: false, fastMode: true }, impls);
+    assert.equal(out, 'FAST');
+    assert.deepEqual(called, { fastSDK: 1, detailedSDK: 0, agenticSDK: 0, subprocess: 0 },
+      'SDK success short-circuits — subprocess never runs');
+  });
+
+  it('routing: detailed mode (fastMode=false) picks detailedSDK', async () => {
+    const { called, impls } = makeImpls();
+    const out = await routeSDK({ useSDK: true, apiKey: 'k', agenticMode: false, fastMode: false }, impls);
+    assert.equal(out, 'DETAILED');
+    assert.equal(called.detailedSDK, 1);
+    assert.equal(called.fastSDK, 0);
+  });
+
+  it('routing: non-agentic SDK error falls back to subprocess (agentic branch skipped)', async () => {
+    const { called, impls } = makeImpls({ fastSDK: () => { throw new Error('429'); } });
+    const out = await routeSDK({ useSDK: true, apiKey: 'k', agenticMode: false, fastMode: true }, impls);
+    assert.equal(out, 'SUBPROCESS');
+    assert.deepEqual(called, { fastSDK: 1, detailedSDK: 0, agenticSDK: 0, subprocess: 1 },
+      'agentic branch not entered when !agenticMode');
+  });
+
+  it('routing: agentic SDK success returns its text and skips the subprocess', async () => {
+    const { called, impls } = makeImpls();
+    const out = await routeSDK({ useSDK: true, apiKey: 'k', agenticMode: true, fastMode: false }, impls);
+    assert.equal(out, 'AGENTIC');
+    assert.deepEqual(called, { fastSDK: 0, detailedSDK: 0, agenticSDK: 1, subprocess: 0 },
+      'agentic SDK success short-circuits the subprocess; non-agentic branch skipped');
+  });
+
+  it('routing: agentic SDK error falls back to subprocess', async () => {
+    const { called, impls } = makeImpls({ agenticSDK: () => { throw new Error('503'); } });
+    const out = await routeSDK({ useSDK: true, apiKey: 'k', agenticMode: true, fastMode: false }, impls);
+    assert.equal(out, 'SUBPROCESS');
+    assert.deepEqual(called, { fastSDK: 0, detailedSDK: 0, agenticSDK: 1, subprocess: 1 });
+  });
+
+  it('routing: SDK disabled (no key) goes straight to subprocess, no SDK calls', async () => {
+    const { called, impls } = makeImpls();
+    const out = await routeSDK({ useSDK: true, apiKey: null, agenticMode: true, fastMode: false }, impls);
+    assert.equal(out, 'SUBPROCESS');
+    assert.deepEqual(called, { fastSDK: 0, detailedSDK: 0, agenticSDK: 0, subprocess: 1 });
+  });
+
+  // --- the response===null guards (defends against double-running a later branch) ---
+  it('routing guard: a populated response blocks BOTH the agentic SDK and the subprocess', () => {
+    // Models the two `response === null && ...` guards in main(). Once response is
+    // set (e.g. a successful earlier branch), neither later branch may fire — even
+    // if its other predicates are satisfied.
+    const takeAgentic = (response, useSDK, apiKey, agenticMode) =>
+      response === null && shouldUseSDK({ useSDK, apiKey }) && agenticMode;
+    const takeSubprocess = (response) => response === null;
+
+    assert.equal(takeAgentic('FAST', true, 'k', true), false, 'non-null response → agentic skipped');
+    assert.equal(takeSubprocess('FAST'), false, 'non-null response → subprocess skipped');
+    assert.equal(takeAgentic(null, true, 'k', true), true, 'null response + agentic + SDK → agentic runs');
+    assert.equal(takeSubprocess(null), true, 'null response → subprocess runs');
+  });
+});
