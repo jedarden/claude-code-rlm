@@ -907,6 +907,49 @@ function cosineSimilarity(a, b) {
   return dot / (Math.sqrt(magA) * Math.sqrt(magB));
 }
 
+/**
+ * embeddingPath — sibling path of the `<key>.json` cache entry holding its query
+ * embedding as raw little-endian float32 bytes.
+ */
+function embeddingPath(key) {
+  return join(CONFIG.cacheDir, `${key}.embedding`);
+}
+
+/**
+ * saveCacheEmbedding — best-effort companion write to saveCache (Phase 3, Unit
+ * 3). When semantic caching is enabled and an embedding API key is available,
+ * embeds `text` and persists the vector as raw float32 bytes next to the JSON
+ * entry so semantic lookup (Unit 4) can score cosine similarity against it.
+ *
+ * Fully gated behind CONFIG.semanticCache: with the flag off this returns
+ * immediately doing zero I/O, so default behavior is byte-identical to before.
+ * Every failure mode — no key, embedText throwing (it throws on all errors),
+ * write errors — is caught and logged; a failed embedding must NEVER break the
+ * cache write or the hook (the JSON entry is written independently before this).
+ * `embedImpl` is injectable for tests. Returns true iff an embedding was written.
+ */
+async function saveCacheEmbedding(key, text, { embedImpl = embedText } = {}) {
+  if (!CONFIG.semanticCache) return false;
+  if (!CONFIG.embedApiKey) {
+    await log('Semantic cache enabled but no embedding API key — skipping embedding write');
+    return false;
+  }
+  try {
+    const vec = await embedImpl(text, CONFIG.embedApiKey);
+    await mkdir(CONFIG.cacheDir, { recursive: true });
+    const file = embeddingPath(key);
+    const buf = Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
+    const tmp = `${file}.${process.pid}.tmp`;
+    await writeFile(tmp, buf);
+    await rename(tmp, file);
+    await log(`Wrote semantic embedding ${key.slice(0, 16)}... (dim ${vec.length})`);
+    return true;
+  } catch (err) {
+    await log(`Embedding write failed (degrading to SHA-256 cache): ${String(err?.message ?? err)}`);
+    return false;
+  }
+}
+
 // =============================================================================
 // RESPONSE PARSING
 // =============================================================================
@@ -1137,8 +1180,10 @@ async function main() {
       process.exit(0);
     }
 
-    // Cache and output
+    // Cache and output. The embedding write is best-effort and fully gated
+    // behind CONFIG.semanticCache — it never blocks output or breaks the hook.
     await saveCache(cacheKey, analysis);
+    await saveCacheEmbedding(cacheKey, userMessage);
     console.log(formatOutput(analysis));
 
     await log('RLM analysis complete');

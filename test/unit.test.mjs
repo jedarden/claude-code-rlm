@@ -10,7 +10,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, rm, writeFile, readFile, stat, readdir } from 'fs/promises';
+import { mkdir, rm, writeFile, readFile, stat, readdir, rename } from 'fs/promises';
 import { join, resolve, relative, isAbsolute } from 'path';
 import { createHash } from 'crypto';
 import { tmpdir } from 'os';
@@ -1931,5 +1931,117 @@ describe('Group 15: Semantic Cache — cosineSimilarity (Phase 3)', () => {
     const b = Float32Array.from([1, 0, 0]);
     assert.ok(Math.abs(cosineSimilarity(a, b) - 1) < 1e-6);
     assert.equal(cosineSimilarity(Float32Array.from([1, 0]), Float32Array.from([0, 1])), 0);
+  });
+});
+
+// ============================================================================
+// GROUP 16: SEMANTIC CACHE — .embedding WRITES (Phase 3, Unit 3)
+// ============================================================================
+
+// saveCacheEmbedding — faithful copy of the hook's, but with CONFIG and the
+// embed function injected via `cfg` so tests drive it without globals or a
+// network. Mirrors the hook: fully gated behind cfg.semanticCache, requires a
+// key, and swallows every failure (returns false) so a bad embedding can never
+// break the cache write or the hook.
+async function saveCacheEmbedding(key, text, cfg) {
+  if (!cfg.semanticCache) return false;
+  if (!cfg.embedApiKey) return false;
+  try {
+    const vec = await cfg.embedImpl(text, cfg.embedApiKey);
+    await mkdir(cfg.cacheDir, { recursive: true });
+    const file = join(cfg.cacheDir, `${key}.embedding`);
+    const buf = Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
+    const tmp = `${file}.${process.pid}.tmp`;
+    await writeFile(tmp, buf);
+    await rename(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe('Group 16: Semantic Cache — .embedding writes (Phase 3)', () => {
+  let testCacheDir;
+  const KEY = 'a'.repeat(64); // shaped like a sha256 hex key
+
+  beforeEach(async () => {
+    testCacheDir = join(tmpdir(), `rlm-emb-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testCacheDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try { await rm(testCacheDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('raw float32 bytes round-trip through Buffer ↔ Float32Array', () => {
+    const vec = Float32Array.from([0.1, -0.2, 0.3, 1234.5, -0.0009765625]);
+    const buf = Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
+    assert.equal(buf.length, vec.length * 4, '4 bytes per float32');
+    const back = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+    assert.equal(back.length, vec.length);
+    for (let i = 0; i < vec.length; i++) {
+      // identical float32 bit patterns → exactly equal, no tolerance needed
+      assert.equal(back[i], vec[i], `element ${i} survives the round-trip`);
+    }
+  });
+
+  it('persisted .embedding file reads back to the original vector', async () => {
+    const vec = Float32Array.from([0.5, -0.25, 0.125, 42]);
+    const embedImpl = async () => vec;
+    const ok = await saveCacheEmbedding(KEY, 'explore the auth flow', {
+      semanticCache: true, embedApiKey: 'sk-x', cacheDir: testCacheDir, embedImpl,
+    });
+    assert.equal(ok, true);
+    const file = join(testCacheDir, `${KEY}.embedding`);
+    assert.ok(existsSync(file), '.embedding file exists');
+    const buf = await readFile(file);
+    const back = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+    assert.deepEqual(Array.from(back), Array.from(vec));
+  });
+
+  it('writes nothing when CONFIG.semanticCache is off (default byte-identical)', async () => {
+    let called = false;
+    const embedImpl = async () => { called = true; return Float32Array.from([1, 2, 3]); };
+    const ok = await saveCacheEmbedding(KEY, 'prompt', {
+      semanticCache: false, embedApiKey: 'sk-x', cacheDir: testCacheDir, embedImpl,
+    });
+    assert.equal(ok, false);
+    assert.equal(called, false, 'never even computes an embedding when flag is off');
+    assert.ok(!existsSync(join(testCacheDir, `${KEY}.embedding`)), 'no .embedding file written');
+  });
+
+  it('writes nothing when no embedding API key is available', async () => {
+    let called = false;
+    const embedImpl = async () => { called = true; return Float32Array.from([1, 2, 3]); };
+    const ok = await saveCacheEmbedding(KEY, 'prompt', {
+      semanticCache: true, embedApiKey: null, cacheDir: testCacheDir, embedImpl,
+    });
+    assert.equal(ok, false);
+    assert.equal(called, false, 'no key → no embedding call');
+    assert.ok(!existsSync(join(testCacheDir, `${KEY}.embedding`)), 'no .embedding file written');
+  });
+
+  it('swallows a thrown embedText so the JSON cache write still succeeds', async () => {
+    // The JSON entry is written first and independently — simulate it here.
+    const jsonFile = join(testCacheDir, `${KEY}.json`);
+    await writeFile(jsonFile, JSON.stringify({ intent: 'x' }));
+
+    const embedImpl = async () => { throw new Error('embedText: HTTP 429'); };
+    const ok = await saveCacheEmbedding(KEY, 'prompt', {
+      semanticCache: true, embedApiKey: 'sk-x', cacheDir: testCacheDir, embedImpl,
+    });
+    assert.equal(ok, false, 'returns false on embed failure (does not throw)');
+    assert.ok(existsSync(jsonFile), 'JSON cache entry is untouched by the failed embedding');
+    assert.ok(!existsSync(join(testCacheDir, `${KEY}.embedding`)), 'no partial .embedding file');
+  });
+
+  it('leaves no .tmp file behind after a successful write', async () => {
+    const embedImpl = async () => Float32Array.from([1, 2, 3, 4]);
+    await saveCacheEmbedding(KEY, 'prompt', {
+      semanticCache: true, embedApiKey: 'sk-x', cacheDir: testCacheDir, embedImpl,
+    });
+    const entries = await readdir(testCacheDir);
+    assert.ok(entries.some(e => e === `${KEY}.embedding`), 'final file present');
+    assert.ok(!entries.some(e => e.includes('.tmp')), 'temp file was renamed away');
   });
 });
