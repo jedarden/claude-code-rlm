@@ -16,6 +16,9 @@ import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
 import { execSync } from 'child_process';
+// parse-log.mjs has NO main()-on-import side effect (CLI is guarded by
+// import.meta.url), so unlike rlm-hook.mjs we import its real exports directly.
+import { parseLog, aggregate, percentile, summarize } from '../bench/parse-log.mjs';
 
 // ============================================================================
 // INLINED LOGIC FROM rlm-hook.mjs
@@ -3335,5 +3338,207 @@ describe('Group 24: Metrics JSONL append (Phase 5)', () => {
     assert.equal(currentMode_copy({ agenticMode: true, fastMode: false }), 'agentic');
     assert.equal(currentMode_copy({ agenticMode: false, fastMode: true }), 'fast');
     assert.equal(currentMode_copy({ agenticMode: false, fastMode: false }), 'detailed');
+  });
+});
+
+// ============================================================================
+// Group 25: Metrics log parsing & aggregation — bench/parse-log.mjs (Phase 5, Unit 2)
+// Imported directly (no main()-on-import side effect). Exercises the REAL
+// exports: parseLog / aggregate / percentile / summarize. Pure, FS-free.
+// ============================================================================
+
+// Build a metric record with a ts derived from a UTC time on a given day.
+function metricRec(day, time, extra = {}) {
+  return { ts: Date.parse(`${day}T${time}Z`), ...extra };
+}
+
+describe('Group 25: Metrics log parse & aggregate (Phase 5)', () => {
+  // ---- percentile: nearest-rank convention ----
+  it('percentile uses nearest-rank on the sorted array', () => {
+    // N=4 sorted [1,2,3,4]: p50 -> ceil(0.5*4)=2 -> idx1 -> 2; p95 -> ceil(3.8)=4 -> 4
+    assert.equal(percentile([4, 1, 3, 2], 50), 2);
+    assert.equal(percentile([4, 1, 3, 2], 95), 4);
+    assert.equal(percentile([4, 1, 3, 2], 99), 4);
+    // p0 clamps rank up to 1 -> smallest; p100 -> largest
+    assert.equal(percentile([5, 9, 1], 0), 1);
+    assert.equal(percentile([5, 9, 1], 100), 9);
+  });
+
+  it('percentile of a single value is that value for every p', () => {
+    assert.equal(percentile([42], 50), 42);
+    assert.equal(percentile([42], 95), 42);
+    assert.equal(percentile([42], 99), 42);
+  });
+
+  it('percentile returns null for empty input (documented convention)', () => {
+    assert.equal(percentile([], 50), null);
+    assert.equal(percentile(null, 95), null);
+    assert.equal(percentile('nope', 99), null);
+  });
+
+  it('percentile drops non-finite entries before ranking', () => {
+    assert.equal(percentile([1, NaN, 2, Infinity, 3, undefined, null], 50), 2);
+  });
+
+  // ---- parseLog: robust JSONL parsing ----
+  it('parseLog skips blank and unparseable lines, never throws', () => {
+    const text = [
+      JSON.stringify({ ts: 1, event: 'complete' }),
+      '',
+      '   ',
+      'GARBAGE {not json',
+      JSON.stringify({ ts: 2, event: 'skip' }),
+    ].join('\n');
+    const recs = parseLog(text);
+    assert.equal(recs.length, 2);
+    assert.deepEqual(recs.map((r) => r.event), ['complete', 'skip']);
+  });
+
+  it('parseLog drops non-object roots (arrays / scalars)', () => {
+    const text = ['[1,2,3]', '42', '"hello"', JSON.stringify({ ts: 1 })].join('\n');
+    const recs = parseLog(text);
+    assert.equal(recs.length, 1);
+    assert.equal(recs[0].ts, 1);
+  });
+
+  it('parseLog tolerates empty / non-string input', () => {
+    assert.deepEqual(parseLog(''), []);
+    assert.deepEqual(parseLog(null), []);
+    assert.deepEqual(parseLog(undefined), []);
+    assert.deepEqual(parseLog(123), []);
+  });
+
+  // ---- aggregate: per-UTC-day bucketing ----
+  it('aggregate buckets records per UTC day, sorted ascending', () => {
+    const recs = [
+      metricRec('2026-06-23', '02:00:00', { event: 'complete', cache_hit: false }),
+      metricRec('2026-06-21', '23:30:00', { event: 'complete', cache_hit: false }),
+      metricRec('2026-06-23', '05:00:00', { event: 'skip', cache_hit: false }),
+    ];
+    const agg = aggregate(recs);
+    assert.deepEqual(agg.days.map((d) => d.day), ['2026-06-21', '2026-06-23']);
+    assert.equal(agg.days.find((d) => d.day === '2026-06-23').total, 2);
+    assert.equal(agg.days.find((d) => d.day === '2026-06-21').total, 1);
+    assert.equal(agg.overall.total, 3);
+    assert.equal(agg.overall.day, 'all');
+  });
+
+  it('aggregate drops records without a finite numeric ts (from days AND overall)', () => {
+    const recs = [
+      metricRec('2026-06-23', '01:00:00', { event: 'complete', cache_hit: false }),
+      { event: 'complete', cache_hit: true }, // no ts
+      { ts: NaN, event: 'skip', cache_hit: false }, // non-finite
+      { ts: '2026-06-23', event: 'error', cache_hit: false }, // string ts
+      'not an object',
+    ];
+    const agg = aggregate(recs);
+    assert.equal(agg.overall.total, 1);
+    assert.equal(agg.days.length, 1);
+  });
+
+  // ---- rate math (hit off the boolean, not the event name) ----
+  it('hit rate counts the boolean cache_hit field, including context_reuse', () => {
+    const day = '2026-06-23';
+    const recs = [
+      metricRec(day, '01:00:00', { event: 'cache_hit', cache_hit: true, source: 'sha' }),
+      metricRec(day, '02:00:00', { event: 'context_reuse', cache_hit: true, intent: 'debugging' }),
+      metricRec(day, '03:00:00', { event: 'complete', cache_hit: false }),
+      metricRec(day, '04:00:00', { event: 'haiku_skip', cache_hit: false }),
+    ];
+    const agg = aggregate(recs);
+    // 2 of 4 carry cache_hit:true (one is a context_reuse, not a cache_hit event)
+    assert.equal(agg.overall.hits, 2);
+    assert.equal(agg.overall.hit_rate, 0.5);
+  });
+
+  it('skip rate keys off event:"skip" and breaks down by reason', () => {
+    const day = '2026-06-23';
+    const recs = [
+      metricRec(day, '01:00:00', { event: 'skip', cache_hit: false, reason: 'too short' }),
+      metricRec(day, '02:00:00', { event: 'skip', cache_hit: false, reason: 'too short' }),
+      metricRec(day, '03:00:00', { event: 'skip', cache_hit: false, reason: 'simple command' }),
+      metricRec(day, '04:00:00', { event: 'complete', cache_hit: false }),
+    ];
+    const agg = aggregate(recs);
+    assert.equal(agg.overall.skips, 3);
+    assert.equal(agg.overall.skip_rate, 0.75);
+    assert.deepEqual(agg.overall.skip_reasons, { 'too short': 2, 'simple command': 1 });
+  });
+
+  it('skip without a reason buckets under "unknown"', () => {
+    const recs = [metricRec('2026-06-23', '01:00:00', { event: 'skip', cache_hit: false })];
+    const agg = aggregate(recs);
+    assert.deepEqual(agg.overall.skip_reasons, { unknown: 1 });
+  });
+
+  it('error rate keys off event:"error"', () => {
+    const day = '2026-06-23';
+    const recs = [
+      metricRec(day, '01:00:00', { event: 'error', cache_hit: false, reason: 'boom' }),
+      metricRec(day, '02:00:00', { event: 'complete', cache_hit: false }),
+    ];
+    const agg = aggregate(recs);
+    assert.equal(agg.overall.errors, 1);
+    assert.equal(agg.overall.error_rate, 0.5);
+  });
+
+  // ---- latency distribution over latency_ms present ----
+  it('latency percentiles compute over the latency_ms values present', () => {
+    const day = '2026-06-23';
+    const recs = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100].map((ms, i) =>
+      metricRec(day, `0${i}:00:00`.slice(-8).padStart(8, '0'), {
+        event: 'complete',
+        cache_hit: false,
+        latency_ms: ms,
+      })
+    );
+    const d = aggregate(recs).overall.latency;
+    assert.equal(d.count, 10);
+    assert.equal(d.min, 10);
+    assert.equal(d.max, 100);
+    // N=10: p50 -> ceil(5)=5 -> idx4 -> 50; p95 -> ceil(9.5)=10 -> 100; p99 -> 100
+    assert.equal(d.p50, 50);
+    assert.equal(d.p95, 100);
+    assert.equal(d.p99, 100);
+  });
+
+  it('records without latency_ms are excluded from the latency distribution', () => {
+    const day = '2026-06-23';
+    const recs = [
+      metricRec(day, '01:00:00', { event: 'skip', cache_hit: false }), // no latency
+      metricRec(day, '02:00:00', { event: 'complete', cache_hit: false, latency_ms: 200 }),
+    ];
+    const d = aggregate(recs).overall.latency;
+    assert.equal(d.count, 1);
+    assert.equal(d.p50, 200);
+  });
+
+  it('latency block of an empty/latency-less set reports nulls, not throws', () => {
+    const agg = aggregate([]);
+    assert.equal(agg.overall.total, 0);
+    assert.equal(agg.overall.hit_rate, 0);
+    assert.equal(agg.overall.latency.count, 0);
+    assert.equal(agg.overall.latency.p50, null);
+    assert.equal(agg.overall.latency.p95, null);
+    assert.equal(agg.overall.latency.p99, null);
+    assert.deepEqual(agg.days, []);
+  });
+
+  // ---- summarize: event & mode tallies ----
+  it('summarize tallies events and modes', () => {
+    const recs = [
+      { event: 'complete', mode: 'agentic', cache_hit: false },
+      { event: 'cache_hit', mode: 'fast', cache_hit: true },
+      { event: 'complete', mode: 'agentic', cache_hit: false },
+    ];
+    const s = summarize(recs);
+    assert.deepEqual(s.events, { complete: 2, cache_hit: 1 });
+    assert.deepEqual(s.modes, { agentic: 2, fast: 1 });
+  });
+
+  it('aggregate tolerates non-array input', () => {
+    assert.deepEqual(aggregate(null).days, []);
+    assert.equal(aggregate(undefined).overall.total, 0);
+    assert.equal(aggregate('nope').overall.total, 0);
   });
 });
