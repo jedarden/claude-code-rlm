@@ -2606,3 +2606,172 @@ describe('Group 19: Conversation Context Awareness — extractPriorRLMBlocks (Ph
     assert.deepEqual(blocks[0].relevant_files, ['real.js', 'kept.js']);
   });
 });
+
+// ============================================================================
+// Group 20: Conversation Context Awareness — intent-overlap early-exit (Phase 4)
+// Faithful inline copies of classifyIntentLocal / intentsOverlap /
+// findReusablePriorBlock from rlm-hook.mjs.
+// ============================================================================
+
+const INTENT_KEYWORDS_copy = [
+  ['debugging', /\b(bug|bugs|debug|error|errors|crash(?:es|ed|ing)?|broken|fails?|failing|failed|stack ?trace|traceback|exception|regression|not working|doesn'?t work|isn'?t working)\b/i],
+  ['refactoring', /\b(refactor(?:ing)?|clean ?up|cleanup|rename|renaming|restructure|reorganize|simplify|extract|deduplicate|de-?dupe|tidy)\b/i],
+  ['code_writing', /\b(add|implement|create|build|write|introduce|generate|scaffold|new feature|support for|set up|wire up)\b/i],
+  ['architecture', /\b(architect\w*|design|structure|best way|approach|trade-?offs?|scalab\w*|high-level)\b/i],
+  ['learning', /\b(what (?:is|are|does|do)|how (?:do|does|can|should)|explain|understand|why (?:is|are|does|do)|where (?:is|are)|tell me about)\b/i],
+];
+
+function classifyIntentLocal_copy(userMessage) {
+  if (typeof userMessage !== 'string' || !userMessage.trim()) return 'other';
+  for (const [label, re] of INTENT_KEYWORDS_copy) {
+    if (re.test(userMessage)) return label;
+  }
+  return 'other';
+}
+
+function intentsOverlap_copy(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const na = a.trim().toLowerCase();
+  const nb = b.trim().toLowerCase();
+  if (!na || !nb) return false;
+  return na === nb;
+}
+
+function findReusablePriorBlock_copy(currentIntent, priorBlocks, { changedFiles = [] } = {}) {
+  if (!Array.isArray(priorBlocks) || priorBlocks.length === 0) return null;
+  if (typeof currentIntent !== 'string' || !currentIntent.trim()) return null;
+  if (currentIntent.trim().toLowerCase() === 'other') return null;
+
+  const changed = new Set(
+    (Array.isArray(changedFiles) ? changedFiles : []).filter((f) => typeof f === 'string')
+  );
+
+  for (const block of priorBlocks) {
+    if (!block || typeof block !== 'object') continue;
+    if (!intentsOverlap_copy(currentIntent, block.intent)) continue;
+    const files = Array.isArray(block.relevant_files) ? block.relevant_files : [];
+    if (files.length === 0) continue;
+    if (files.some((f) => changed.has(f))) continue;
+    return block;
+  }
+  return null;
+}
+
+describe('Group 20: Conversation Context Awareness — intent-overlap early-exit (Phase 4)', () => {
+  // --- classifyIntentLocal ---
+  it('classifies debugging messages', () => {
+    assert.equal(classifyIntentLocal_copy('the login button is broken and throws an error'), 'debugging');
+    assert.equal(classifyIntentLocal_copy('fix the crash on startup'), 'debugging');
+    assert.equal(classifyIntentLocal_copy('this test keeps failing'), 'debugging');
+  });
+
+  it('classifies refactoring messages', () => {
+    assert.equal(classifyIntentLocal_copy('refactor the auth module'), 'refactoring');
+    assert.equal(classifyIntentLocal_copy('please rename the helper functions'), 'refactoring');
+  });
+
+  it('classifies code_writing messages', () => {
+    assert.equal(classifyIntentLocal_copy('add a logout button'), 'code_writing');
+    assert.equal(classifyIntentLocal_copy('implement rate limiting'), 'code_writing');
+  });
+
+  it('classifies architecture messages', () => {
+    assert.equal(classifyIntentLocal_copy('what is the best way to design this pipeline'), 'architecture');
+    assert.equal(classifyIntentLocal_copy('high-level approach for sharding'), 'architecture');
+  });
+
+  it('classifies learning/question messages', () => {
+    assert.equal(classifyIntentLocal_copy('explain how the cache works'), 'learning');
+    assert.equal(classifyIntentLocal_copy('what does gatherConversationContext do'), 'learning');
+  });
+
+  it('falls back to other for unmatched / empty input', () => {
+    assert.equal(classifyIntentLocal_copy('hello there'), 'other');
+    assert.equal(classifyIntentLocal_copy(''), 'other');
+    assert.equal(classifyIntentLocal_copy(null), 'other');
+    assert.equal(classifyIntentLocal_copy(42), 'other');
+  });
+
+  it('debugging takes precedence over a stray action verb', () => {
+    // "fix the bug where users can't add items" — both add (code_writing) and
+    // bug (debugging); debugging is checked first, so it wins.
+    assert.equal(classifyIntentLocal_copy("fix the bug where users can't add items"), 'debugging');
+  });
+
+  // --- intentsOverlap ---
+  it('intentsOverlap: identical labels overlap (case/space-insensitive)', () => {
+    assert.equal(intentsOverlap_copy('debugging', 'debugging'), true);
+    assert.equal(intentsOverlap_copy(' Debugging ', 'debugging'), true);
+  });
+
+  it('intentsOverlap: divergent labels do not overlap', () => {
+    assert.equal(intentsOverlap_copy('debugging', 'code_writing'), false);
+  });
+
+  it('intentsOverlap: null/empty/non-string ⇒ no overlap', () => {
+    assert.equal(intentsOverlap_copy(null, 'debugging'), false);
+    assert.equal(intentsOverlap_copy('debugging', null), false);
+    assert.equal(intentsOverlap_copy('', ''), false);
+    assert.equal(intentsOverlap_copy(5, 'debugging'), false);
+  });
+
+  // --- findReusablePriorBlock ---
+  const priors = [
+    { intent: 'debugging', relevant_files: ['src/auth.js', 'src/db.js'] }, // newest
+    { intent: 'code_writing', relevant_files: ['src/ui.js'] },
+  ];
+
+  it('reuses the most-recent block when intent matches and files are unchanged', () => {
+    const hit = findReusablePriorBlock_copy('debugging', priors, { changedFiles: [] });
+    assert.ok(hit);
+    assert.equal(hit.intent, 'debugging');
+    assert.deepEqual(hit.relevant_files, ['src/auth.js', 'src/db.js']);
+  });
+
+  it('does not reuse when the current intent diverges from all priors', () => {
+    assert.equal(findReusablePriorBlock_copy('architecture', priors, {}), null);
+  });
+
+  it('does not reuse when a referenced file has changed', () => {
+    const miss = findReusablePriorBlock_copy('debugging', priors, { changedFiles: ['src/db.js'] });
+    assert.equal(miss, null);
+  });
+
+  it('still reuses when an UNRELATED file changed (not in the matched block)', () => {
+    const hit = findReusablePriorBlock_copy('debugging', priors, { changedFiles: ['src/ui.js'] });
+    assert.ok(hit);
+    assert.equal(hit.intent, 'debugging');
+  });
+
+  it('returns null for empty / non-array priors', () => {
+    assert.equal(findReusablePriorBlock_copy('debugging', [], {}), null);
+    assert.equal(findReusablePriorBlock_copy('debugging', null, {}), null);
+  });
+
+  it('does not reuse the catch-all "other" intent', () => {
+    const otherPriors = [{ intent: 'other', relevant_files: ['x.js'] }];
+    assert.equal(findReusablePriorBlock_copy('other', otherPriors, {}), null);
+  });
+
+  it('does not reuse a matching-intent block that recorded no files', () => {
+    const noFiles = [{ intent: 'debugging', relevant_files: [] }];
+    assert.equal(findReusablePriorBlock_copy('debugging', noFiles, {}), null);
+  });
+
+  it('skips a changed newer block and reuses an older unchanged match', () => {
+    const blocks = [
+      { intent: 'debugging', relevant_files: ['new.js'] },   // newest, but changed
+      { intent: 'debugging', relevant_files: ['old.js'] },   // older, unchanged
+    ];
+    const hit = findReusablePriorBlock_copy('debugging', blocks, { changedFiles: ['new.js'] });
+    assert.ok(hit);
+    assert.deepEqual(hit.relevant_files, ['old.js']);
+  });
+
+  it('tolerates malformed entries in the priors array', () => {
+    const blocks = [null, 'nope', 42, { intent: 'debugging', relevant_files: ['ok.js'] }];
+    const hit = findReusablePriorBlock_copy('debugging', blocks, {});
+    assert.ok(hit);
+    assert.deepEqual(hit.relevant_files, ['ok.js']);
+  });
+});
