@@ -63,6 +63,11 @@ const CONFIG = {
   embedModel: process.env.RLM_EMBED_MODEL || 'text-embedding-3-small',
   embedApiKey: process.env.OPENAI_API_KEY || null,
   embedBaseUrl: process.env.RLM_EMBED_BASE_URL || 'https://api.openai.com/v1',
+  // Conversation context awareness (Phase 4): how many of the most recent prior
+  // RLM blocks to look back over when deciding whether the current intent/files
+  // were already explored. Always-on optimization (no enable gate); only the
+  // look-back depth is tunable.
+  contextWindow: parseInt(process.env.RLM_CONTEXT_WINDOW || '5', 10),
   // Debug mode
   debug: process.env.RLM_DEBUG === 'true',
 };
@@ -249,6 +254,92 @@ async function gatherConversationContext(transcriptPath, maxMessages = 5) {
     await log(`Transcript read error: ${err.message}`);
     return null;
   }
+}
+
+// =============================================================================
+// CONVERSATION CONTEXT AWARENESS (Phase 4)
+// =============================================================================
+
+/**
+ * Pull the intent out of a prior analysis object, regardless of mode.
+ * Agentic & fast modes store `intent` as a plain string; detailed mode stores
+ * `intent: { primary, confidence }`. Returns a string or null.
+ */
+function normalizeIntent(analysis) {
+  const intent = analysis?.intent;
+  if (typeof intent === 'string') return intent || null;
+  if (intent && typeof intent === 'object' && typeof intent.primary === 'string') {
+    return intent.primary || null;
+  }
+  return null;
+}
+
+/**
+ * Pull a flat list of file paths out of a prior analysis object.
+ * Agentic mode uses `relevant_files` (array of strings OR { path, purpose }
+ * objects); fast mode uses `files` (array of strings). Returns string[].
+ */
+function normalizeRelevantFiles(analysis) {
+  const raw = Array.isArray(analysis?.relevant_files)
+    ? analysis.relevant_files
+    : (Array.isArray(analysis?.files) ? analysis.files : []);
+  const out = [];
+  for (const f of raw) {
+    if (typeof f === 'string') {
+      if (f) out.push(f);
+    } else if (f && typeof f === 'object' && typeof f.path === 'string' && f.path) {
+      out.push(f.path);
+    }
+  }
+  return out;
+}
+
+/**
+ * Extract prior RLM pre-research blocks from a transcript.
+ *
+ * The hook injects its analysis as a `<rlm_preresearch>` block (agentic mode,
+ * the default) or `<rlm_analysis>` block (fast/detailed mode), each wrapping a
+ * pretty-printed JSON body (see formatOutput). Because that injected text lives
+ * verbatim in the conversation, earlier turns' blocks survive in the transcript
+ * and can be pulled back out so a later turn can tell whether the current
+ * intent/files were already explored.
+ *
+ * Pure: string in → array out, newest-first, capped to `window`. Never throws;
+ * malformed/truncated JSON bodies and non-object roots are skipped. The caller
+ * must pass DECODED message text (un-escaped out of the JSONL), not the raw
+ * file bytes — inside a JSONL line the block's quotes/newlines are escaped.
+ *
+ * @param {string} transcriptText  decoded transcript text (may contain blocks)
+ * @param {{window?: number}} opts  look-back depth (most-recent N blocks)
+ * @returns {Array<{intent: string|null, relevant_files: string[], raw: object}>}
+ */
+function extractPriorRLMBlocks(transcriptText, { window = CONFIG.contextWindow } = {}) {
+  if (typeof transcriptText !== 'string' || transcriptText.length === 0) return [];
+
+  const tagRe = /<rlm_(?:preresearch|analysis)>([\s\S]*?)<\/rlm_(?:preresearch|analysis)>/g;
+  const blocks = [];
+  let m;
+  while ((m = tagRe.exec(transcriptText)) !== null) {
+    const body = m[1].trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      continue; // skip non-JSON / truncated bodies
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+
+    blocks.push({
+      intent: normalizeIntent(parsed),
+      relevant_files: normalizeRelevantFiles(parsed),
+      raw: parsed,
+    });
+  }
+
+  // Matches arrive in chronological (oldest→newest) order; we want newest-first.
+  blocks.reverse();
+  const limit = Number.isFinite(window) && window > 0 ? window : blocks.length;
+  return blocks.slice(0, limit);
 }
 
 // =============================================================================
