@@ -2209,3 +2209,233 @@ describe('Group 17: Semantic Cache — semanticLookup (Phase 3)', () => {
     assert.equal(hit, null, 'absent cache dir → miss, not a throw');
   });
 });
+
+// ============================================================================
+// GROUP 18: SEMANTIC CACHE — index.json reverse index (Phase 3, Unit 5)
+// ============================================================================
+
+// Faithful copies of the hook's Unit-5 helpers, parameterized by cacheDir /
+// cfg so tests drive them without globals. The .embedding files remain the
+// source of truth; index.json is a single-read accelerator with a file-scan
+// fallback when it's absent/empty/corrupt.
+
+async function readCacheIndex(cacheDir) {
+  try {
+    const parsed = JSON.parse(await readFile(join(cacheDir, 'index.json'), 'utf-8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+async function updateCacheIndex(key, vec, cfg) {
+  if (!cfg.semanticCache) return false;
+  try {
+    const index = await readCacheIndex(cfg.cacheDir);
+    index[key] = { dim: vec.length, vec: Array.from(vec) };
+    await mkdir(cfg.cacheDir, { recursive: true });
+    const file = join(cfg.cacheDir, 'index.json');
+    const tmp = `${file}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify(index));
+    await rename(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function scoreFromIndex(queryVec, simImpl, cacheDir) {
+  const index = await readCacheIndex(cacheDir);
+  const keys = Object.keys(index);
+  if (keys.length === 0) return null;
+  let bestKey = null, bestScore = -Infinity;
+  for (const key of keys) {
+    const arr = index[key] && index[key].vec;
+    if (!Array.isArray(arr) || arr.length === 0) continue;
+    try {
+      const score = simImpl(queryVec, Float32Array.from(arr));
+      if (score > bestScore) { bestScore = score; bestKey = key; }
+    } catch {
+      // foreign-dimension / bad vector — skip
+    }
+  }
+  return bestKey === null ? null : { bestKey, bestScore };
+}
+
+async function scoreFromFiles(queryVec, simImpl, cacheDir) {
+  let files;
+  try {
+    files = await readdir(cacheDir);
+  } catch {
+    return null;
+  }
+  let bestKey = null, bestScore = -Infinity;
+  for (const f of files) {
+    if (!f.endsWith('.embedding')) continue;
+    try {
+      const buf = await readFile(join(cacheDir, f));
+      if (buf.length === 0 || buf.length % 4 !== 0) continue;
+      const vec = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+      const score = simImpl(queryVec, vec);
+      if (score > bestScore) { bestScore = score; bestKey = f.slice(0, -('.embedding'.length)); }
+    } catch {
+      // corrupt/foreign vector — skip
+    }
+  }
+  return bestKey === null ? null : { bestKey, bestScore };
+}
+
+// Index-first semanticLookup (Unit 5): prefer index.json, fall back to scan.
+async function semanticLookupIndexed(queryText, cfg) {
+  if (!cfg.semanticCache) return null;
+  if (!cfg.embedApiKey) return null;
+  try {
+    const queryVec = await cfg.embedImpl(queryText, cfg.embedApiKey);
+    let best = await scoreFromIndex(queryVec, cosineSimilarity, cfg.cacheDir);
+    if (best === null) best = await scoreFromFiles(queryVec, cosineSimilarity, cfg.cacheDir);
+    if (best === null) return null;
+    const { bestKey, bestScore } = best;
+    if (bestScore < cfg.semanticThreshold) return null;
+    const entry = await cfg.checkImpl(bestKey);
+    if (!entry) return null;
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+describe('Group 18: Semantic Cache — index.json reverse index (Phase 3)', () => {
+  let testCacheDir;
+
+  const fixedVec = v => async () => Float32Array.from(v);
+
+  const checkImpl = async (key) => {
+    try {
+      return JSON.parse(await readFile(join(testCacheDir, `${key}.json`), 'utf-8'));
+    } catch {
+      return null;
+    }
+  };
+
+  const baseCfg = overrides => ({
+    semanticCache: true,
+    embedApiKey: 'sk-x',
+    cacheDir: testCacheDir,
+    semanticThreshold: 0.92,
+    checkImpl,
+    ...overrides,
+  });
+
+  beforeEach(async () => {
+    testCacheDir = join(tmpdir(), `rlm-idx-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testCacheDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try { await rm(testCacheDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('upsert round-trips through index.json (dim + inline vector)', async () => {
+    const KEY = 'a'.repeat(64);
+    const ok = await updateCacheIndex(KEY, Float32Array.from([0.1, -0.2, 0.3]), baseCfg());
+    assert.equal(ok, true);
+    assert.ok(existsSync(join(testCacheDir, 'index.json')), 'index.json written');
+    const index = await readCacheIndex(testCacheDir);
+    assert.deepEqual(Object.keys(index), [KEY]);
+    assert.equal(index[KEY].dim, 3);
+    // float32 round-trip via JSON — compare with tolerance for narrowing.
+    const back = Float32Array.from(index[KEY].vec);
+    const orig = Float32Array.from([0.1, -0.2, 0.3]);
+    for (let i = 0; i < orig.length; i++) assert.ok(Math.abs(back[i] - orig[i]) < 1e-6);
+  });
+
+  it('accumulates multiple keys across successive upserts', async () => {
+    const A = 'a'.repeat(64), B = 'b'.repeat(64);
+    await updateCacheIndex(A, Float32Array.from([1, 0, 0]), baseCfg());
+    await updateCacheIndex(B, Float32Array.from([0, 1, 0]), baseCfg());
+    const index = await readCacheIndex(testCacheDir);
+    assert.deepEqual(Object.keys(index).sort(), [A, B].sort());
+    assert.deepEqual(index[A].vec, [1, 0, 0]);
+    assert.deepEqual(index[B].vec, [0, 1, 0]);
+  });
+
+  it('re-upserting the same key overwrites its vector', async () => {
+    const KEY = 'c'.repeat(64);
+    await updateCacheIndex(KEY, Float32Array.from([1, 0, 0]), baseCfg());
+    await updateCacheIndex(KEY, Float32Array.from([0, 0, 1]), baseCfg());
+    const index = await readCacheIndex(testCacheDir);
+    assert.equal(Object.keys(index).length, 1);
+    assert.deepEqual(index[KEY].vec, [0, 0, 1]);
+  });
+
+  it('writes no index when semanticCache is off (default byte-identical)', async () => {
+    const ok = await updateCacheIndex('a'.repeat(64), Float32Array.from([1, 2, 3]), baseCfg({ semanticCache: false }));
+    assert.equal(ok, false);
+    assert.ok(!existsSync(join(testCacheDir, 'index.json')), 'no index.json when flag off');
+  });
+
+  it('readCacheIndex returns {} for absent / corrupt / non-object index', async () => {
+    assert.deepEqual(await readCacheIndex(testCacheDir), {}, 'absent → {}');
+    await writeFile(join(testCacheDir, 'index.json'), '{ not json');
+    assert.deepEqual(await readCacheIndex(testCacheDir), {}, 'malformed JSON → {}');
+    await writeFile(join(testCacheDir, 'index.json'), '[1,2,3]');
+    assert.deepEqual(await readCacheIndex(testCacheDir), {}, 'array root → {}');
+  });
+
+  it('lookup via index returns the nearest entry with NO .embedding files present', async () => {
+    const A = 'a'.repeat(64), B = 'b'.repeat(64), C = 'c'.repeat(64);
+    await updateCacheIndex(A, Float32Array.from([0.99, 0.1, 0]), baseCfg());  // ~0.995 vs query
+    await updateCacheIndex(B, Float32Array.from([0, 1, 0]), baseCfg());        // 0
+    await updateCacheIndex(C, Float32Array.from([0.5, 0.866, 0]), baseCfg());  // ~0.5
+    await writeFile(join(testCacheDir, `${A}.json`), JSON.stringify({ who: 'A', intent: 'auth' }));
+    await writeFile(join(testCacheDir, `${B}.json`), JSON.stringify({ who: 'B' }));
+    await writeFile(join(testCacheDir, `${C}.json`), JSON.stringify({ who: 'C' }));
+    // Prove it is the index, not the files: there are zero .embedding files.
+    const files = await readdir(testCacheDir);
+    assert.ok(!files.some(f => f.endsWith('.embedding')), 'no .embedding sidecars exist');
+    const hit = await semanticLookupIndexed('explore auth', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.ok(hit, 'index-only lookup returns a hit');
+    assert.equal(hit.who, 'A', 'nearest of the three index entries');
+  });
+
+  it('falls back to the .embedding file scan when index.json is corrupt', async () => {
+    const GOOD = 'd'.repeat(64);
+    // good .embedding + json, but a corrupt index.json that yields {}
+    const vec = Float32Array.from([0.98, 0.2, 0]);
+    await writeFile(join(testCacheDir, `${GOOD}.embedding`), Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+    await writeFile(join(testCacheDir, `${GOOD}.json`), JSON.stringify({ who: 'GOOD' }));
+    await writeFile(join(testCacheDir, 'index.json'), 'totally not json');
+    const hit = await semanticLookupIndexed('q', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.ok(hit, 'corrupt index → file-scan fallback still finds the match');
+    assert.equal(hit.who, 'GOOD');
+  });
+
+  it('falls back to the file scan when index.json is absent but sidecars exist', async () => {
+    const GOOD = 'e'.repeat(64);
+    const vec = Float32Array.from([0.97, 0.24, 0]);
+    await writeFile(join(testCacheDir, `${GOOD}.embedding`), Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+    await writeFile(join(testCacheDir, `${GOOD}.json`), JSON.stringify({ who: 'GOOD' }));
+    assert.ok(!existsSync(join(testCacheDir, 'index.json')), 'no index yet');
+    const hit = await semanticLookupIndexed('q', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.ok(hit, 'absent index → file-scan fallback');
+    assert.equal(hit.who, 'GOOD');
+  });
+
+  it('returns null when the best index entry is below threshold', async () => {
+    await updateCacheIndex('a'.repeat(64), Float32Array.from([0, 1, 0]), baseCfg());        // cos 0
+    await updateCacheIndex('b'.repeat(64), Float32Array.from([0.5, 0.866, 0]), baseCfg());  // ~0.5
+    const hit = await semanticLookupIndexed('q', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.equal(hit, null, 'nothing in the index is close enough → miss');
+  });
+
+  it('skips a foreign-dimension index entry without aborting the lookup', async () => {
+    const GOOD = 'a'.repeat(64), BAD = 'b'.repeat(64);
+    await updateCacheIndex(GOOD, Float32Array.from([0.99, 0.1, 0]), baseCfg());  // 3-dim, ~0.995
+    await updateCacheIndex(BAD, Float32Array.from([1, 0]), baseCfg());           // 2-dim → sim throws
+    await writeFile(join(testCacheDir, `${GOOD}.json`), JSON.stringify({ who: 'GOOD' }));
+    const hit = await semanticLookupIndexed('q', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.ok(hit, 'good 3-dim entry still matches despite a foreign-dim sibling');
+    assert.equal(hit.who, 'GOOD');
+  });
+});
