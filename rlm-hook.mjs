@@ -309,13 +309,25 @@ function normalizeRelevantFiles(analysis) {
  * must pass DECODED message text (un-escaped out of the JSONL), not the raw
  * file bytes — inside a JSONL line the block's quotes/newlines are escaped.
  *
+ * Each returned block carries a `ts` (epoch-ms the turn was produced) so the
+ * mtime-based staleness check (computeChangedFiles) knows how far back to look.
+ * DECISION (Phase 4 open question — "prior blocks carry no timestamp"): option
+ * (a). The block lives in a JSONL line that has its own `timestamp`; rather than
+ * teach this pure-text function to re-parse JSONL, the caller passes that line's
+ * timestamp as `ts` and we stamp every block found in this call. CONTRACT: for
+ * accurate PER-BLOCK timestamps, call this once per transcript message with that
+ * message's timestamp — calling it on the whole transcript blob stamps every
+ * block with the same `ts`. When `ts` is absent/non-finite, blocks get `ts:null`
+ * and computeChangedFiles treats their files as changed (fail-safe: re-explore).
+ *
  * @param {string} transcriptText  decoded transcript text (may contain blocks)
- * @param {{window?: number}} opts  look-back depth (most-recent N blocks)
- * @returns {Array<{intent: string|null, relevant_files: string[], raw: object}>}
+ * @param {{window?: number, ts?: number}} opts  look-back depth; epoch-ms stamp
+ * @returns {Array<{intent: string|null, relevant_files: string[], ts: number|null, raw: object}>}
  */
-function extractPriorRLMBlocks(transcriptText, { window = CONFIG.contextWindow } = {}) {
+function extractPriorRLMBlocks(transcriptText, { window = CONFIG.contextWindow, ts } = {}) {
   if (typeof transcriptText !== 'string' || transcriptText.length === 0) return [];
 
+  const stamp = typeof ts === 'number' && Number.isFinite(ts) ? ts : null;
   const tagRe = /<rlm_(?:preresearch|analysis)>([\s\S]*?)<\/rlm_(?:preresearch|analysis)>/g;
   const blocks = [];
   let m;
@@ -332,6 +344,7 @@ function extractPriorRLMBlocks(transcriptText, { window = CONFIG.contextWindow }
     blocks.push({
       intent: normalizeIntent(parsed),
       relevant_files: normalizeRelevantFiles(parsed),
+      ts: stamp,
       raw: parsed,
     });
   }
@@ -434,6 +447,62 @@ function findReusablePriorBlock(currentIntent, priorBlocks, { changedFiles = [] 
     return block;
   }
   return null;
+}
+
+/**
+ * Determine which of a prior block's files have CHANGED since it was produced.
+ *
+ * Feeds `findReusablePriorBlock`'s `changedFiles`: a prior <rlm_preresearch>
+ * block is only reusable if none of the files it referenced were touched after
+ * that turn. This computes that "changed" subset.
+ *
+ * A path counts as CHANGED when:
+ *   - stat fails (ENOENT / permission / etc.) — deleted, moved, or unreadable, or
+ *   - its `mtimeMs` is strictly greater than `sinceMs` — edited after the block.
+ * Anything we cannot positively confirm as unchanged is reported as changed, so
+ * the early-exit fails safe (forces fresh exploration) rather than reusing stale
+ * context. A file whose mtime equals `sinceMs` is considered unchanged.
+ *
+ * `sinceMs` is the epoch-ms timestamp of the turn that produced the block
+ * (extractPriorRLMBlocks surfaces it as `block.ts`). If `sinceMs` is not a finite
+ * number we cannot reason about freshness, so EVERY input path is reported as
+ * changed. Returned paths are the ORIGINAL strings from `relevantFiles` (not the
+ * resolved absolutes), so they match what findReusablePriorBlock looks up.
+ *
+ * Pure aside from the injected stat; never throws.
+ *
+ * @param {string[]} relevantFiles  paths from a prior block (rel to cwd or abs)
+ * @param {number} sinceMs          epoch-ms the block was produced
+ * @param {{cwd?: string, statImpl?: (p: string) => Promise<{mtimeMs: number}>}} opts
+ * @returns {Promise<string[]>}     subset of relevantFiles considered changed
+ */
+async function computeChangedFiles(relevantFiles, sinceMs, { cwd = process.cwd(), statImpl = stat } = {}) {
+  if (!Array.isArray(relevantFiles) || relevantFiles.length === 0) return [];
+  const files = relevantFiles.filter((f) => typeof f === 'string' && f);
+  if (files.length === 0) return [];
+
+  // Without a usable reference time we cannot judge freshness — treat all as
+  // changed so the caller re-explores rather than reusing possibly-stale context.
+  if (typeof sinceMs !== 'number' || !Number.isFinite(sinceMs)) {
+    return [...new Set(files)];
+  }
+
+  const changed = [];
+  const seen = new Set();
+  for (const f of files) {
+    if (seen.has(f)) continue; // de-dupe; report each path at most once
+    seen.add(f);
+    const abs = isAbsolute(f) ? f : resolve(cwd, f);
+    try {
+      const st = await statImpl(abs);
+      if (!st || typeof st.mtimeMs !== 'number' || st.mtimeMs > sinceMs) {
+        changed.push(f);
+      }
+    } catch {
+      changed.push(f); // missing / unreadable ⇒ changed
+    }
+  }
+  return changed;
 }
 
 // =============================================================================
