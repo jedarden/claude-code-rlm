@@ -916,6 +916,61 @@ function embeddingPath(key) {
 }
 
 /**
+ * indexPath — the single inline-vector reverse index in the cache dir
+ * (Phase 3, Unit 5). Maps `<key>` → its embedding so semanticLookup can score
+ * every candidate from one read instead of scanning every `.embedding` file.
+ */
+function indexPath() {
+  return join(CONFIG.cacheDir, 'index.json');
+}
+
+/**
+ * readCacheIndex — load the reverse index, or `{}` on any problem (absent file,
+ * malformed JSON, a non-object/array root). Pure read; never throws. Callers
+ * treat an empty result as "no index" and fall back to the `.embedding` scan.
+ */
+async function readCacheIndex() {
+  try {
+    const parsed = JSON.parse(await readFile(indexPath(), 'utf-8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * updateCacheIndex — best-effort upsert of one key's embedding into index.json
+ * (Phase 3, Unit 5). Stores the vector inline as a plain number array so
+ * semanticLookup can score all candidates from a single read (no per-file
+ * `.embedding` I/O). Read-modify-write with an atomic tmp+rename; the `.embedding`
+ * sidecars remain the source of truth, so a failed or stale index is non-fatal —
+ * lookup falls back to scanning the files. Gated on semanticCache (zero I/O when
+ * off) and wrapped in try/catch so an index failure never breaks the embedding
+ * write or the hook. Returns true iff the index was rewritten.
+ *
+ * Race note: concurrent hook invocations do last-writer-wins on this file (same
+ * tradeoff the plan accepts for the JSON cache). A lost update just drops one
+ * key from the index until its next save; the file scan still covers it.
+ */
+async function updateCacheIndex(key, vec) {
+  if (!CONFIG.semanticCache) return false;
+  try {
+    const index = await readCacheIndex();
+    index[key] = { dim: vec.length, vec: Array.from(vec) };
+    await mkdir(CONFIG.cacheDir, { recursive: true });
+    const file = indexPath();
+    const tmp = `${file}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify(index));
+    await rename(tmp, file);
+    return true;
+  } catch (err) {
+    await log(`Cache index update failed (lookup will fall back to file scan): ${String(err?.message ?? err)}`);
+    return false;
+  }
+}
+
+/**
  * saveCacheEmbedding — best-effort companion write to saveCache (Phase 3, Unit
  * 3). When semantic caching is enabled and an embedding API key is available,
  * embeds `text` and persists the vector as raw float32 bytes next to the JSON
@@ -942,6 +997,9 @@ async function saveCacheEmbedding(key, text, { embedImpl = embedText } = {}) {
     const tmp = `${file}.${process.pid}.tmp`;
     await writeFile(tmp, buf);
     await rename(tmp, file);
+    // Mirror the vector into the reverse index (best-effort; the .embedding
+    // file is the source of truth, so an index failure is non-fatal).
+    await updateCacheIndex(key, vec);
     await log(`Wrote semantic embedding ${key.slice(0, 16)}... (dim ${vec.length})`);
     return true;
   } catch (err) {
@@ -951,11 +1009,78 @@ async function saveCacheEmbedding(key, text, { embedImpl = embedText } = {}) {
 }
 
 /**
- * semanticLookup — Phase 3, Unit 4. On a SHA-256 cache miss, scan the cache
- * directory for `<hash>.embedding` sidecars, score each against the query's
- * embedding via cosine similarity, and return the best-matching cache entry
- * when its similarity meets CONFIG.semanticThreshold (default 0.92). Returns
- * null on any miss or failure, so the caller falls through to invoking Haiku.
+ * scoreFromIndex — Phase 3, Unit 5. Score the query vector against every entry
+ * in index.json (vectors stored inline), returning `{ bestKey, bestScore }` or
+ * null when the index is empty / has no usable vector. A single read replaces
+ * the per-file `.embedding` scan. Foreign-dimension vectors throw in `simImpl`
+ * and are skipped per-entry; a null return signals the caller to fall back to
+ * the file scan (the index may simply not exist yet).
+ */
+async function scoreFromIndex(queryVec, simImpl) {
+  const index = await readCacheIndex();
+  const keys = Object.keys(index);
+  if (keys.length === 0) return null;
+  let bestKey = null;
+  let bestScore = -Infinity;
+  for (const key of keys) {
+    const arr = index[key] && index[key].vec;
+    if (!Array.isArray(arr) || arr.length === 0) continue;
+    try {
+      const score = simImpl(queryVec, Float32Array.from(arr));
+      if (score > bestScore) {
+        bestScore = score;
+        bestKey = key;
+      }
+    } catch {
+      // foreign-dimension / bad vector — skip this entry
+    }
+  }
+  return bestKey === null ? null : { bestKey, bestScore };
+}
+
+/**
+ * scoreFromFiles — Phase 3, Unit 5 (the robust fallback, formerly the body of
+ * semanticLookup). Read every `<hash>.embedding` sidecar, score it, and return
+ * `{ bestKey, bestScore }` or null when none are usable. Per-file try/catch so
+ * one corrupt/short/foreign vector is skipped without aborting the scan.
+ */
+async function scoreFromFiles(queryVec, simImpl) {
+  let files;
+  try {
+    files = await readdir(CONFIG.cacheDir);
+  } catch {
+    return null; // cache dir absent → nothing to match against
+  }
+  let bestKey = null;
+  let bestScore = -Infinity;
+  for (const f of files) {
+    if (!f.endsWith('.embedding')) continue;
+    try {
+      const buf = await readFile(join(CONFIG.cacheDir, f));
+      if (buf.length === 0 || buf.length % 4 !== 0) continue; // truncated tail
+      const vec = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+      const score = simImpl(queryVec, vec);
+      if (score > bestScore) {
+        bestScore = score;
+        bestKey = f.slice(0, -('.embedding'.length));
+      }
+    } catch {
+      // corrupt/foreign vector — skip this file, keep scanning
+    }
+  }
+  return bestKey === null ? null : { bestKey, bestScore };
+}
+
+/**
+ * semanticLookup — Phase 3, Unit 4 + 5. On a SHA-256 cache miss, find the
+ * best-matching cache entry by cosine similarity and return it when the score
+ * meets CONFIG.semanticThreshold (default 0.92). Returns null on any miss or
+ * failure, so the caller falls through to invoking Haiku.
+ *
+ * Unit 5: prefer the single-read inline-vector index.json; fall back to the
+ * per-file `.embedding` scan when the index is absent/empty/corrupt (or yields
+ * no usable vector). The `.embedding` files remain the source of truth, so the
+ * file scan is always a correct backstop if the index lags behind.
  *
  * Fully gated behind CONFIG.semanticCache + an embedding API key: with the flag
  * off (or no key) it returns null immediately doing zero I/O, so default
@@ -984,32 +1109,16 @@ async function semanticLookup(queryText, {
   if (!CONFIG.embedApiKey) return null;
   try {
     const queryVec = await embedImpl(queryText, CONFIG.embedApiKey);
-    let files;
-    try {
-      files = await readdir(CONFIG.cacheDir);
-    } catch {
-      return null; // cache dir absent → nothing to match against
+    // Index-first (one read), then the robust per-file scan as a fallback.
+    let best = await scoreFromIndex(queryVec, simImpl);
+    if (best === null) best = await scoreFromFiles(queryVec, simImpl);
+    if (best === null) {
+      await log('Semantic cache miss (no candidate embeddings)');
+      return null;
     }
-    let bestKey = null;
-    let bestScore = -Infinity;
-    for (const f of files) {
-      if (!f.endsWith('.embedding')) continue;
-      try {
-        const buf = await readFile(join(CONFIG.cacheDir, f));
-        if (buf.length === 0 || buf.length % 4 !== 0) continue; // truncated tail
-        const vec = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
-        const score = simImpl(queryVec, vec);
-        if (score > bestScore) {
-          bestScore = score;
-          bestKey = f.slice(0, -('.embedding'.length));
-        }
-      } catch {
-        // corrupt/foreign vector — skip this file, keep scanning
-      }
-    }
-    if (bestKey === null || bestScore < CONFIG.semanticThreshold) {
-      const shown = bestScore === -Infinity ? 'n/a' : bestScore.toFixed(4);
-      await log(`Semantic cache miss (best ${shown} < ${CONFIG.semanticThreshold})`);
+    const { bestKey, bestScore } = best;
+    if (bestScore < CONFIG.semanticThreshold) {
+      await log(`Semantic cache miss (best ${bestScore.toFixed(4)} < ${CONFIG.semanticThreshold})`);
       return null;
     }
     const entry = await checkImpl(bestKey);
