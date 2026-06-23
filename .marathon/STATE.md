@@ -1,5 +1,9 @@
 # Marathon State — claude-code-rlm
 
+## PROJECT COMPLETE
+
+**All five phases done. `.marathon/DONE` written (commit pending). 272 unit tests + 15 integration tests green.** Phase 5 Unit 4 (final): verified the plan's Unit-4 test surface (log append=Group 24, JSONL parsing + aggregation math=Group 25, HTML render=Group 26) was already covered — no padding added per the "real untested code path" bar — then wrote `.marathon/DONE` summarizing Phases 1–5 and the 5 deferred open questions (plan §160). On any future iteration where `.marathon/DONE` exists: run `node --test test/unit.test.mjs`, confirm green, exit. Do not start new work.
+
 ## Last completed
 
 **Phase 5, Unit 3: `bench/dashboard.mjs` — static HTML render + `--serve` — commit b6f5ff1.** New dependency-free ESM module under `bench/` (Node built-ins only: `http`, `fs/promises`, `url`). Imports the data layer from `parse-log.mjs` (`aggregate`, `parseLog`, `readLog`, `defaultLogPath`) — aggregation is NOT re-implemented. Two responsibilities:
@@ -75,4 +79,6 @@ None. Note: tests inline faithful copies of hook logic (no imports from `rlm-hoo
 - [x] Phase 2 — SDK-Direct Mode (COMPLETE)
 - [x] Phase 3 — Semantic Caching (COMPLETE — Units 1-6)
 - [x] Phase 4 — Conversation Context Awareness (COMPLETE — Units 1–5: extractPriorRLMBlocks + CONFIG.contextWindow; classifyIntentLocal + intentsOverlap + findReusablePriorBlock; computeChangedFiles + block `ts`; extractPriorBlocksFromTranscript + gatherConversationContext `{messages, priorBlocks}`; findReusablePriorBlockWithMtime + main() early-exit wiring.)
-- [ ] Phase 5 — Metrics Dashboard (Unit 1 DONE: appendMetric + currentMode + recordMetric wired into every main() exit, Group 24. Unit 2 DONE: bench/parse-log.mjs aggregator + Group 25 (18 tests, direct import). Unit 3 DONE: bench/dashboard.mjs renderHTML + --serve + Group 26 (10 tests, direct import). Unit 4 (final): verify coverage, write `.marathon/DONE` — plan's Unit-4 test surface already covered by Groups 24/25/26.)
+- [x] Phase 5 — Metrics Dashboard (COMPLETE — Unit 1: appendMetric + currentMode + recordMetric wired into every main() exit, Group 24. Unit 2: bench/parse-log.mjs aggregator + Group 25 (18 tests, direct import). Unit 3: bench/dashboard.mjs renderHTML + --serve + Group 26 (10 tests, direct import). Unit 4 (final): verified coverage (Groups 24/25/26 cover the plan's Unit-4 surface), wrote `.marathon/DONE`.)
+
+**ALL FIVE PHASES COMPLETE — see `.marathon/DONE`.**

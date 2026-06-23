@@ -1,0 +1,72 @@
+# claude-code-rlm — Marathon COMPLETE
+
+All five phases of the `claude-code-rlm` `UserPromptSubmit` hook are implemented,
+tested, committed, and pushed. `node --test test/unit.test.mjs` is green.
+
+## What was built
+
+A `UserPromptSubmit` hook (`rlm-hook.mjs`, dependency-light Node ESM) that
+dispatches Haiku to pre-explore the codebase before the main model's turn,
+injecting findings as `<rlm_preresearch>` / `<rlm_analysis>` context.
+
+- **Phase 1 — Core Hook (COMPLETE).** Subprocess-based Haiku invocation
+  (fast / detailed / agentic modes), prompt assembly, SHA-256 cache,
+  conversation-context gathering, skip heuristics, safe-by-default output
+  formatting. Every failure path swallowed so the hook never blocks the user.
+
+- **Phase 2 — SDK-Direct Mode (COMPLETE).** `@anthropic-ai/sdk` added as a
+  dependency. `RLM_USE_SDK=true` + `ANTHROPIC_API_KEY` selects the SDK path;
+  otherwise the subprocess behavior is unchanged. `callHaikuFastSDK`,
+  `callHaikuDetailedSDK`, and `callHaikuAgenticSDK` (tool-use loop dispatching
+  Glob/Grep/Read/Write/Bash(git:*), capped at `RLM_MAX_TURNS`, default 10).
+  SDK errors fall back gracefully.
+
+- **Phase 3 — Semantic Caching (COMPLETE).** `embedText` → `Float32Array`,
+  pure `cosineSimilarity`, `.embedding` float32 sidecars, `semanticLookup`
+  on SHA miss (threshold `RLM_SEMANTIC_THRESHOLD`, default 0.92), and an
+  `index.json` reverse index (inline vectors, single-read lookup) that
+  self-heals from the `.embedding` files as source of truth. Gated on
+  `RLM_SEMANTIC_CACHE=true` — zero extra I/O when off.
+
+- **Phase 4 — Conversation Context Awareness (COMPLETE).**
+  `extractPriorRLMBlocks` / `extractPriorBlocksFromTranscript` recover prior
+  pre-research blocks from the transcript JSONL; `classifyIntentLocal` +
+  `intentsOverlap` + `findReusablePriorBlockWithMtime` decide reuse;
+  `computeChangedFiles` (mtime, per-block `ts` window) gates it. On a hit,
+  `main()` emits a lightly-marked continuation block and skips Haiku entirely.
+  `RLM_CONTEXT_WINDOW` (default 5) bounds the look-back. Transparent — always on.
+
+- **Phase 5 — Metrics Dashboard (COMPLETE).** `appendMetric` writes one JSON
+  line per invocation at every `main()` exit (event, latency_ms, mode,
+  input_len, cache_hit + extras), best-effort, never altering exit behavior.
+  `bench/parse-log.mjs` aggregates per-UTC-day stats (hit/skip/error rates,
+  nearest-rank p50/p95/p99 latency). `bench/dashboard.mjs` renders a
+  standalone, XSS-safe static HTML dashboard (`renderHTML`) and serves it on
+  port 9876 with `--serve` (re-aggregates the live log per request).
+
+## Tests
+
+- **272 unit tests green** (`node --test test/unit.test.mjs`), 26 groups.
+  Phase-5 coverage: Group 24 (metrics log append), Group 25 (JSONL parsing +
+  aggregation math, direct import of parse-log.mjs), Group 26 (HTML render +
+  escaping, direct import of dashboard.mjs).
+- **15 integration tests green** (`RUN_INTEGRATION_TESTS=1 node --test
+  test/integration.test.mjs`) — unaffected by parse-log/dashboard (off the
+  hook path).
+- Unit tests inline faithful copies of hook logic rather than importing
+  `rlm-hook.mjs` (which calls `main()` on load); the standalone bench modules
+  guard their CLI behind `import.meta.url === pathToFileURL(argv[1]).href`, so
+  they ARE imported directly.
+
+## Remaining open questions (from docs/plan/plan.md §160 — deferred, not blocking)
+
+1. **Max turns in agentic mode** — 10 is a guess; needs empirical testing on
+   large codebases.
+2. **Scratch file location** — Phase 2 writes to a pid-scoped scratch path to
+   avoid the `.claude/rlm-scratch.md` collision called out in the plan.
+3. **Multi-project sessions** — cache is not yet re-keyed/invalidated when
+   `cwd` changes between turns.
+4. **Cost tracking** — per-run Haiku token usage (~2K–10K in / ~500–2K out
+   estimated) not yet measured; the Phase-5 metrics log is the foundation for it.
+5. **Race conditions** — concurrent hook invocations do last-writer-wins cache
+   writes; no lock file yet (accepted per plan).
