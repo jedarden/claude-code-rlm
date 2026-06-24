@@ -32,23 +32,23 @@ The hook injects a block like this before your prompt reaches the main model:
 
 ```xml
 <rlm_preresearch>
-  <intent>Add retry logic to the Kalshi order submission function</intent>
+  <intent>Add retry logic to the payment service submit function</intent>
   <relevant_files>
-    <file path="src/orders.ts" relevance="primary">Contains submitOrder() at line 142; currently no retry logic</file>
+    <file path="src/payments.ts" relevance="primary">Contains submitPayment() at line 142; currently no retry logic</file>
     <file path="src/client.ts" relevance="secondary">HttpClient with exponential backoff helper already implemented at line 89</file>
-    <file path="test/orders.test.ts" relevance="tests">6 existing tests for submitOrder; mock at line 34</file>
+    <file path="test/payments.test.ts" relevance="tests">6 existing tests for submitPayment; mock at line 34</file>
   </relevant_files>
   <patterns>
     - Retry logic in this codebase uses withRetry() from src/utils/retry.ts (max 3, 200ms base delay)
-    - Error types: KalshiRateLimitError and KalshiNetworkError are retryable; KalshiAuthError is not
+    - Error types: RateLimitError and NetworkError are retryable; AuthError is not
     - Tests use vi.useFakeTimers() for delay testing (see src/pricing.test.ts line 12)
   </patterns>
   <recent_changes>
-    - 2d ago: Added KalshiRateLimitError to error.ts (commit a3f1c2b)
+    - 2d ago: Added RateLimitError to error.ts (commit a3f1c2b)
     - 5d ago: withRetry() added to utils/retry.ts (commit 8e9d0f4)
   </recent_changes>
   <approach>
-    Wrap the HTTP call in submitOrder() with withRetry(), passing [KalshiRateLimitError, KalshiNetworkError]
+    Wrap the HTTP call in submitPayment() with withRetry(), passing [RateLimitError, NetworkError]
     as retryable types. Update the 6 existing tests to cover retry behavior using fake timers.
   </approach>
 </rlm_preresearch>
@@ -60,7 +60,7 @@ The hook injects a block like this before your prompt reaches the main model:
 
 **Quick install (recommended):**
 ```bash
-git clone https://git.ardenone.com/jedarden/claude-code-rlm.git
+git clone https://github.com/jedarden/claude-code-rlm.git
 cd claude-code-rlm
 bash install.sh
 ```
