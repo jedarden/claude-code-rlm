@@ -77,7 +77,7 @@ The install script copies `rlm-hook.mjs` to `~/.claude/hooks/` and makes it exec
           {
             "type": "command",
             "command": "~/.claude/hooks/rlm-hook.mjs",
-            "timeout": 30
+            "timeout": 90
           }
         ]
       }
@@ -104,7 +104,7 @@ RLM_FAST_MODE=true       # Concise non-agentic analysis (~4s, default when agent
 
 # Model tuning
 RLM_MODEL=claude-haiku-4-5-20251001   # Which model to use for preresearch
-RLM_TIMEOUT=60000                      # Total timeout in ms (default: 60s)
+RLM_TIMEOUT=60000                      # Total timeout in ms (default: 60s, must be < hook timeout in settings.json)
 RLM_CACHE_TTL=3600                     # Cache TTL in seconds (default: 1h)
 RLM_MIN_LENGTH=20                      # Skip inputs shorter than this (chars)
 RLM_MAX_LENGTH=4000                    # Truncate inputs longer than this (chars)
