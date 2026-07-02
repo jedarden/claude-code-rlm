@@ -170,7 +170,7 @@ Not every prompt benefits from preresearch. The hook detects and skips trivial i
 | Input type | Example | Reason skipped |
 |---|---|---|
 | Short (\<20 chars) | `ls`, `yes`, `ok`, `sure` | Not worth analyzing |
-| Simple command | `ls`, `pwd`, `cat`, `echo`, `git status`, `npm install`, `yarn add` | Operational, not exploratory |
+| Simple command | `ls`, `pwd`, `cat`, `echo`, `git status`, `npm`, `yarn` | Operational, not exploratory |
 | Single-word response | `yes`, `no`, `ok`, `thanks`, `y`, `n` | Affirmation/negation, not a task |
 | Slash command | `/help`, `/clear`, `/compact` | Claude Code meta-commands |
 | Code-heavy paste | Input where >50% is code blocks with 2+ blocks | Prompt already carries its own context |
