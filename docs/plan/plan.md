@@ -86,81 +86,104 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 
 ---
 
-## Phase 3 — Semantic Caching `[ ]`
+## Phase 3 — Semantic Caching (COMPLETE ✅) `[x]`
 
-**Goal:** Cache hits based on semantic similarity, not exact SHA-256 match. Two prompts that are 90% similar should reuse the same analysis.
+**Deliverables:**
+- Embedding generation and cosine similarity scoring (`embedText`, `cosineSimilarity`)
+- Sidecar `.embedding` files (Float32Array, raw binary)
+- `index.json` reverse index with inline vectors for fast lookup
+- File-scan fallback when index is missing/corrupt
+- `semanticLookup` helper with threshold gating
+- Integrated into `main()` after SHA-256 miss
 
-**Approach:**
-- Embed user messages using a local or API-based embedding model
-- Store embeddings alongside cache entries
-- On cache lookup: compute similarity against cached embeddings, return best match if similarity > threshold (e.g., 0.92)
-- Candidate models: `text-embedding-3-small` (API), `nomic-embed-text` (local via Ollama)
+**Features implemented:**
+- Embedding via OpenAI-compatible endpoint (`RLM_EMBEDDING_ENDPOINT`, default OpenAI, keyed by `OPENAI_API_KEY`)
+- Cosine similarity with dimension mismatch safety and zero-magnitude handling
+- `index.json` design: inline `{dim, vec: Array.from(float32)}` per entry, single-read lookup, tolerant of absent/malformed index (falls back to file scan)
+- Per-record `ts` stamping for accurate timestamping
+- Threshold gating (default 0.92) with TTL validation
+- Gated behind `RLM_SEMANTIC_CACHE=true`, default off
 
-**Implementation sketch:**
-```
-cache/
-  <sha256>.json          ← exact-match cache (current)
-  <sha256>.embedding     ← float32 embedding vector
-  index.json             ← lightweight ANN index (cosine similarity)
-```
+**Key design decision:** Inline vectors in `index.json` (single-read lookup) over key-list scan, with robust file-scan fallback when index is missing/corrupt.
 
-**Tradeoffs:**
-- Adds ~100–200ms for embedding lookup
-- Requires embedding API or local model
-- Index needs compaction as cache grows
-- High-similarity threshold required to avoid injecting stale/wrong context
-
-**Recommendation:** Gate behind `RLM_SEMANTIC_CACHE=true`. Default off until embedding latency and quality are validated.
+**Test coverage:** Groups 14-18 (42 tests) covering embedding generation, similarity math, sidecar I/O, index read/write, and semantic lookup with fallback.
 
 ---
 
-## Phase 4 — Conversation Context Awareness `[ ]`
+## Phase 4 — Conversation Context Awareness (COMPLETE ✅) `[x]`
 
-**Goal:** Read the recent conversation transcript and use it to skip redundant exploration. If Haiku explored `src/auth/` two turns ago and the user is still working on auth, don't re-explore.
+**Goal:** Read the recent conversation transcript and skip redundant exploration by reusing prior RLM analysis when intent and files are unchanged.
 
-**Approach:**
-1. Extend `gatherConversationContext` to extract prior RLM outputs from the transcript
-2. If a recent `<rlm_preresearch>` block exists and covers overlapping intent/files:
-   - Skip re-exploration
-   - Inject a lightweight "continuing from prior analysis" block instead
-3. Track which files were already read in the session to avoid re-reading unchanged files
+**Deliverables:**
+- `extractPriorRLMBlocks` — parse prior `<rlm_preresearch>`/`<rlm_analysis>` blocks from transcript text
+- `classifyIntentLocal` — keyword-based intent classifier (code_writing, debugging, refactoring, architecture, learning, other)
+- `intentsOverlap` — strict intent equality check
+- `findReusablePriorBlock` — find most recent reusable block by intent + changed files
+- `computeChangedFiles` — mtime-based file change detection with cwd resolution
+- `findReusablePriorBlockWithMtime` — per-block mtime checking (handles timestamped blocks correctly)
+- `extractPriorBlocksFromTranscript` — JSONL-aware wrapper that extracts per-record blocks
+- `gatherConversationContext` extended to return `{messages, priorBlocks}`
+- Early-exit wired into `main()` — reuse hits skip Haiku entirely
 
-**Implementation:**
-- Parse `transcript_path` for `<rlm_preresearch>` blocks in recent turns
-- Extract `relevant_files` and `intent` from prior blocks
-- If current prompt intent matches prior intent (same root task), reuse + extend
-- If intent diverges (new task), run full exploration
+**Features implemented:**
+- Intent classification via ordered keyword regexes (debugging → refactoring → code_writing → architecture → learning → other)
+- Per-block timestamp tracking (`ts` stamped on extraction from each transcript record's timestamp)
+- Mtime-based file change detection (relative paths resolved under cwd, strict `>` comparison)
+- Per-block changed-file computation (each block carries its own timestamp)
+- Best-effact early-exit: any failure falls through to normal Haiku exploration
+- Continuation marker: `[Continuing from prior pre-research — files unchanged since last turn]` prepended to reused analysis
+- Configurable via `RLM_CONTEXT_WINDOW` (default 5 turns)
 
-**Expected benefit:** Eliminate ~80% of re-exploration in multi-turn coding sessions on the same task.
+**Key design decision:** Per-record timestamping (option a from plan) — each extracted block carries the `ts` from its transcript record, enabling accurate per-block mtime checks. The cheap keyword classifier fires on the current turn (option a) so early-exit can trigger immediately.
+
+**Test coverage:** Groups 19-23 (62 tests) covering block extraction, intent classification, overlap detection, reuse logic, mtime change detection, per-block timestamping, JSONL transcript parsing, and main() early-exit behavior.
 
 ---
 
-## Phase 5 — Metrics Dashboard `[ ]`
+## Phase 5 — Metrics Dashboard (COMPLETE ✅) `[x]`
 
 **Goal:** Understand hook performance in production: hit rate, skip rate, latency distribution, model cost.
 
-**Metrics to capture (append to log):**
-```json
-{"ts": 1234567890, "event": "cache_hit|cache_miss|skip|error", "latency_ms": 1234, "mode": "agentic|fast|detailed", "input_len": 234}
-```
+**Deliverables:**
+- `appendMetric` — bullet-proof JSONL append to `~/.local/share/rlm-hook/metrics.jsonl`
+- `recordMetric` — sugar for recording events with latency, mode, input_len, cache_hit, and extras
+- `currentMode` — returns current mode (agentic/fast/detailed)
+- Metrics wired at every `main()` exit (skip, cache_hit SHA/semantic, context_reuse, haiku_skip, complete, error)
+- `bench/parse-log.mjs` — JSONL parser + per-UTC-day aggregation with nearest-rank percentiles
+- `bench/dashboard.mjs` — static HTML render + `--serve` HTTP server on port 9876
+- Configurable via `RLM_METRICS_FILE`
 
-**Dashboard:**
-- Static HTML generated from log file
-- Shows: daily hit rate, latency P50/P95/P99, skip reasons, error rate
-- Served locally: `node bench/dashboard.mjs --serve` → `http://localhost:9876`
+**Features implemented:**
+- JSONL format (one JSON object per line, never throws on parse errors)
+- Event taxonomy extended beyond the original 4: `skip`, `cache_hit` (SHA/semantic source), `context_reuse`, `haiku_skip`, `complete`, `error`
+- Canonical `cache_hit` boolean (true for cache_hit + context_reuse) for hit-rate calculations
+- Latency distribution: p50/p95/p99/min/max over `latency_ms` field
+- Per-UTC-day buckets with `overall` rollup
+- Skip-reason and mode breakdowns
+- Dashboard: summary cards, per-day table, skip-reason table, events table, modes table
+- XSS-safe HTML rendering (all interpolated text escaped)
+- Null-handling: renders as `—`, never the string "null"
+- Static HTML render (`--out <path>`) or live HTTP server (`--serve`, `--port N`)
 
-**Implementation:**
-- Structured JSON log format (one entry per line, JSONL)
-- `bench/parse-log.mjs`: parse log → aggregate metrics
-- `bench/dashboard.mjs`: render HTML dashboard, optionally serve
-- No external dependencies (use Node built-ins only)
+**Deviations from plan:**
+- Event taxonomy richer than planned (adds semantic source, context_reuse, haiku_skip, complete for better breakdown)
+- Embeddings use OpenAI-compatible endpoint keyed by `OPENAI_API_KEY` (not hard-coded to OpenAI)
+
+**Test coverage:** Groups 24-26 (34 tests) covering metric append/shaping, JSONL parsing, aggregation math, percentile calculation, and HTML rendering.
 
 ---
 
 ## Open Questions
 
-1. **Max turns in agentic mode**: 10 turns is a guess. Does it reliably finish exploration within that budget for large codebases? Needs empirical testing.
-2. **Scratch file location**: `.claude/rlm-scratch.md` could conflict if the user already has a file there. Consider a temp path like `/tmp/rlm-scratch-<pid>.md`.
-3. **Multi-project sessions**: When `cwd` changes between turns (user switches projects), the cache should be invalidated or keyed differently.
-4. **Cost tracking**: Each agentic run consumes Haiku tokens. With 10 turns of tool calls, estimated ~2K–10K input tokens and ~500–2K output tokens per run. Need to measure actual usage.
-5. **Race conditions**: If the user submits two prompts rapidly, two hook invocations run concurrently. Cache writes are not atomic — last writer wins. Acceptable for now; use a lock file in Phase 3+ if needed.
+### Resolved during implementation
+
+1. **Scratch file location (SDK path)**: RESOLVED — Phase 2 SDK mode uses a pid-scoped temp file (`/tmp/rlm-scratch-<pid>.md`) to avoid conflicts. Still open for the CLI subprocess path (currently uses `.claude/rlm-scratch.md`).
+2. **Block timestamp tracking (Phase 4)**: RESOLVED — per-record timestamping (option a). Each extracted block carries the `ts` from its transcript record, enabling accurate per-block mtime checks via `computeChangedFiles`.
+3. **Index design (Phase 3)**: RESOLVED — inline vectors in `index.json` with file-scan fallback. Single-read lookup for speed; absent/corrupt index degrades gracefully to per-file `.embedding` scan.
+
+### Still open
+
+4. **Max turns in agentic mode**: 10 turns is a guess. Does it reliably finish exploration within that budget for large codebases? Needs empirical testing.
+5. **Multi-project sessions**: When `cwd` changes between turns (user switches projects), the cache should be invalidated or keyed differently.
+6. **Cost tracking**: Each agentic run consumes Haiku tokens. With 10 turns of tool calls, estimated ~2K–10K input tokens and ~500–2K output tokens per run. Need to measure actual usage.
+7. **Race conditions**: If the user submits two prompts rapidly, two hook invocations run concurrently. Cache writes are not atomic — last writer wins. Acceptable for now; use a lock file in Phase 3+ if needed.
