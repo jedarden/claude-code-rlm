@@ -28,6 +28,31 @@ if ! command -v claude &>/dev/null; then
   echo "  Install via: npm install -g @anthropic-ai/claude-code"
 fi
 
+# Prompt for SDK mode installation
+echo ""
+echo "SDK-Direct mode (optional):"
+echo "  The hook can call the Anthropic API directly (~800ms latency) instead of"
+echo "  spawning the claude CLI subprocess (~4s latency). This requires the"
+echo "  @anthropic-ai/sdk package and an ANTHROPIC_API_KEY."
+echo ""
+read -p "Install SDK dependencies for SDK-Direct mode? [y/N] " -n 1 -r
+echo ""
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+  echo "Installing @anthropic-ai/sdk next to the hook..."
+  npm install --prefix "${HOOK_DIR}" @anthropic-ai/sdk
+  echo "SDK dependencies installed to ${HOOK_DIR}/node_modules/"
+  echo ""
+  echo "To enable SDK mode, set in your environment or ~/.claude/settings.json:"
+  echo "  RLM_USE_SDK=true"
+  echo "  ANTHROPIC_API_KEY=sk-ant-..."
+  echo ""
+else
+  echo "Skipping SDK dependencies. The hook will use subprocess mode (default)."
+  echo "You can install SDK dependencies later by running:"
+  echo "  npm install --prefix ~/.claude/hooks @anthropic-ai/sdk"
+  echo ""
+fi
+
 # Print settings.json snippet
 cat <<'EOF'
 

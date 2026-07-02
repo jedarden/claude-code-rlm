@@ -25,7 +25,8 @@
   ],
   "license": "MIT",
   "author": "jedarden",
-  "dependencies": {
+  "dependencies": {},
+  "optionalDependencies": {
     "@anthropic-ai/sdk": "^0.105.0"
   }
 }
