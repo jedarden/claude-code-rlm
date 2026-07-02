@@ -41,7 +41,7 @@ Add the following to ~/.claude/settings.json to activate the hook:
           {
             "type": "command",
             "command": "~/.claude/hooks/rlm-hook.mjs",
-            "timeout": 30
+            "timeout": 90
           }
         ]
       }
