@@ -4,7 +4,7 @@ A `UserPromptSubmit` hook for Claude Code that dispatches Haiku to pre-explore t
 
 ## Key files
 
-- `rlm-hook.mjs` — main hook (~1880 lines, Node ESM, depends on @anthropic-ai/sdk for Phase 2 SDK mode)
+- `rlm-hook.mjs` — main hook (~1913 lines, Node ESM, depends on @anthropic-ai/sdk for Phase 2 SDK mode)
 - `rlm-hook.sh` — thin bash wrapper
 - `install.sh` — copies hook to `~/.claude/hooks/`
 - `docs/plan/plan.md` — authoritative implementation plan (5 phases)
