@@ -137,7 +137,12 @@ async function checkCache(key) {
       const content = await readFile(cacheFile, 'utf-8');
       return JSON.parse(content);
     }
+    // Expired: delete the JSON entry and clean up any orphaned semantic artifacts
     await rm(cacheFile, { force: true });
+    // Best-effort: delete the companion .embedding sidecar
+    await rm(join(CONFIG.cacheDir, `${key}.embedding`), { force: true }).catch(() => {});
+    // Best-effort: prune the key from index.json
+    await pruneCacheIndex(key).catch(() => {});
   } catch {
     // Cache miss
   }
@@ -1401,6 +1406,31 @@ async function updateCacheIndex(key, vec) {
 }
 
 /**
+ * pruneCacheIndex — best-effort removal of a key from index.json (Phase 3,
+ * semantic cache hygiene). Used when a cache entry expires or when an orphaned
+ * embedding is discovered during semantic lookup. Fully gated behind
+ * semanticCache and wrapped in try/catch so index failures never break the hook.
+ * Returns true iff the key was present and removed.
+ */
+async function pruneCacheIndex(key) {
+  if (!CONFIG.semanticCache) return false;
+  try {
+    const index = await readCacheIndex();
+    if (!(key in index)) return false;
+    delete index[key];
+    await mkdir(CONFIG.cacheDir, { recursive: true });
+    const file = indexPath();
+    const tmp = `${file}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify(index));
+    await rename(tmp, file);
+    return true;
+  } catch (err) {
+    await log(`Cache index prune failed for ${key.slice(0, 16)}...: ${String(err?.message ?? err)}`);
+    return false;
+  }
+}
+
+/**
  * saveCacheEmbedding — best-effort companion write to saveCache (Phase 3, Unit
  * 3). When semantic caching is enabled and an embedding API key is available,
  * embeds `text` and persists the vector as raw float32 bytes next to the JSON
@@ -1553,8 +1583,12 @@ async function semanticLookup(queryText, {
     }
     const entry = await checkImpl(bestKey);
     if (!entry) {
-      // matched an embedding whose JSON expired or vanished — treat as a miss
-      await log(`Semantic match ${bestKey.slice(0, 16)}... (${bestScore.toFixed(4)}) but entry gone`);
+      // matched an embedding whose JSON expired or vanished — treat as a miss and clean up the orphan
+      await log(`Semantic match ${bestKey.slice(0, 16)}... (${bestScore.toFixed(4)}) but entry gone — cleaning up orphan`);
+      // Best-effort: delete the orphan .embedding sidecar
+      await rm(join(CONFIG.cacheDir, `${bestKey}.embedding`), { force: true }).catch(() => {});
+      // Best-effort: prune the orphan key from index.json
+      await pruneCacheIndex(bestKey).catch(() => {});
       return null;
     }
     await log(`Semantic cache hit ${bestKey.slice(0, 16)}... (cosine ${bestScore.toFixed(4)} ≥ ${CONFIG.semanticThreshold})`);
