@@ -2259,6 +2259,23 @@ async function updateCacheIndex(key, vec, cfg) {
   }
 }
 
+async function pruneCacheIndex(key, cfg) {
+  if (!cfg.semanticCache) return false;
+  try {
+    const index = await readCacheIndex(cfg.cacheDir);
+    if (!(key in index)) return false;
+    delete index[key];
+    await mkdir(cfg.cacheDir, { recursive: true });
+    const file = join(cfg.cacheDir, 'index.json');
+    const tmp = `${file}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify(index));
+    await rename(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function scoreFromIndex(queryVec, simImpl, cacheDir) {
   const index = await readCacheIndex(cacheDir);
   const keys = Object.keys(index);
@@ -2312,7 +2329,12 @@ async function semanticLookupIndexed(queryText, cfg) {
     const { bestKey, bestScore } = best;
     if (bestScore < cfg.semanticThreshold) return null;
     const entry = await cfg.checkImpl(bestKey);
-    if (!entry) return null;
+    if (!entry) {
+      // matched an embedding whose JSON expired or vanished — treat as a miss and clean up the orphan
+      await rm(join(cfg.cacheDir, `${bestKey}.embedding`), { force: true }).catch(() => {});
+      await pruneCacheIndex(bestKey, cfg).catch(() => {});
+      return null;
+    }
     return entry;
   } catch {
     return null;
@@ -2453,6 +2475,246 @@ describe('Group 18: Semantic Cache — index.json reverse index (Phase 3)', () =
     assert.equal(hit.who, 'GOOD');
   });
 });
+
+// ============================================================================
+// Group 18.1: Semantic Cache — Orphan Cleanup (bf-fhk: semantic cache hygiene)
+// Tests for orphan cleanup behavior: when cache entries expire or embeddings
+// lose their JSON sidecars, the .embedding files and index.json entries must
+// be cleaned up to prevent unbounded cache growth.
+// ============================================================================
+
+describe('Group 18.1: Semantic Cache — Orphan Cleanup (bf-fhk)', () => {
+  let testCacheDir;
+
+  const fixedVec = v => async () => Float32Array.from(v);
+
+  const checkImpl = async (key) => {
+    try {
+      return JSON.parse(await readFile(join(testCacheDir, `${key}.json`), 'utf-8'));
+    } catch {
+      return null;
+    }
+  };
+
+  const baseCfg = overrides => ({
+    semanticCache: true,
+    embedApiKey: 'sk-x',
+    cacheDir: testCacheDir,
+    semanticThreshold: 0.92,
+    checkImpl,
+    ...overrides,
+  });
+
+  // Inlined checkCache logic for testing expiration cleanup
+  async function checkCache_copy(key, cacheTTL = 3600) {
+    const cacheFile = join(testCacheDir, `${key}.json`);
+    try {
+      const stats = await stat(cacheFile);
+      const ageSeconds = (Date.now() - stats.mtimeMs) / 1000;
+      if (ageSeconds < cacheTTL) {
+        const content = await readFile(cacheFile, 'utf-8');
+        return JSON.parse(content);
+      }
+      // Expired: delete the JSON entry and clean up any orphaned semantic artifacts
+      await rm(cacheFile, { force: true });
+      // Best-effort: delete the companion .embedding sidecar
+      await rm(join(testCacheDir, `${key}.embedding`), { force: true }).catch(() => {});
+      // Best-effort: prune the key from index.json
+      await pruneCacheIndex(key, { semanticCache: true, cacheDir: testCacheDir }).catch(() => {});
+    } catch {
+      // Cache miss
+    }
+    return null;
+  }
+
+  beforeEach(async () => {
+    testCacheDir = join(tmpdir(), `rlm-orphan-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testCacheDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try { await rm(testCacheDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('pruneCacheIndex removes a key from index.json when present', async () => {
+    const KEY = 'a'.repeat(64);
+    const index = await readCacheIndex(testCacheDir);
+    index[KEY] = { dim: 3, vec: [1, 2, 3] };
+    await writeFile(join(testCacheDir, 'index.json'), JSON.stringify(index));
+
+    const pruned = await pruneCacheIndex(KEY, { semanticCache: true, cacheDir: testCacheDir });
+    assert.equal(pruned, true, 'should report key was pruned');
+
+    const after = await readCacheIndex(testCacheDir);
+    assert.equal(KEY in after, false, 'key should be gone from index');
+  });
+
+  it('pruneCacheIndex returns false when key is already absent', async () => {
+    const KEY = 'b'.repeat(64);
+    // Empty index
+    await writeFile(join(testCacheDir, 'index.json'), '{}');
+
+    const pruned = await pruneCacheIndex(KEY, { semanticCache: true, cacheDir: testCacheDir });
+    assert.equal(pruned, false, 'should report key was not present');
+  });
+
+  it('pruneCacheIndex gracefully handles absent/missing index.json', async () => {
+    const KEY = 'c'.repeat(64);
+    // No index.json file exists
+
+    const pruned = await pruneCacheIndex(KEY, { semanticCache: true, cacheDir: testCacheDir });
+    assert.equal(pruned, false, 'should handle absent index gracefully');
+    // Should not throw, and no index.json should be created
+    assert.ok(!existsSync(join(testCacheDir, 'index.json')));
+  });
+
+  it('checkCache on expiration deletes .json, .embedding, and prunes index', async () => {
+    const KEY = 'd'.repeat(64);
+    const data = { intent: 'debugging', files: ['x.js'] };
+
+    // Write fresh cache entry and embedding
+    await writeFile(join(testCacheDir, `${KEY}.json`), JSON.stringify(data));
+    const vec = Float32Array.from([0.5, -0.25, 0.125]);
+    await writeFile(join(testCacheDir, `${KEY}.embedding`), Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+
+    // Add to index
+    const index = await readCacheIndex(testCacheDir);
+    index[KEY] = { dim: 3, vec: Array.from(vec) };
+    await writeFile(join(testCacheDir, 'index.json'), JSON.stringify(index));
+
+    // Simulate expiration by setting mtime far in the past (2000 seconds ago)
+    const jsonPath = join(testCacheDir, `${KEY}.json`);
+    const oldTime = new Date(Date.now() - 2_000_000);
+    await utimesMtime(jsonPath, oldTime.getTime());
+
+    // checkCache should detect expiration and clean up
+    const result = await checkCache_copy(KEY, 1000); // TTL=1000s, entry is 2000s old
+    assert.equal(result, null, 'expired entry should return null');
+
+    // Verify all artifacts are gone
+    assert.ok(!existsSync(jsonPath), 'JSON cache file should be deleted');
+    assert.ok(!existsSync(join(testCacheDir, `${KEY}.embedding`)), 'embedding sidecar should be deleted');
+    const afterIndex = await readCacheIndex(testCacheDir);
+    assert.equal(KEY in afterIndex, false, 'key should be pruned from index');
+  });
+
+  it('checkCache on hit preserves .json, .embedding, and index entry', async () => {
+    const KEY = 'e'.repeat(64);
+    const data = { intent: 'code_writing', files: ['y.js'] };
+
+    // Write fresh cache entry and embedding
+    await writeFile(join(testCacheDir, `${KEY}.json`), JSON.stringify(data));
+    const vec = Float32Array.from([0.9, 0.1, 0.3]);
+    await writeFile(join(testCacheDir, `${KEY}.embedding`), Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+
+    // Add to index
+    const index = await readCacheIndex(testCacheDir);
+    index[KEY] = { dim: 3, vec: Array.from(vec) };
+    await writeFile(join(testCacheDir, 'index.json'), JSON.stringify(index));
+
+    // checkCache with generous TTL should return the entry
+    const result = await checkCache_copy(KEY, 10000); // TTL=10s, entry is fresh
+    assert.deepEqual(result, data, 'fresh entry should be returned');
+
+    // Verify all artifacts are still present
+    assert.ok(existsSync(join(testCacheDir, `${KEY}.json`)), 'JSON cache file should still exist');
+    assert.ok(existsSync(join(testCacheDir, `${KEY}.embedding`)), 'embedding sidecar should still exist');
+    const afterIndex = await readCacheIndex(testCacheDir);
+    assert.equal(KEY in afterIndex, true, 'key should still be in index');
+  });
+
+  it('semanticLookupIndexed deletes orphan .embedding and prunes index when JSON is gone', async () => {
+    const KEY = 'f'.repeat(64);
+    // Only write embedding, no JSON (simulating expired/deleted cache entry)
+    const vec = Float32Array.from([0.98, 0.2, 0]);
+    await writeFile(join(testCacheDir, `${KEY}.embedding`), Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+
+    // Add to index (orphaned state)
+    const index = await readCacheIndex(testCacheDir);
+    index[KEY] = { dim: 3, vec: Array.from(vec) };
+    await writeFile(join(testCacheDir, 'index.json'), JSON.stringify(index));
+
+    // semanticLookup should find the embedding but miss the JSON, triggering cleanup
+    const hit = await semanticLookupIndexed('query', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.equal(hit, null, 'should return null when JSON is gone');
+
+    // Verify orphan was cleaned up
+    assert.ok(!existsSync(join(testCacheDir, `${KEY}.embedding`)), 'orphan .embedding should be deleted');
+    const afterIndex = await readCacheIndex(testCacheDir);
+    assert.equal(KEY in afterIndex, false, 'orphan key should be pruned from index');
+  });
+
+  it('semanticLookupIndexed handles missing index.json gracefully during orphan cleanup', async () => {
+    const KEY = 'g'.repeat(64);
+    // Only write embedding, no JSON
+    const vec = Float32Array.from([0.97, 0.24, 0]);
+    await writeFile(join(testCacheDir, `${KEY}.embedding`), Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+
+    // No index.json at all
+
+    // semanticLookup should handle missing index during cleanup
+    const hit = await semanticLookupIndexed('query', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.equal(hit, null, 'should return null when JSON is gone');
+
+    // Embedding should be deleted even without index
+    assert.ok(!existsSync(join(testCacheDir, `${KEY}.embedding`)), 'orphan .embedding should be deleted');
+  });
+
+  it('semanticLookupIndexed returns null and does not clean when below threshold', async () => {
+    const KEY = 'h'.repeat(64);
+    const vec = Float32Array.from([0, 1, 0]); // cos=0 vs [1,0,0]
+    await writeFile(join(testCacheDir, `${KEY}.embedding`), Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+    await writeFile(join(testCacheDir, `${KEY}.json`), JSON.stringify({ who: 'H' }));
+
+    const index = await readCacheIndex(testCacheDir);
+    index[KEY] = { dim: 3, vec: Array.from(vec) };
+    await writeFile(join(testCacheDir, 'index.json'), JSON.stringify(index));
+
+    const hit = await semanticLookupIndexed('query', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.equal(hit, null, 'below threshold → miss');
+
+    // Nothing should be deleted (it's a legitimate miss, not an orphan)
+    assert.ok(existsSync(join(testCacheDir, `${KEY}.embedding`)), 'embedding should remain');
+    assert.ok(existsSync(join(testCacheDir, `${KEY}.json`)), 'JSON should remain');
+    const afterIndex = await readCacheIndex(testCacheDir);
+    assert.equal(KEY in afterIndex, true, 'key should remain in index');
+  });
+
+  it('semanticLookupIndexed preserves valid hit (above threshold, JSON present)', async () => {
+    const KEY = 'i'.repeat(64);
+    const vec = Float32Array.from([0.99, 0.1, 0]); // cos~0.995 vs [1,0,0]
+    await writeFile(join(testCacheDir, `${KEY}.embedding`), Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength));
+    await writeFile(join(testCacheDir, `${KEY}.json`), JSON.stringify({ who: 'I' }));
+
+    const index = await readCacheIndex(testCacheDir);
+    index[KEY] = { dim: 3, vec: Array.from(vec) };
+    await writeFile(join(testCacheDir, 'index.json'), JSON.stringify(index));
+
+    const hit = await semanticLookupIndexed('query', baseCfg({ embedImpl: fixedVec([1, 0, 0]) }));
+    assert.ok(hit, 'above threshold with valid JSON → hit');
+    assert.equal(hit.who, 'I');
+
+    // Nothing should be deleted
+    assert.ok(existsSync(join(testCacheDir, `${KEY}.embedding`)), 'embedding should remain');
+    assert.ok(existsSync(join(testCacheDir, `${KEY}.json`)), 'JSON should remain');
+    const afterIndex = await readCacheIndex(testCacheDir);
+    assert.equal(KEY in afterIndex, true, 'key should remain in index');
+  });
+});
+
+// Helper: set mtime on a file (used by checkCache expiration test)
+async function utimesMtime(path, mtimeMs) {
+  const fd = await open(path, 'r+');
+  try {
+    await fd.utimes(new Date(mtimeMs), new Date(mtimeMs));
+  } finally {
+    await fd.close();
+  }
+}
+
+async function open(path, flags) {
+  return await import('fs').then(fs => fs.promises.open(path, flags));
+}
 
 // ============================================================================
 // Group 19: Conversation Context Awareness — extractPriorRLMBlocks (Phase 4)
