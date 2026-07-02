@@ -79,7 +79,7 @@ cd claude-code-rlm
 bash install.sh
 ```
 
-The install script copies `rlm-hook.mjs` to `~/.claude/hooks/` and makes it executable.
+The install script copies `rlm-hook.mjs` to `~/.claude/hooks/` and makes it executable. During installation, you'll be prompted to optionally install SDK dependencies for SDK-Direct mode.
 
 **Add to Claude Code settings** (`~/.claude/settings.json`):
 ```json
@@ -103,6 +103,18 @@ The install script copies `rlm-hook.mjs` to `~/.claude/hooks/` and makes it exec
 **Requirements:**
 - Node.js 18+
 - Claude Code CLI (`claude` in PATH)
+
+**SDK-Direct mode (optional):**
+If you chose to install SDK dependencies during installation, set these environment variables:
+```bash
+RLM_USE_SDK=true
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+If you skipped SDK installation during install, you can add it later:
+```bash
+npm install --prefix ~/.claude/hooks @anthropic-ai/sdk
+```
 
 ---
 
