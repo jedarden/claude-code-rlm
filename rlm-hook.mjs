@@ -713,7 +713,7 @@ function buildRLMPrompt(userMessage, projectContext, conversationContext) {
 
   // Agentic mode: Haiku explores the codebase with tools and writes structured notes
   if (CONFIG.agenticMode) {
-    const scratchFile = '.claude/rlm-scratch.md';
+    const scratchFile = `.claude/rlm-scratch-${process.pid}.md`;
 
     return `You are an RLM (Recursive Language Model) preresearch agent. Your job is to explore the codebase and gather context for a more expensive coding model.
 
@@ -1805,7 +1805,7 @@ async function main() {
 
     // Invoke Haiku — clean up scratch file in finally so it runs even on throw
     const prompt = buildRLMPrompt(truncatedMessage, projectContext, conversationContext);
-    const scratchFile = CONFIG.agenticMode && cwd ? join(cwd, '.claude', 'rlm-scratch.md') : null;
+    const scratchFile = CONFIG.agenticMode && cwd ? join(cwd, '.claude', `rlm-scratch-${process.pid}.md`) : null;
 
     let response = null;
 
