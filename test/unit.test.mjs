@@ -279,7 +279,7 @@ function buildRLMPrompt(userMessage, projectContext, conversationContext, { agen
   }
 
   if (agenticMode) {
-    const scratchFile = '.claude/rlm-scratch.md';
+    const scratchFile = `.claude/rlm-scratch-${process.pid}.md`;
     return (
       `You are an RLM (Recursive Language Model) preresearch agent. Your job is to explore the codebase and gather context for a more expensive coding model.\n\n` +
       `TASK: Analyze the user's request and gather relevant context from the codebase.\n\n` +
@@ -989,6 +989,14 @@ describe('Group 9: RLM Prompt Building (buildRLMPrompt)', () => {
     assert.doesNotThrow(() => buildRLMPrompt(msg, null, null, { fastMode: true }));
     assert.doesNotThrow(() => buildRLMPrompt(msg, null, null, { agenticMode: true }));
     assert.doesNotThrow(() => buildRLMPrompt(msg, null, null, { agenticMode: false, fastMode: false }));
+  });
+
+  it('agentic mode: scratch file path is pid-scoped to prevent concurrent collisions', () => {
+    const prompt = buildRLMPrompt(msg, null, null, { agenticMode: true });
+    const pidScopedPath = `.claude/rlm-scratch-${process.pid}.md`;
+    assert.ok(prompt.includes(pidScopedPath), `Scratch file path must be pid-scoped (${pidScopedPath}) to prevent concurrent-run collisions`);
+    // Also verify the old fixed path is NOT present
+    assert.ok(!prompt.includes('.claude/rlm-scratch.md') || prompt.includes(pidScopedPath), 'Old fixed path should not be used; only pid-scoped path allowed');
   });
 });
 
