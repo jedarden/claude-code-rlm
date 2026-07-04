@@ -1,61 +1,52 @@
-# Bead bf-gjo: Documentation Refresh
+# Documentation Verification Summary (Bead bf-gjo)
 
-## Status: Already Complete
+**Date:** 2026-07-04
 
-All issues described in bead bf-gjo were already fixed in commit 7c6ac8a (2026-06-24, "docs: improve README for clarity and discoverability"). The bead description was based on an older state of the documentation.
+**Task:** Refresh README.md and CLAUDE.md to match shipped Phases 2-5
 
-## Verification Results (2026-07-02)
+## Findings
 
-### 1. Env Var Documentation ✓
-All 20 env vars in CONFIG are documented in README.md Configuration section (lines 107-149):
-- RLM_AGENTIC_MODE, RLM_FAST_MODE (mode selection)
-- RLM_MODEL, RLM_TIMEOUT, RLM_CACHE_TTL, RLM_MIN_LENGTH, RLM_MAX_LENGTH, RLM_MAX_TURNS (model tuning)
-- RLM_CACHE_DIR, RLM_LOG_FILE, RLM_METRICS_FILE (paths)
-- RLM_USE_SDK, ANTHROPIC_API_KEY, RLM_SDK_MAX_TOKENS (Phase 2: SDK-Direct)
-- RLM_SEMANTIC_CACHE, RLM_SEMANTIC_THRESHOLD, RLM_EMBED_MODEL, RLM_EMBED_BASE_URL, OPENAI_API_KEY (Phase 3: Semantic caching)
-- RLM_CONTEXT_WINDOW, RLM_GATHER_CONTEXT (Phase 4: Context awareness)
-- RLM_DEBUG (debug)
+All documentation is **already accurate and up-to-date**. No changes were needed.
 
-CLAUDE.md documents the key env vars appropriately for a project-level reference.
+### Detailed Verification Results
 
-### 2. Example Output Format ✓
-README.md Example output (lines 29-68) matches formatOutput exactly:
-- `<rlm_preresearch>` tag
-- Pretty-printed JSON via `JSON.stringify(analysis, null, 2)`
-- `</rlm_preresearch>` tag
-- Empty line
-- `PRERESEARCH COMPLETE:` header
-- Plain-text summary with Intent, Summary, Relevant Files, Existing Patterns, Recent Changes, Tasks, Approach
+#### 1. Configuration Section (README.md lines 121-162)
+✅ **All Phase 2-5 env vars are documented:**
+- Phase 2: RLM_USE_SDK, ANTHROPIC_API_KEY, RLM_SDK_MAX_TOKENS
+- Phase 3: RLM_SEMANTIC_CACHE, RLM_SEMANTIC_THRESHOLD, RLM_EMBED_MODEL, RLM_EMBED_BASE_URL, OPENAI_API_KEY
+- Phase 4: RLM_CONTEXT_WINDOW, RLM_GATHER_CONTEXT
+- Phase 5: RLM_METRICS_FILE
 
-### 3. NPM Scripts ✓
-README.md Development section (lines 237-248) correctly lists only existing scripts:
-- `npm test` (runs unit tests)
-- `npm run test:integration` (runs integration tests)
-- `npm run bench` (runs benchmarks)
+All 22 CONFIG variables from rlm-hook.mjs (lines 32-76) are documented.
 
-No reference to `npm run lint` (which doesn't exist).
+#### 2. Example Output (README.md lines 29-69)
+✅ **Matches formatOutput function exactly:**
+- Agentic mode output format with `<rlm_preresearch>` tags
+- JSON structure with intent, summary, relevant_files, existing_patterns, tasks, approach, warnings
+- Plain-text "PRERESEARCH COMPLETE:" summary section
 
-### 4. Phase 4 and Phase 5 Documentation ✓
-README.md includes complete sections:
-- Phase 4: Context reuse optimization (lines 180-193)
-- Phase 5: Metrics dashboard (lines 196-218) with `bench/dashboard.mjs --serve` and port 9876
+#### 3. npm Script References
+✅ **No non-existent scripts referenced:**
+- Only legitimate scripts referenced: `npm run bench`, `npm run test`, `npm run test:integration`, `npm run install-hook`
+- No `npm run lint` or other non-existent scripts found
 
-### 5. CLAUDE.md Accuracy ✓
-- Line count: "~1880 lines" (actual: 1879 lines) ✓
-- Dependency: "depends on @anthropic-ai/sdk for Phase 2 SDK mode" ✓
-- Env vars: RLM_AGENTIC_MODE, RLM_FAST_MODE (not the non-existent RLM_MODE) ✓
-- Phase framing: No "Phase 2 adds the SDK" as future (it's already shipped) ✓
+#### 4. Phase 4 and Phase 5 Documentation
+✅ **Both phases have dedicated sections:**
+- Phase 4: Context reuse optimization (lines 193-208)
+- Phase 5: Metrics dashboard (lines 210-232)
 
-### 6. Skip-Detection Table ✓
-README.md table (lines 157-164) matches shouldSkipRLM (rlm-hook.mjs lines 159-185):
-- Short (<20 chars) - minInputLength check
-- Simple command - simplePatterns regex (git status, npm, pwd)
-- Single-word response - simplePatterns regex (yes, no, ok, thanks)
-- Slash command - /^\/\w+$/ pattern
-- Code-heavy paste - code block detection
+#### 5. CLAUDE.md Accuracy
+✅ **All information is correct:**
+- Line count: "~1913 lines" matches actual 1913 lines
+- Dependencies: "depends on @anthropic-ai/sdk for Phase 2 SDK mode" is accurate
+- Env var names: Uses correct RLM_AGENTIC_MODE, RLM_FAST_MODE (not RLM_MODE)
+- No references to "664 lines" or "no external deps"
 
-No false patterns like "cargo build" or "bare question words".
+#### 6. Skip-Detection Table (README.md lines 165-177)
+✅ **Matches shouldSkipRLM implementation:**
+- All 5 skip categories documented: short inputs, simple commands, single-word responses, slash commands, code-heavy paste
+- Examples and reasons align with code logic
 
 ## Conclusion
 
-Documentation is accurate, complete, and matches the shipped code (rlm-hook.mjs). No changes needed.
+The documentation was already refreshed to match shipped Phases 2-5. All env vars, output formats, phase descriptions, and implementation details are accurately documented. No file changes were required.
