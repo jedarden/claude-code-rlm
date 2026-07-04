@@ -50,8 +50,13 @@ All `RLM_*` vars are documented in `rlm-hook.mjs` at the top (lines 32-76). Key 
 - `RLM_AGENTIC_MODE` — `true` (default) to enable codebase exploration with tools; `false` for fast analysis only
 - `RLM_FAST_MODE` — `true` (default) for concise non-agentic analysis (~4s); `false` for detailed (~9s)
 - `RLM_USE_SDK` — `true` to use Anthropic SDK directly instead of subprocess (requires `ANTHROPIC_API_KEY`)
+- `RLM_SDK_MAX_TOKENS` — Max tokens for SDK Haiku calls (default: 2048)
 - `RLM_SEMANTIC_CACHE` — `true` to enable embedding similarity cache (requires `OPENAI_API_KEY`)
+- `RLM_SEMANTIC_THRESHOLD` — Cosine similarity threshold for semantic cache (0-1, default: 0.92)
+- `RLM_EMBED_MODEL` — OpenAI embedding model (default: text-embedding-3-small)
+- `RLM_EMBED_BASE_URL` — Embedding API endpoint (default: https://api.openai.com/v1)
 - `RLM_CONTEXT_WINDOW` — How many prior RLM blocks to look back for context reuse (default: 5)
+- `RLM_GATHER_CONTEXT` — Gather project context (default: true)
 - `RLM_METRICS_FILE` — Path to metrics JSONL log for dashboard (Phase 5)
 - `RLM_DEBUG` — `true` for verbose logging to `RLM_LOG_FILE`
 
