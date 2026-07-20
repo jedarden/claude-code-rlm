@@ -187,3 +187,42 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 5. **Multi-project sessions**: When `cwd` changes between turns (user switches projects), the cache should be invalidated or keyed differently.
 6. **Cost tracking**: Each agentic run consumes Haiku tokens. With 10 turns of tool calls, estimated ~2K–10K input tokens and ~500–2K output tokens per run. Need to measure actual usage.
 7. **Race conditions**: If the user submits two prompts rapidly, two hook invocations run concurrently. Cache writes are not atomic — last writer wins. Acceptable for now; use a lock file in Phase 3+ if needed.
+
+---
+
+## ADR-001: 2026-07-20 — Resume warm per-conversation Haiku sessions instead of cold subprocess spawns
+
+**Status:** Proposed
+
+### Context
+
+The hook's entire value proposition is that Haiku pre-explores the codebase cheaply so Opus/Sonnet can skip the first 10–20 orienting tool calls. But on every cache-miss turn — the common case, since the SHA-256/semantic caches only key off near-identical prompt text — the hook pays the full cost of a **cold** `claude -p ...` subprocess spawn: fresh CLI startup, CLAUDE.md/plugin/skill discovery, a brand-new system prompt, and a from-scratch agentic exploration (Glob/Grep/Read/git log) of the *same* codebase Haiku already explored one or two turns earlier in the same conversation. README documents this as ~4–20s per cache-miss turn.
+
+Phase 4 (shipped) tries to paper over this after the fact: it parses the transcript for prior `<rlm_preresearch>` blocks, classifies intent with a keyword heuristic, and does mtime checks on the files a prior block touched — if intent matches and nothing changed, it reuses the whole prior block verbatim and skips Haiku entirely. This is necessarily all-or-nothing: full reuse or full re-exploration. It can't express "mostly the same codebase state, but check these two new files" — the actual common case in an iterative coding session.
+
+`claude` (the CLI this hook already shells out to via `spawn('claude', ...)` in `invokeHaiku`, `rlm-hook.mjs`) already supports naming and resuming a session: `--session-id <uuid>` to start a named session, `-r/--resume <id>` to continue it later, both usable with `-p`/`--print`. Resuming carries forward the full prior conversation — including tool results already returned (file contents already read, git log already pulled) — so a resumed Haiku turn can genuinely pick up where it left off instead of re-deriving everything from a blank slate. Because Anthropic's prompt caching keys off matching leading conversation content, resumed turns should also see materially lower latency and token cost than a fresh spawn, independent of any hook-side logic.
+
+### Decision
+
+Add an opt-in `RLM_SESSION_RESUME=true` mode (default off until validated) that:
+
+1. Derives a stable per-conversation session id by hashing the hook's `transcript_path` input (stable for the lifetime of a Claude Code conversation) into a UUID.
+2. On the first cache-miss turn of a conversation, invokes Haiku with `--session-id <id>`. On subsequent cache-miss turns, invokes with `--resume <id>` instead of a bare spawn, keeping `-p`/`--output-format text` unchanged.
+3. Caps resumed-session growth (e.g., start a fresh session every N turns, or once the resumed session's transcript crosses a size threshold) so a long-running conversation doesn't accumulate an unbounded Haiku history.
+4. Falls back to a normal, non-resumed spawn on any `--resume` failure (missing/expired/corrupt session) — consistent with the hook's existing "never block the conversation" contract; a resume failure is just another `catch` path that degrades to today's behavior.
+
+The existing skip-detection, SHA-256/semantic caches, and Phase-4 block-reuse heuristics are unchanged and still run first — they continue to short-circuit truly-trivial or truly-identical-prompt turns before the subprocess is ever touched. This ADR targets what's left: the cache-miss turns that currently pay full cold-start-plus-full-exploration cost every single time.
+
+### Alternatives Considered
+
+1. **Custom persistent daemon** (long-lived Node process holding an in-memory codebase index, hook invocations talk to it over a Unix socket). Rejected for now — it re-implements, with new process-lifecycle and IPC surface, a warm-context benefit `--resume` already provides for free from the CLI dependency this hook already requires. Worth revisiting only if `--resume` proves insufficient (e.g., session-store overhead turns out to dominate).
+2. **Hand-rolled message-array replay via SDK-Direct mode** (Phase 2's own tool loop, keeping conversation history in a file and resending it each call). Rejected — SDK mode requires `ANTHROPIC_API_KEY` (see `docs/notes/architecture.md`, "Why subprocess instead of SDK": the subprocess path exists specifically to ride the user's Max subscription instead of a separate key), and resending the full message array on every call still re-pays the token cost of prior exploration even though it dodges CLI cold-start.
+3. **Keep Phase 4 as the sole reuse mechanism.** Rejected as a long-term answer — its all-or-nothing reuse does nothing for the common "mostly unchanged, one new file" case, which session resume handles naturally via the model's own judgment instead of a hand-rolled mtime heuristic.
+
+### Consequences
+
+- **Positive:** cache-miss turns (the majority of turns in an active session) get faster and cheaper once a session is warm, without new infrastructure — this reuses a capability of a dependency the hook already shells out to.
+- **Positive:** Phase 4's reuse logic can simplify over time — "has Haiku already seen this file" becomes something the resumed session's own history answers natively, rather than something `extractPriorRLMBlocks`/`computeChangedFiles` has to approximate by re-parsing the transcript.
+- **Negative/risk:** session storage now grows on disk per conversation (Claude Code's own session store, separate from `RLM_CACHE_DIR`) — needs an eviction policy in the same spirit as `RLM_CACHE_TTL`.
+- **Negative/risk:** concurrent hook invocations resuming the *same* session id (rapid double-submit) can race the same way the existing SHA-256 cache write already can (Open Question 7, above) — this is an existing risk now shared by a second subsystem, not a new class of bug.
+- **Migration cost:** additive only. New `CONFIG.sessionResume` flag, default off; the existing cold-spawn path is unchanged when the flag is off, so this ships without touching current behavior for anyone who doesn't opt in.
