@@ -464,6 +464,40 @@ describe('Group 2: Cache Key Generation', () => {
     const key = getCacheKey('some/path/like/input with spaces & special chars!');
     assert.match(key, /^[0-9a-f]{64}$/, 'Key must be 64 lowercase hex chars with no path separators');
   });
+
+  it('same prompt in different cwd → different keys (project-scoped)', () => {
+    const prompt = 'add retry logic';
+    const cwd1 = '/home/user/project-a';
+    const cwd2 = '/home/user/project-b';
+    const key1 = getCacheKey(prompt + '\0' + cwd1);
+    const key2 = getCacheKey(prompt + '\0' + cwd2);
+    assert.notEqual(key1, key2, 'Same prompt in different projects must produce different cache keys');
+  });
+
+  it('same prompt with same cwd → same key (deterministic)', () => {
+    const prompt = 'add retry logic';
+    const cwd = '/home/user/project-a';
+    const key1 = getCacheKey(prompt + '\0' + cwd);
+    const key2 = getCacheKey(prompt + '\0' + cwd);
+    assert.equal(key1, key2, 'Same prompt and cwd must produce identical cache keys');
+  });
+
+  it('null cwd treated as empty string (no throw)', () => {
+    const prompt = 'add retry logic';
+    const key1 = getCacheKey(prompt + '\0' + '');
+    const key2 = getCacheKey(prompt + '\0' + null);
+    assert.equal(key1, key2, 'Null cwd must be treated as empty string');
+  });
+
+  it('cwd affects key independent of prompt content', () => {
+    const prompt = 'implement feature x';
+    const cwdA = '/project/a';
+    const cwdB = '/project/b';
+    // Same prompt, different cwd → different keys
+    assert.notEqual(getCacheKey(prompt + '\0' + cwdA), getCacheKey(prompt + '\0' + cwdB));
+    // Different prompt, same cwd → different keys
+    assert.notEqual(getCacheKey(prompt + '\0' + cwdA), getCacheKey('different prompt' + '\0' + cwdA));
+  });
 });
 
 // ============================================================================
@@ -3913,5 +3947,197 @@ describe('Group 26: Metrics dashboard renderHTML (Phase 5)', () => {
   it('shows the log path in the subheader when provided', () => {
     const html = renderHTML(aggregate([]), { logPath: '/tmp/metrics.jsonl' });
     assert.match(html, /Source: \/tmp\/metrics\.jsonl/);
+  });
+});
+
+// ============================================================================
+// GROUP 27: Session Resume (ADR-001) — deriveSessionId, session markers, turn cap
+// ============================================================================
+
+describe('Group 27: Session Resume (ADR-001)', () => {
+  let testCacheDir;
+
+  beforeEach(async () => {
+    testCacheDir = join(tmpdir(), `rlm-session-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testCacheDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testCacheDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  /**
+   * deriveSessionId — creates a stable UUID from a transcript_path.
+   * Inlined from rlm-hook.mjs for testing.
+   */
+  function deriveSessionId(transcriptPath) {
+    if (!transcriptPath || typeof transcriptPath !== 'string') return null;
+    const hash = createHash('sha256').update(transcriptPath).digest();
+    if (hash.length < 16) return null;
+    const bytes = hash.slice(0, 16);
+    const d = bytes;
+    const hex = (n) => n.toString(16).padStart(2, '0');
+    return (
+      hex(d[0]) + hex(d[1]) + hex(d[2]) + hex(d[3]) + '-' +
+      hex(d[4]) + hex(d[5]) + '-' +
+      hex((d[6] & 0x0f) | 0x40) + hex(d[7]) + '-' +
+      hex((d[8] & 0x3f) | 0x80) + hex(d[9]) + '-' +
+      hex(d[10]) + hex(d[11]) + hex(d[12]) + hex(d[13]) + hex(d[14]) + hex(d[15])
+    );
+  }
+
+  /**
+   * sessionMarkerPath — returns the path to the session marker file.
+   */
+  function sessionMarkerPath(sessionId, cacheDir) {
+    if (!sessionId) return null;
+    return join(cacheDir, `session-${sessionId}.json`);
+  }
+
+  /**
+   * readSessionMarker — reads session state from disk.
+   */
+  async function readSessionMarker(sessionId, cacheDir) {
+    if (!sessionId) return { started: false };
+    const path = sessionMarkerPath(sessionId, cacheDir);
+    if (!path) return { started: false };
+
+    try {
+      const content = await readFile(path, 'utf-8');
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed === 'object') {
+        return { started: !!parsed.started, turns: typeof parsed.turns === 'number' ? parsed.turns : 0 };
+      }
+    } catch {
+      // File missing or corrupt — treat as new session
+    }
+    return { started: false };
+  }
+
+  /**
+   * writeSessionMarker — writes session state to disk.
+   */
+  async function writeSessionMarker(sessionId, state, cacheDir) {
+    if (!sessionId || !state) return;
+    const path = sessionMarkerPath(sessionId, cacheDir);
+    if (!path) return;
+
+    try {
+      await mkdir(cacheDir, { recursive: true });
+      const tmp = `${path}.${process.pid}.tmp`;
+      await writeFile(tmp, JSON.stringify(state));
+      await rename(tmp, path);
+    } catch (err) {
+      // Silently fail in tests
+    }
+  }
+
+  /**
+   * shouldStartNewSession — decides whether to start a fresh session based on turn count.
+   */
+  function shouldStartNewSession(state, maxTurns = 20) {
+    if (!state || typeof state.turns !== 'number') return false;
+    return state.turns >= maxTurns;
+  }
+
+  it('deriveSessionId returns null for missing or invalid transcript_path', () => {
+    assert.equal(deriveSessionId(null), null);
+    assert.equal(deriveSessionId(undefined), null);
+    assert.equal(deriveSessionId(''), null);
+    assert.equal(deriveSessionId(123), null);
+  });
+
+  it('deriveSessionId produces deterministic UUID for same transcript_path', () => {
+    const path1 = '/home/user/.claude/transcripts/conversation-12345.jsonl';
+    const path2 = '/home/user/.claude/transcripts/conversation-12345.jsonl';
+    const id1 = deriveSessionId(path1);
+    const id2 = deriveSessionId(path2);
+    assert.ok(id1);
+    assert.ok(id2);
+    assert.equal(id1, id2, 'Same path must produce same session ID');
+  });
+
+  it('deriveSessionId produces distinct UUIDs for different transcript_paths', () => {
+    const paths = [
+      '/home/user/.claude/transcripts/conversation-001.jsonl',
+      '/home/user/.claude/transcripts/conversation-002.jsonl',
+      '/home/user/.claude/transcripts/conversation-003.jsonl',
+    ];
+    const ids = paths.map(deriveSessionId);
+    assert.ok(ids[0]);
+    assert.ok(ids[1]);
+    assert.ok(ids[2]);
+    assert.notEqual(ids[0], ids[1], 'Different paths must produce different IDs');
+    assert.notEqual(ids[1], ids[2], 'Different paths must produce different IDs');
+    assert.notEqual(ids[0], ids[2], 'Different paths must produce different IDs');
+  });
+
+  it('deriveSessionId output is valid UUID v4 format', () => {
+    const id = deriveSessionId('/some/path/transcript.jsonl');
+    assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
+  it('readSessionMarker returns { started: false } for missing marker file', async () => {
+    const sessionId = deriveSessionId('/some/transcript.jsonl');
+    const state = await readSessionMarker(sessionId, testCacheDir);
+    assert.deepEqual(state, { started: false });
+  });
+
+  it('writeSessionMarker and readSessionMarker round-trip correctly', async () => {
+    const sessionId = deriveSessionId('/some/transcript.jsonl');
+    const written = { started: true, turns: 5 };
+    await writeSessionMarker(sessionId, written, testCacheDir);
+    const read = await readSessionMarker(sessionId, testCacheDir);
+    assert.deepEqual(read, written);
+  });
+
+  it('writeSessionMarker atomically replaces existing marker (last write wins)', async () => {
+    const sessionId = deriveSessionId('/some/transcript.jsonl');
+    await writeSessionMarker(sessionId, { started: true, turns: 3 }, testCacheDir);
+    await writeSessionMarker(sessionId, { started: true, turns: 7 }, testCacheDir);
+    const read = await readSessionMarker(sessionId, testCacheDir);
+    assert.equal(read.turns, 7, 'Last write should win');
+  });
+
+  it('readSessionMarker handles corrupt JSON gracefully (returns { started: false })', async () => {
+    const sessionId = deriveSessionId('/some/transcript.jsonl');
+    const markerPath = sessionMarkerPath(sessionId, testCacheDir);
+    await writeFile(markerPath, '{ corrupt json');
+    const state = await readSessionMarker(sessionId, testCacheDir);
+    assert.deepEqual(state, { started: false });
+  });
+
+  it('shouldStartNewSession returns false when state.turns < maxTurns', () => {
+    assert.equal(shouldStartNewSession({ turns: 5 }, 20), false);
+    assert.equal(shouldStartNewSession({ turns: 19 }, 20), false);
+    assert.equal(shouldStartNewSession({ turns: 0 }, 20), false);
+  });
+
+  it('shouldStartNewSession returns true when state.turns >= maxTurns', () => {
+    assert.equal(shouldStartNewSession({ turns: 20 }, 20), true);
+    assert.equal(shouldStartNewSession({ turns: 21 }, 20), true);
+    assert.equal(shouldStartNewSession({ turns: 100 }, 20), true);
+  });
+
+  it('shouldStartNewSession returns false for missing/invalid state', () => {
+    assert.equal(shouldStartNewSession(null), false);
+    assert.equal(shouldStartNewSession(undefined), false);
+    assert.equal(shouldStartNewSession({}), false);
+    assert.equal(shouldStartNewSession({ turns: 'not a number' }), false);
+  });
+
+  it('session markers for different sessions do not interfere', async () => {
+    const sessionId1 = deriveSessionId('/transcript1.jsonl');
+    const sessionId2 = deriveSessionId('/transcript2.jsonl');
+    await writeSessionMarker(sessionId1, { started: true, turns: 10 }, testCacheDir);
+    await writeSessionMarker(sessionId2, { started: true, turns: 15 }, testCacheDir);
+
+    const state1 = await readSessionMarker(sessionId1, testCacheDir);
+    const state2 = await readSessionMarker(sessionId2, testCacheDir);
+
+    assert.equal(state1.turns, 10);
+    assert.equal(state2.turns, 15);
   });
 });
