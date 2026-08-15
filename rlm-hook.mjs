@@ -18,10 +18,68 @@ import { mkdir, readFile, writeFile, stat, rm, rename, readdir } from 'fs/promis
 import { join, basename, resolve, relative, isAbsolute } from 'path';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
+import { parseLog, aggregate, readLog, defaultLogPath } from './bench/parse-log.mjs';
 
 // --version flag
 if (process.argv.includes('--version')) {
   console.log('0.1.0');
+  process.exit(0);
+}
+
+// --stats flag: print compact metrics summary and exit
+if (process.argv.includes('--stats')) {
+  const metricsPath = process.env.RLM_METRICS_FILE
+    ? (process.env.RLM_METRICS_FILE.startsWith('~/')
+        ? join(homedir(), process.env.RLM_METRICS_FILE.slice(2))
+        : process.env.RLM_METRICS_FILE)
+    : defaultLogPath();
+
+  const text = await readLog(metricsPath);
+  const records = parseLog(text);
+  const agg = aggregate(records);
+  const overall = agg.overall;
+
+  // Helper functions for formatting
+  const pct = (n) => n == null ? '—' : `${(n * 100).toFixed(1)}%`;
+  const num = (n) => n == null ? '—' : String(n);
+
+  console.log(`RLM Hook Metrics Summary`);
+  console.log(`Log: ${metricsPath}`);
+  console.log('');
+  console.log(`Total events: ${overall.total}`);
+  console.log(`Cache hit rate: ${pct(overall.hit_rate)}`);
+  console.log(`Skip rate: ${pct(overall.skip_rate)}`);
+
+  // Top skip reasons
+  if (overall.skip_reasons && Object.keys(overall.skip_reasons).length > 0) {
+    const sortedReasons = Object.entries(overall.skip_reasons)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5);
+    console.log(`Top skip reasons:`);
+    for (const [reason, count] of sortedReasons) {
+      console.log(`  - ${reason}: ${count} (${pct(count / overall.total)})`);
+    }
+  }
+
+  console.log(`Error rate: ${pct(overall.error_rate)}`);
+  console.log(`Latency p50: ${num(overall.latency.p50)}ms`);
+  console.log(`Latency p95: ${num(overall.latency.p95)}ms`);
+
+  // Per-mode breakdown
+  if (overall.modes && Object.keys(overall.modes).length > 0) {
+    console.log(``);
+    console.log(`Per-mode breakdown:`);
+    for (const [mode, count] of Object.entries(overall.modes)) {
+      console.log(`  - ${mode}: ${count} events (${pct(count / overall.total)})`);
+    }
+  }
+
+  // Estimated cost (if available)
+  if (overall.estimated_cost_usd != null) {
+    console.log(``);
+    console.log(`Estimated Haiku cost: $${overall.estimated_cost_usd.toFixed(4)}`);
+  }
+
   process.exit(0);
 }
 
@@ -1014,7 +1072,7 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
 
       if (CONFIG.agenticMode) {
         // Enable file exploration tools + git + scratch file cleanup
-        args.push('--allowedTools', 'Read,Glob,Grep,Write,Bash(git:*),Bash(rm:*)');
+        args.push('--allowedTools', 'Read,Glob,Grep,Write,Bash(git:*),Bash(rm .claude/rlm-scratch-*.md)');
         args.push('--max-turns', String(CONFIG.maxTurns));
       }
 
@@ -1109,6 +1167,24 @@ function extractSDKText(response) {
 }
 
 /**
+ * extractSDKUsage — safely extract token usage from an Anthropic response.
+ * Returns { input_tokens, output_tokens } or null if usage data is missing.
+ * Defensive against missing/partial shapes.
+ */
+function extractSDKUsage(response) {
+  if (!response || typeof response !== 'object') return null;
+  const usage = response.usage;
+  if (!usage || typeof usage !== 'object') return null;
+  const input = usage.input_tokens;
+  const output = usage.output_tokens;
+  if (typeof input === 'number' && Number.isFinite(input) &&
+      typeof output === 'number' && Number.isFinite(output)) {
+    return { input_tokens: input, output_tokens: output };
+  }
+  return null;
+}
+
+/**
  * createAnthropicClient — lazily import the SDK and construct a client. Kept
  * separate so callers can inject a fake client in tests instead of importing
  * the dependency. Throws if the SDK is not installed (caught by the caller,
@@ -1122,8 +1198,8 @@ async function createAnthropicClient(apiKey) {
 /**
  * callMessagesSDK — shared single-turn, tool-free Messages call used by both the
  * fast and detailed SDK paths (they differ only in the prompt buildRLMPrompt
- * produced and the log label). Mirrors invokeHaiku's contract: returns the raw
- * model text, which main() hands to parseHaikuResponse. `client` is injectable
+ * produced and the log label). Returns { text, usage } where usage is
+ * { input_tokens, output_tokens } or null if unavailable. `client` is injectable
  * for testing; in production it is created lazily.
  */
 async function callMessagesSDK(prompt, apiKey, client = null, label = 'single-turn') {
@@ -1135,7 +1211,10 @@ async function callMessagesSDK(prompt, apiKey, client = null, label = 'single-tu
     messages: [{ role: 'user', content: prompt }],
   });
   await log(`Haiku SDK (${label}) completed in ${Date.now() - startTime}ms`);
-  return extractSDKText(response);
+  return {
+    text: extractSDKText(response),
+    usage: extractSDKUsage(response),
+  };
 }
 
 /**

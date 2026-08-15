@@ -797,6 +797,17 @@ describe('Group 6: Output Formatting (formatOutput)', () => {
 // GROUP 7: CACHE FILE OPERATIONS
 // ============================================================================
 
+// Faithful copy of saveCache(), parameterized with a writeFile seam so an
+// interrupted temp-file write can be simulated without changing the final
+// cache path. The production helper uses fs/promises writeFile and rename.
+async function saveCache_copy(key, data, { cacheDir, writeFileImpl = writeFile } = {}) {
+  await mkdir(cacheDir, { recursive: true });
+  const cacheFile = join(cacheDir, `${key}.json`);
+  const tmp = `${cacheFile}.${process.pid}.tmp`;
+  await writeFileImpl(tmp, JSON.stringify(data, null, 2));
+  await rename(tmp, cacheFile);
+}
+
 describe('Group 7: Cache File Operations', () => {
   let testCacheDir;
 
@@ -855,6 +866,40 @@ describe('Group 7: Cache File Operations', () => {
       const data = JSON.parse(await readFile(file, 'utf-8'));
       assert.equal(data.input, input, `Cache entry for "${input}" must read back correctly`);
     }
+  });
+
+  it('keeps the final cache file complete when a temp write is interrupted', async () => {
+    const key = 'a'.repeat(64);
+    const cacheFile = join(testCacheDir, `${key}.json`);
+    const tmpFile = `${cacheFile}.${process.pid}.tmp`;
+    const previous = { version: 1, summary: 'complete cached result' };
+    const replacement = { version: 2, summary: 'replacement cached result' };
+    const previousSerialized = JSON.stringify(previous, null, 2);
+    const replacementSerialized = JSON.stringify(replacement, null, 2);
+    const partial = replacementSerialized.slice(0, Math.floor(replacementSerialized.length / 2));
+
+    await writeFile(cacheFile, previousSerialized);
+
+    const interruptedWrite = async (path, content) => {
+      assert.equal(path, tmpFile, 'the interrupted write must target the temp path');
+      await writeFile(path, partial);
+      // At the point the temp write fails, readers must still see the prior
+      // complete file at the final path rather than the partial replacement.
+      assert.equal(await readFile(cacheFile, 'utf-8'), previousSerialized);
+      throw new Error('simulated write interruption');
+    };
+
+    await assert.rejects(
+      () => saveCache_copy(key, replacement, {
+        cacheDir: testCacheDir,
+        writeFileImpl: interruptedWrite,
+      }),
+      /simulated write interruption/,
+    );
+
+    assert.equal(await readFile(cacheFile, 'utf-8'), previousSerialized);
+    assert.deepEqual(JSON.parse(await readFile(cacheFile, 'utf-8')), previous);
+    assert.equal(await readFile(tmpFile, 'utf-8'), partial, 'only the temp file contains partial data');
   });
 });
 
