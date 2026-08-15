@@ -854,6 +854,7 @@ async function invokeHaiku(prompt, workingDir = null) {
       '-p', prompt,
       '--model', CONFIG.haikuModel,
       '--output-format', 'text',
+      '--safe-mode',
     ];
 
     if (workingDir) {
