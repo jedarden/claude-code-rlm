@@ -73,6 +73,13 @@ const CONFIG = {
   contextWindow: parseInt(process.env.RLM_CONTEXT_WINDOW || '5', 10),
   // Debug mode
   debug: process.env.RLM_DEBUG === 'true',
+  // Session resume (ADR-001): warm Haiku sessions across cache-miss turns.
+  // Opt-in feature gated behind RLM_SESSION_RESUME=true to validate latency/cost
+  // before making it default. Derives a stable session UUID from transcript_path.
+  sessionResume: process.env.RLM_SESSION_RESUME === 'true',
+  // Max turns per resumed session before starting fresh (bounds history growth).
+  // Default 20 turns per ADR-001's Consequences section.
+  sessionResumeMaxTurns: parseInt(process.env.RLM_SESSION_RESUME_MAX_TURNS || '20', 10),
 };
 
 // =============================================================================
@@ -118,6 +125,113 @@ async function appendMetric(metric) {
   } catch {
     // Never let a metrics failure change the hook's behavior
   }
+}
+
+// =============================================================================
+// SESSION RESUME (ADR-001)
+// =============================================================================
+
+/**
+ * deriveSessionId — creates a stable UUID from a transcript_path.
+ * SHA-256 hashes the path, then formats the first 16 bytes as a UUID v4
+ * (xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx where x and y are hex digits).
+ * This gives us a deterministic session ID per conversation that survives
+ * across hook invocations without any coordination.
+ *
+ * @param {string} transcriptPath  Path from hook input (stable for a conversation)
+ * @returns {string|null}  UUID-formatted string, or null if no transcript_path
+ */
+function deriveSessionId(transcriptPath) {
+  if (!transcriptPath || typeof transcriptPath !== 'string') return null;
+  const hash = createHash('sha256').update(transcriptPath).digest();
+  // Use first 16 bytes for UUID (128 bits)
+  if (hash.length < 16) return null;
+  const bytes = hash.slice(0, 16);
+
+  // Format as UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+  // Bits 48-51 are set to 0100 (v4 variant)
+  // Bits 64-65 have top two bits set (10, RFC 4122 variant)
+  const d = bytes;
+  const hex = (n) => n.toString(16).padStart(2, '0');
+  return (
+    hex(d[0]) + hex(d[1]) + hex(d[2]) + hex(d[3]) + '-' +
+    hex(d[4]) + hex(d[5]) + '-' +
+    hex((d[6] & 0x0f) | 0x40) + hex(d[7]) + '-' +
+    hex((d[8] & 0x3f) | 0x80) + hex(d[9]) + '-' +
+    hex(d[10]) + hex(d[11]) + hex(d[12]) + hex(d[13]) + hex(d[14]) + hex(d[15])
+  );
+}
+
+/**
+ * sessionMarkerPath — returns the path to the on-disk session marker file.
+ * The marker tracks whether we've started a session and how many turns we've
+ * used. Stored under RLM_CACHE_DIR to avoid polluting the project directory.
+ *
+ * @param {string} sessionId  UUID from deriveSessionId
+ * @returns {string}  Absolute path to the marker file
+ */
+function sessionMarkerPath(sessionId) {
+  if (!sessionId) return null;
+  return join(CONFIG.cacheDir, `session-${sessionId}.json`);
+}
+
+/**
+ * readSessionMarker — reads the session state from disk.
+ * Returns { started: true, turns: N } or { started: false }.
+ * Never throws; returns null on any error.
+ *
+ * @param {string} sessionId  UUID from deriveSessionId
+ * @returns {object|null}  Session state or null on error
+ */
+async function readSessionMarker(sessionId) {
+  if (!sessionId) return { started: false };
+  const path = sessionMarkerPath(sessionId);
+  if (!path) return { started: false };
+
+  try {
+    const content = await readFile(path, 'utf-8');
+    const parsed = JSON.parse(content);
+    if (parsed && typeof parsed === 'object') {
+      return { started: !!parsed.started, turns: typeof parsed.turns === 'number' ? parsed.turns : 0 };
+    }
+  } catch {
+    // File missing or corrupt — treat as new session
+  }
+  return { started: false };
+}
+
+/**
+ * writeSessionMarker — writes or updates the session state to disk.
+ * Best-effort write; failure is logged but doesn't block the hook.
+ *
+ * @param {string} sessionId  UUID from deriveSessionId
+ * @param {object} state  { started: boolean, turns: number }
+ */
+async function writeSessionMarker(sessionId, state) {
+  if (!sessionId || !state) return;
+  const path = sessionMarkerPath(sessionId);
+  if (!path) return;
+
+  try {
+    await mkdir(CONFIG.cacheDir, { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify(state));
+    await rename(tmp, path);
+  } catch (err) {
+    await log(`Session marker write failed for ${sessionId.slice(0, 8)}...: ${String(err?.message ?? err)}`);
+  }
+}
+
+/**
+ * shouldStartNewSession — decides whether to start a fresh session based on
+ * turn count. Returns true when we've hit RLM_SESSION_RESUME_MAX_TURNS.
+ *
+ * @param {object} state  Session state from readSessionMarker
+ * @returns {boolean}  True if we should start a new session
+ */
+function shouldStartNewSession(state) {
+  if (!state || typeof state.turns !== 'number') return false;
+  return state.turns >= CONFIG.sessionResumeMaxTurns;
 }
 
 // =============================================================================
@@ -846,67 +960,125 @@ Output ONLY valid JSON, nothing else.`;
 // HAIKU INVOCATION
 // =============================================================================
 
-async function invokeHaiku(prompt, workingDir = null) {
-  return new Promise((resolve, reject) => {
-    const startTime = Date.now();
+/**
+ * invokeHaiku — spawn the claude CLI subprocess with optional session resume.
+ * When CONFIG.sessionResume is true and a sessionId is provided:
+ *   - First cache-miss turn (no marker): passes --session-id <id>
+ *   - Subsequent turns: passes --resume <id>
+ *   - After maxTurns: starts fresh with --session-id <id> (turn counter resets)
+ *
+ * Any --resume failure (nonzero exit) retries once as a fresh spawn, per ADR-001.
+ *
+ * @param {string} prompt  The prompt to send to Haiku
+ * @param {string|null} workingDir  Working directory for the subprocess
+ * @param {object|null} session  Session state { id, state } or null
+ * @returns {Promise<string>}  Haiku's stdout
+ */
+async function invokeHaiku(prompt, workingDir = null, session = null) {
+  const sessionId = session?.id ?? null;
+  const sessionState = session?.state ?? { started: false };
+  const isFirstTurn = !sessionState.started;
+  const hitTurnCap = shouldStartNewSession(sessionState);
 
-    const args = [
-      '-p', prompt,
-      '--model', CONFIG.haikuModel,
-      '--output-format', 'text',
-      '--safe-mode',
-    ];
+  let attemptResume = false;
+  let actualSessionId = null;
 
-    if (workingDir) {
-      args.push('--add-dir', workingDir);
+  if (CONFIG.sessionResume && sessionId) {
+    if (isFirstTurn || hitTurnCap) {
+      // First turn or hit cap: start a fresh named session
+      actualSessionId = sessionId;
+    } else if (sessionState.started) {
+      // Subsequent turn: resume the existing session
+      actualSessionId = sessionId;
+      attemptResume = true;
     }
+  }
 
-    // Always bypass permissions — this is a preresearch subprocess, not an interactive session
-    args.push('--permission-mode', 'bypassPermissions');
+  const doSpawn = (useResume = false) => {
+    return new Promise((resolve, reject) => {
+      const startTime = Date.now();
 
-    if (CONFIG.agenticMode) {
-      // Enable file exploration tools + git + scratch file cleanup
-      args.push('--allowedTools', 'Read,Glob,Grep,Write,Bash(git:*),Bash(rm:*)');
-      args.push('--max-turns', String(CONFIG.maxTurns));
-    }
-    // Non-agentic: omit --allowedTools entirely — absence means no tools allowed
+      const args = [
+        '-p', prompt,
+        '--model', CONFIG.haikuModel,
+        '--output-format', 'text',
+        '--safe-mode',
+      ];
 
-    const proc = spawn('claude', args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: workingDir || process.cwd(),
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    const timeoutId = setTimeout(() => {
-      proc.kill('SIGTERM');
-      setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 2000);
-      reject(new Error('Haiku invocation timed out'));
-    }, CONFIG.timeout);
-
-    proc.stdout.on('data', (data) => { stdout += data.toString(); });
-    proc.stderr.on('data', (data) => { stderr += data.toString(); });
-
-    proc.on('close', (code) => {
-      clearTimeout(timeoutId);
-      const latency = Date.now() - startTime;
-      log(`Haiku completed in ${latency}ms with exit code ${code}`);
-
-      if (code === 0) {
-        resolve(stdout);
-      } else {
-        reject(new Error(`Haiku failed (exit ${code}): ${stderr.slice(0, 500)}`));
+      if (workingDir) {
+        args.push('--add-dir', workingDir);
       }
-    });
 
-    proc.on('error', (err) => {
-      clearTimeout(timeoutId);
-      reject(err);
-    });
+      // Always bypass permissions — this is a preresearch subprocess, not an interactive session
+      args.push('--permission-mode', 'bypassPermissions');
 
-    proc.stdin.end();
-  });
+      if (CONFIG.agenticMode) {
+        // Enable file exploration tools + git + scratch file cleanup
+        args.push('--allowedTools', 'Read,Glob,Grep,Write,Bash(git:*),Bash(rm:*)');
+        args.push('--max-turns', String(CONFIG.maxTurns));
+      }
+
+      // Session resume flags (ADR-001)
+      if (actualSessionId) {
+        if (useResume) {
+          args.push('--resume', actualSessionId);
+        } else {
+          args.push('--session-id', actualSessionId);
+        }
+      }
+
+      const proc = spawn('claude', args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: workingDir || process.cwd(),
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      const timeoutId = setTimeout(() => {
+        proc.kill('SIGTERM');
+        setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 2000);
+        reject(new Error('Haiku invocation timed out'));
+      }, CONFIG.timeout);
+
+      proc.stdout.on('data', (data) => { stdout += data.toString(); });
+      proc.stderr.on('data', (data) => { stderr += data.toString(); });
+
+      proc.on('close', (code) => {
+        clearTimeout(timeoutId);
+        const latency = Date.now() - startTime;
+        const mode = useResume ? 'resume' : (actualSessionId ? 'session-id' : 'cold');
+        log(`Haiku (${mode}) completed in ${latency}ms with exit code ${code}`);
+
+        if (code === 0) {
+          resolve(stdout);
+        } else {
+          reject(new Error(`Haiku failed (exit ${code}): ${stderr.slice(0, 500)}`));
+        }
+      });
+
+      proc.on('error', (err) => {
+        clearTimeout(timeoutId);
+        reject(err);
+      });
+
+      proc.stdin.end();
+    });
+  };
+
+  // Try resume first; on failure, retry once as a fresh spawn (ADR-001 fallback)
+  if (attemptResume) {
+    try {
+      return await doSpawn(true);
+    } catch (err) {
+      await log(`Session resume failed for ${actualSessionId.slice(0, 8)}..., retrying as fresh spawn: ${String(err?.message ?? err)}`);
+      // Fallback: try again as a fresh spawn (no --resume)
+      return await doSpawn(false);
+    }
+  }
+
+  // Normal path: cold spawn or --session-id (no resume fallback needed)
+  return await doSpawn(false);
 }
 
 // =============================================================================
@@ -1553,15 +1725,15 @@ async function scoreFromFiles(queryVec, simImpl) {
  * try/catch, so one corrupt/short/foreign-dimension vector (cosineSimilarity
  * throws on length mismatch) is skipped without aborting the scan.
  *
- * Caveat: embeddings are keyed by `userMessage` only, but cache keys also fold
- * in cwd, so a high-similarity hit can come from a different cwd. Acceptable for
- * now — the analysis is file-pointer guidance the main model re-validates; a
- * cwd sidecar could tighten this later. `embedText` is fed `userMessage` here,
- * matching exactly what saveCacheEmbedding (Unit 3) stored.
+ * Embeddings are keyed by `userMessage + '\0' + cwd` to match the SHA-256 cache
+ * scheme, ensuring semantic lookups are project-scoped. `embedText` is fed
+ * `queryText + '\0' + cwd`, matching exactly what saveCacheEmbedding (Unit 3)
+ * stored.
  *
  * Injectables (embedImpl / simImpl / checkImpl) keep it unit-testable.
  */
 async function semanticLookup(queryText, {
+  cwd = '',
   embedImpl = embedText,
   simImpl = cosineSimilarity,
   checkImpl = checkCache,
@@ -1569,7 +1741,7 @@ async function semanticLookup(queryText, {
   if (!CONFIG.semanticCache) return null;
   if (!CONFIG.embedApiKey) return null;
   try {
-    const queryVec = await embedImpl(queryText, CONFIG.embedApiKey);
+    const queryVec = await embedImpl(queryText + '\0' + cwd, CONFIG.embedApiKey);
     // Index-first (one read), then the robust per-file scan as a fallback.
     let best = await scoreFromIndex(queryVec, simImpl);
     if (best === null) best = await scoreFromFiles(queryVec, simImpl);
@@ -1779,8 +1951,8 @@ async function main() {
     // query against stored embeddings and reuse the nearest analysis above
     // threshold. Fully gated + best-effort: returns null (proceed to Haiku)
     // when semantic caching is off, keyless, or on any failure. Embeds
-    // `userMessage` to match what saveCacheEmbedding stored.
-    const semanticHit = await semanticLookup(userMessage);
+    // `userMessage + cwd` to match what saveCacheEmbedding stored.
+    const semanticHit = await semanticLookup(userMessage, { cwd: cwd || '' });
     if (semanticHit) {
       console.log(formatOutput(semanticHit));
       await recordMetric('cache_hit', true, { source: 'semantic' });
@@ -1878,7 +2050,25 @@ async function main() {
 
     if (response === null) {
       try {
-        response = await invokeHaiku(prompt, cwd);
+        // Session resume (ADR-001): derive session ID and read marker
+        let session = null;
+        if (CONFIG.sessionResume && transcriptPath) {
+          const sessionId = deriveSessionId(transcriptPath);
+          if (sessionId) {
+            const sessionState = await readSessionMarker(sessionId);
+            session = { id: sessionId, state: sessionState };
+            await log(`Session ${sessionId.slice(0, 8)}...: ${sessionState.started ? `resume (turn ${sessionState.turns})` : 'new session'}`);
+          }
+        }
+
+        response = await invokeHaiku(prompt, cwd, session);
+
+        // Update session marker after successful invocation
+        if (CONFIG.sessionResume && session?.id) {
+          const newTurns = shouldStartNewSession(session.state) ? 1 : (session.state.turns || 0) + 1;
+          await writeSessionMarker(session.id, { started: true, turns: newTurns });
+          await log(`Session ${session.id.slice(0, 8)}... updated to turn ${newTurns}`);
+        }
       } finally {
         if (scratchFile) {
           try { await rm(scratchFile, { force: true }); } catch {}
