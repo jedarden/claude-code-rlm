@@ -185,7 +185,7 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 
 4. **Max turns in agentic mode**: 10 turns is a guess. Does it reliably finish exploration within that budget for large codebases? Needs empirical testing.
 5. **Multi-project sessions**: When `cwd` changes between turns (user switches projects), the cache should be invalidated or keyed differently.
-6. **Cost tracking**: Each agentic run consumes Haiku tokens. With 10 turns of tool calls, estimated ~2K–10K input tokens and ~500–2K output tokens per run. Need to measure actual usage.
+6. ~~**Cost tracking**: Each agentic run consumes Haiku tokens. With 10 turns of tool calls, estimated ~2K–10K input tokens and ~500–2K output tokens per run. Need to measure actual usage.~~ **RESOLVED (2026-08-15)** — The metrics parser now calculates estimated USD cost from recorded `token_estimate.input_tokens`/`output_tokens` using current Haiku pricing, and the dashboard shows overall and per-day totals.
 7. **Race conditions**: If the user submits two prompts rapidly, two hook invocations run concurrently. Cache writes are not atomic — last writer wins. Acceptable for now; use a lock file in Phase 3+ if needed.
 
 ---

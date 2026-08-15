@@ -52,6 +52,11 @@ function num(n) {
   return n == null ? '—' : String(n);
 }
 
+/** Format a USD estimate to four decimal places; missing/invalid → em dash. */
+function usd(n) {
+  return typeof n === 'number' && Number.isFinite(n) ? `$${n.toFixed(4)}` : '—';
+}
+
 /** Render a `{key: count}` map as table rows, or an empty-state row. */
 function mapRows(map, emptyLabel) {
   const entries = Object.entries(map && typeof map === 'object' ? map : {});
@@ -112,6 +117,7 @@ export function renderHTML(agg, opts = {}) {
     ['Hit rate', pct(overall.hit_rate)],
     ['Skip rate', pct(overall.skip_rate)],
     ['Error rate', pct(overall.error_rate)],
+    ['Estimated cost', usd(overall.estimated_cost_usd)],
     ['p50', `${num(oLat.p50)}${oLat.p50 == null ? '' : 'ms'}`],
     ['p95', `${num(oLat.p95)}${oLat.p95 == null ? '' : 'ms'}`],
     ['p99', `${num(oLat.p99)}${oLat.p99 == null ? '' : 'ms'}`],
@@ -126,7 +132,7 @@ export function renderHTML(agg, opts = {}) {
 
   const dayRows =
     days.length === 0
-      ? `<tr><td class="muted" colspan="8">No metrics recorded yet.</td></tr>`
+      ? `<tr><td class="muted" colspan="9">No metrics recorded yet.</td></tr>`
       : days
           .map((d) => {
             const lat = d.latency || {};
@@ -136,6 +142,7 @@ export function renderHTML(agg, opts = {}) {
   <td class="n">${esc(pct(d.hit_rate))}</td>
   <td class="n">${esc(pct(d.skip_rate))}</td>
   <td class="n">${esc(pct(d.error_rate))}</td>
+  <td class="n">${esc(usd(d.estimated_cost_usd))}</td>
   <td class="n">${esc(num(lat.p50))}</td>
   <td class="n">${esc(num(lat.p95))}</td>
   <td class="n">${esc(num(lat.p99))}</td>
@@ -163,7 +170,7 @@ export function renderHTML(agg, opts = {}) {
 <thead>
 <tr>
   <th>Day</th><th class="n">Events</th><th class="n">Hit%</th><th class="n">Skip%</th>
-  <th class="n">Err%</th><th class="n">p50</th><th class="n">p95</th><th class="n">p99</th>
+  <th class="n">Err%</th><th class="n">Est. cost (USD)</th><th class="n">p50</th><th class="n">p95</th><th class="n">p99</th>
 </tr>
 </thead>
 <tbody>${dayRows}</tbody>

@@ -25,6 +25,13 @@
  * name — hit rate is computed off the boolean.
  */
 
+// Claude Haiku 4.5 standard API pricing: $1/M input tokens and $5/M output
+// tokens. Keep these rates here so a pricing change has one obvious update site.
+export const HAIKU_PRICING_USD_PER_TOKEN = Object.freeze({
+  input: 1 / 1_000_000,
+  output: 5 / 1_000_000,
+});
+
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -62,7 +69,8 @@ export function percentile(values, p) {
  *
  * @param {object[]} records
  * @returns {object} { total, hits, hit_rate, skips, skip_rate, skip_reasons,
- *                     errors, error_rate, events, modes, latency }
+ *                     errors, error_rate, events, modes, latency,
+ *                     estimated_cost_usd }
  */
 export function summarize(records) {
   const list = Array.isArray(records) ? records : [];
@@ -74,6 +82,8 @@ export function summarize(records) {
   const events = {};
   const modes = {};
   const latencies = [];
+  let estimatedCostUsd = 0;
+  let tokenEstimateCount = 0;
 
   for (const r of list) {
     if (!r || typeof r !== 'object') continue;
@@ -95,6 +105,23 @@ export function summarize(records) {
     if (typeof r.latency_ms === 'number' && Number.isFinite(r.latency_ms)) {
       latencies.push(r.latency_ms);
     }
+    const tokenEstimate = r.token_estimate;
+    if (
+      tokenEstimate &&
+      typeof tokenEstimate === 'object' &&
+      !Array.isArray(tokenEstimate) &&
+      typeof tokenEstimate.input_tokens === 'number' &&
+      Number.isFinite(tokenEstimate.input_tokens) &&
+      tokenEstimate.input_tokens >= 0 &&
+      typeof tokenEstimate.output_tokens === 'number' &&
+      Number.isFinite(tokenEstimate.output_tokens) &&
+      tokenEstimate.output_tokens >= 0
+    ) {
+      estimatedCostUsd +=
+        tokenEstimate.input_tokens * HAIKU_PRICING_USD_PER_TOKEN.input +
+        tokenEstimate.output_tokens * HAIKU_PRICING_USD_PER_TOKEN.output;
+      tokenEstimateCount++;
+    }
   }
 
   return {
@@ -108,6 +135,7 @@ export function summarize(records) {
     error_rate: total ? errors / total : 0,
     events,
     modes,
+    estimated_cost_usd: tokenEstimateCount ? estimatedCostUsd : null,
     latency: {
       count: latencies.length,
       p50: percentile(latencies, 50),

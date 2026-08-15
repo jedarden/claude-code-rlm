@@ -228,7 +228,7 @@ node bench/dashboard.mjs --serve
 - `output_length` — character count of the analysis
 - `token_estimate` — estimated tokens used (if SDK mode)
 
-The dashboard shows latency distribution, cache hit rate over time, and per-mode performance — useful for tuning timeouts, cache TTL, and mode selection.
+The dashboard shows latency distribution, cache hit rate over time, per-mode performance, and estimated Haiku cost when token estimates are available — useful for tuning timeouts, cache TTL, mode selection, and spend.
 
 ---
 

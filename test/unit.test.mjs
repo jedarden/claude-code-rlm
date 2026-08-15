@@ -3820,6 +3820,41 @@ describe('Group 25: Metrics log parse & aggregate (Phase 5)', () => {
     assert.equal(d.p50, 200);
   });
 
+  it('sums input/output token estimates into per-day and overall USD costs', () => {
+    const recs = [
+      metricRec('2026-06-23', '01:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: 1000, output_tokens: 500 },
+      }),
+      metricRec('2026-06-23', '02:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: 2000, output_tokens: 100 },
+      }),
+      metricRec('2026-06-24', '01:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: 500, output_tokens: 0 },
+      }),
+    ];
+    const agg = aggregate(recs);
+    assert.ok(Math.abs(agg.days[0].estimated_cost_usd - 0.006) < 1e-12);
+    assert.ok(Math.abs(agg.days[1].estimated_cost_usd - 0.0005) < 1e-12);
+    assert.ok(Math.abs(agg.overall.estimated_cost_usd - 0.0065) < 1e-12);
+  });
+
+  it('reports null cost when a bucket has no usable token estimate', () => {
+    const agg = aggregate([
+      metricRec('2026-06-23', '01:00:00', { event: 'skip' }),
+      metricRec('2026-06-24', '01:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: 100, output_tokens: 50 },
+      }),
+    ]);
+    assert.equal(agg.days[0].estimated_cost_usd, null);
+    assert.ok(agg.days[1].estimated_cost_usd > 0);
+    assert.ok(agg.overall.estimated_cost_usd > 0);
+    assert.equal(aggregate([]).overall.estimated_cost_usd, null);
+  });
+
   it('latency block of an empty/latency-less set reports nulls, not throws', () => {
     const agg = aggregate([]);
     assert.equal(agg.overall.total, 0);
@@ -3891,6 +3926,21 @@ describe('Group 26: Metrics dashboard renderHTML (Phase 5)', () => {
     assert.match(html, /Skip rate/);
     assert.match(html, /Error rate/);
     assert.match(html, /25\.0%/);
+  });
+
+  it('renders estimated cost in the overall card and per-day table', () => {
+    const html = renderHTML(
+      aggregate([
+        {
+          ts: Date.parse('2026-06-23T01:00:00Z'),
+          event: 'complete',
+          token_estimate: { input_tokens: 1000, output_tokens: 500 },
+        },
+      ])
+    );
+    assert.match(html, /Estimated cost/);
+    assert.match(html, /Est\. cost \(USD\)/);
+    assert.equal((html.match(/\$0\.0035/g) || []).length, 2);
   });
 
   it('renders a per-day row for each agg.days entry', () => {
