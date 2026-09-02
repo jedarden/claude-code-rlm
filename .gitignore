@@ -4,3 +4,6 @@ node_modules/
 bench/results/*.json
 !bench/results/baseline.json
 .claude/rlm-scratch.md
+
+# NEEDLE execution traces are local diagnostics.
+**/.beads/traces/
