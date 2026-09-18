@@ -25,3 +25,4 @@ bench/results/*.json
 .beads/*.temp
 .beads/*.journal
 .br_recovery/
+.marathon/
