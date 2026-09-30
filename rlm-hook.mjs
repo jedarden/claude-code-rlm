@@ -19,6 +19,7 @@ import { join, basename, resolve, relative, isAbsolute } from 'path';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { parseLog, aggregate, readLog, defaultLogPath } from './bench/parse-log.mjs';
+import { normalizePreresearch, parsePreresearchResponse } from './preresearch-schema.mjs';
 
 // --version flag
 if (process.argv.includes('--version')) {
@@ -1482,15 +1483,17 @@ async function dispatchAgenticTool(name, input, cwd) {
  * callHaikuAgenticSDK — the explicit tool-use loop. Sends the agentic prompt with
  * the AGENTIC_TOOLS schema; while Haiku replies with `tool_use`, run each tool
  * and feed back a `tool_result` keyed by `tool_use_id`, then re-call. Stops when
- * `stop_reason !== 'tool_use'` (returns that turn's text) or when CONFIG.maxTurns
- * is hit (returns the best text seen so far). `client` and `dispatch` are
- * injectable for tests; in production they default to the real implementations.
+ * `stop_reason !== 'tool_use'` or when CONFIG.maxTurns is hit. Returns
+ * { text, usage } where usage is the summed { input_tokens, output_tokens } across
+ * all turns, or null if unavailable. `client` and `dispatch` are injectable for tests.
  */
 async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch = dispatchAgenticTool) {
   const startTime = Date.now();
   const c = client || await createAnthropicClient(apiKey);
   const messages = [{ role: 'user', content: prompt }];
   let lastText = '';
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
     const response = await c.messages.create({
@@ -1503,9 +1506,21 @@ async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch 
     const text = extractSDKText(response);
     if (text) lastText = text;
 
+    // Accumulate usage across turns
+    const usage = extractSDKUsage(response);
+    if (usage) {
+      totalInputTokens += usage.input_tokens;
+      totalOutputTokens += usage.output_tokens;
+    }
+
     if (response.stop_reason !== 'tool_use') {
       await log(`Haiku SDK (agentic) completed in ${Date.now() - startTime}ms over ${turn + 1} turn(s)`);
-      return text || lastText;
+      return {
+        text: text || lastText,
+        usage: (totalInputTokens > 0 || totalOutputTokens > 0)
+          ? { input_tokens: totalInputTokens, output_tokens: totalOutputTokens }
+          : null,
+      };
     }
 
     // Echo the assistant's tool_use turn back, then answer each tool call.
@@ -1521,7 +1536,12 @@ async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch 
   }
 
   await log(`Haiku SDK (agentic) hit turn cap (${CONFIG.maxTurns}) in ${Date.now() - startTime}ms`);
-  return lastText;
+  return {
+    text: lastText,
+    usage: (totalInputTokens > 0 || totalOutputTokens > 0)
+      ? { input_tokens: totalInputTokens, output_tokens: totalOutputTokens }
+      : null,
+  };
 }
 
 // =============================================================================
@@ -1856,28 +1876,7 @@ async function semanticLookup(queryText, {
 // =============================================================================
 
 function parseHaikuResponse(response) {
-  // 1. Direct JSON parse
-  try {
-    return JSON.parse(response.trim());
-  } catch {}
-
-  // 2. JSON inside markdown code block
-  const jsonMatch = response.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonMatch) {
-    try {
-      return JSON.parse(jsonMatch[1].trim());
-    } catch {}
-  }
-
-  // 3. Any JSON object in the response (non-greedy to avoid spanning multiple objects)
-  const objectMatch = response.match(/\{[\s\S]*?\}/);
-  if (objectMatch) {
-    try {
-      return JSON.parse(objectMatch[0]);
-    } catch {}
-  }
-
-  return { skip_rlm: true, skip_reason: 'Could not parse Haiku response' };
+  return parsePreresearchResponse(response);
 }
 
 // =============================================================================
@@ -1885,12 +1884,14 @@ function parseHaikuResponse(response) {
 // =============================================================================
 
 function formatOutput(analysis) {
+  analysis = normalizePreresearch(analysis);
+
   // Agentic mode produces a rich structure with relevant_files
-  if (CONFIG.agenticMode && analysis.relevant_files) {
-    const intent = analysis.intent || 'unknown';
-    const summary = analysis.summary || '';
+  if (CONFIG.agenticMode) {
+    const intent = typeof analysis.intent === 'string' ? analysis.intent : 'unknown';
+    const summary = typeof analysis.summary === 'string' ? analysis.summary : '';
     const files = (analysis.relevant_files || []).map(f =>
-      typeof f === 'string' ? f : `${f.path} (${f.purpose || 'unknown'})`
+      typeof f === 'string' ? f : `${f.path} (${typeof f.purpose === 'string' ? f.purpose : 'unknown'})`
     ).join('; ');
     const patterns = (analysis.existing_patterns || []).join('; ');
     const tasks = (analysis.tasks || []).join('; ');
@@ -1916,7 +1917,9 @@ Approach: ${approach}`;
 
   // Fast mode: compact structure
   if (CONFIG.fastMode) {
-    const intent = analysis.intent || 'unknown';
+    const intent = typeof analysis.intent === 'string'
+      ? analysis.intent
+      : (analysis.intent?.primary || 'unknown');
     const tasks = (analysis.tasks || []).join('; ');
     const tech = (analysis.tech || []).join(', ');
     const files = (analysis.files || []).join(', ');
@@ -1935,14 +1938,19 @@ RLM: ${intent} | Tasks: ${tasks}`;
 
   // Detailed mode
   const intent = analysis.intent?.primary || 'unknown';
-  const confidence = analysis.intent?.confidence || 'N/A';
+  const confidence = typeof analysis.intent?.confidence === 'number'
+    && Number.isFinite(analysis.intent.confidence)
+    ? analysis.intent.confidence
+    : 'N/A';
   const tasks = (analysis.decomposition || [])
     .slice(0, 3)
-    .map(t => t.task)
+    .map(t => typeof t?.task === 'string' ? t.task : '')
+    .filter(Boolean)
     .join('; ');
   const approach = analysis.suggested_approach || 'N/A';
   const domain = analysis.implicit_context?.domain || 'general';
-  const technologies = (analysis.implicit_context?.relevant_technologies || []).join(', ') || 'N/A';
+  const technologies = (Array.isArray(analysis.implicit_context?.relevant_technologies)
+    ? analysis.implicit_context.relevant_technologies : []).join(', ') || 'N/A';
 
   return `<rlm_analysis>
 ${JSON.stringify(analysis, null, 2)}
@@ -2156,7 +2164,7 @@ async function main() {
     }
 
     // Parse and validate
-    const analysis = parseHaikuResponse(response);
+    const analysis = normalizePreresearch(parseHaikuResponse(response));
 
     if (analysis.skip_rlm || analysis.skip) {
       await log(`RLM skipped by Haiku: ${analysis.skip_reason || analysis.reason}`);
