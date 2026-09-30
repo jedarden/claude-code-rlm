@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -92,6 +93,10 @@ function spawnHook(stdinData, { cacheDir, env = {} } = {}) {
   });
 }
 
+function cacheKey(prompt, cwd = '') {
+  return createHash('sha256').update(prompt + '\0' + cwd).digest('hex');
+}
+
 // ---------------------------------------------------------------------------
 // 1. --version flag
 // ---------------------------------------------------------------------------
@@ -158,7 +163,104 @@ describe('CLI command skip', { timeout: 5000 }, () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Very long input truncation
+// 5. Skip-detection boundaries
+//
+// These cases deliberately use prompts at or above the default minimum so
+// command and code-shape detection cannot pass accidentally via the length
+// gate. Each subprocess gets an isolated cache so a prior test cannot change
+// which path the hook takes.
+// ---------------------------------------------------------------------------
+
+describe('Skip-detection boundaries', { timeout: 10000 }, () => {
+  it('skips below the default minimum and analyzes at exactly 20 characters', async () => {
+    const cacheDir = join(tmpdir(), `rlm-boundary-min-${Date.now()}`);
+
+    const below = await spawnHook(JSON.stringify({ prompt: 'x'.repeat(19) }), { cacheDir });
+    assert.equal(below.code, 0, 'Below-threshold input must exit successfully');
+    assert.equal(below.stdout, '', '19 characters must be skipped');
+
+    const atBoundary = await spawnHook(JSON.stringify({ prompt: 'x'.repeat(20) }), { cacheDir });
+    assert.equal(atBoundary.code, 0, 'Boundary input must exit successfully');
+    assert.match(
+      atBoundary.stdout,
+      /code_writing/,
+      'Exactly 20 characters must pass the length gate and reach the analyzer',
+    );
+
+    await rm(cacheDir, { recursive: true, force: true });
+  });
+
+  it('honors RLM_MIN_LENGTH overrides at the configured boundary', async () => {
+    const cacheDir = join(tmpdir(), `rlm-boundary-env-${Date.now()}`);
+    const prompt = 'y'.repeat(25);
+
+    const overridden = await spawnHook(JSON.stringify({ prompt }), {
+      cacheDir,
+      env: { RLM_MIN_LENGTH: '30' },
+    });
+    assert.equal(overridden.code, 0);
+    assert.equal(overridden.stdout, '', '25 characters must skip when the minimum is overridden to 30');
+
+    const atOverride = await spawnHook(JSON.stringify({ prompt }), {
+      cacheDir,
+      env: { RLM_MIN_LENGTH: '25' },
+    });
+    assert.equal(atOverride.code, 0);
+    assert.match(atOverride.stdout, /code_writing/, 'Input at the overridden minimum must be analyzed');
+
+    await rm(cacheDir, { recursive: true, force: true });
+  });
+
+  it('recognizes long CLI and slash commands independently of the length gate', async () => {
+    const prompts = [
+      'git status --short --branch',
+      '/aaaaaaaaaaaaaaaaaaaa',
+    ];
+
+    for (const prompt of prompts) {
+      assert.ok(prompt.length >= 20, `${prompt} must exercise command detection above the minimum`);
+      const result = await spawnHook(JSON.stringify({ prompt }));
+      assert.equal(result.code, 0, `${prompt} must exit successfully`);
+      assert.equal(result.stdout, '', `${prompt} must be skipped as a simple command`);
+    }
+  });
+
+  it('skips multiple code blocks when code is the majority, but not a single block', async () => {
+    const codeHeavy = [
+      '```js\nconst first = 1;\n```',
+      '```js\nconst second = 2;\n```',
+      'Review.',
+    ].join('\n');
+    const codeHeavyResult = await spawnHook(JSON.stringify({ prompt: codeHeavy }));
+    assert.equal(codeHeavyResult.code, 0);
+    assert.equal(codeHeavyResult.stdout, '', 'Multiple majority-code blocks must be skipped');
+
+    const oneBlock = '```js\nconst only = 1;\n```\nExplain the migration risks and suggest the next steps.';
+    const oneBlockResult = await spawnHook(JSON.stringify({ prompt: oneBlock }));
+    assert.equal(oneBlockResult.code, 0);
+    assert.match(oneBlockResult.stdout, /code_writing/, 'A single code block must not trigger code-heavy skipping');
+  });
+
+  it('checks skip detection before reading a matching cache entry', async () => {
+    const cacheDir = join(tmpdir(), `rlm-boundary-cache-${Date.now()}`);
+    const prompt = 'git status --short --branch';
+    const key = cacheKey(prompt);
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(
+      join(cacheDir, `${key}.json`),
+      JSON.stringify({ intent: 'cached-result-must-not-be-used' }),
+    );
+
+    const result = await spawnHook(JSON.stringify({ prompt }), { cacheDir });
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout, '', 'A skippable prompt must remain silent even when cached');
+
+    await rm(cacheDir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Very long input truncation
 // ---------------------------------------------------------------------------
 
 describe('Very long input truncation', { timeout: 5000 }, () => {
