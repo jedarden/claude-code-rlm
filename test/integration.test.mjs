@@ -13,7 +13,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -36,6 +36,9 @@ await writeFile(
   join(FAKE_DIR, 'claude'),
   `#!/usr/bin/env node
 // Fake claude for rlm-hook integration tests — ignores all args
+if (process.env.RLM_CLAUDE_TRACE_FILE) {
+  require('node:fs').appendFileSync(process.env.RLM_CLAUDE_TRACE_FILE, 'invoked\\n');
+}
 process.stdout.write(JSON.stringify({
   "intent": "code_writing",
   "tasks": ["Analyze request", "Implement solution", "Add tests"],
@@ -45,6 +48,105 @@ process.stdout.write(JSON.stringify({
 }));
 `,
   { mode: 0o755 },
+);
+
+// A local ESM loader makes the spawned hook resolve its lazy SDK import to a
+// deterministic fake. The fake records constructor/create calls and can model
+// success, API errors, or a multi-turn tool-use exchange without network I/O.
+await writeFile(
+  join(FAKE_DIR, 'sdk-loader.mjs'),
+  `export async function resolve(specifier, context, nextResolve) {
+  if (specifier === '@anthropic-ai/sdk') {
+    return { url: new URL('./fake-anthropic-sdk.mjs', import.meta.url).href, shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+}
+`,
+);
+
+await writeFile(
+  join(FAKE_DIR, 'sdk-unavailable-loader.mjs'),
+  `export async function resolve(specifier, context, nextResolve) {
+  if (specifier === '@anthropic-ai/sdk') {
+    throw new Error("Cannot find package '@anthropic-ai/sdk'");
+  }
+  return nextResolve(specifier, context);
+}
+`,
+);
+
+await writeFile(
+  join(FAKE_DIR, 'fake-anthropic-sdk.mjs'),
+  `import { appendFileSync } from 'node:fs';
+
+function trace(event) {
+  const path = process.env.RLM_SDK_TRACE_FILE;
+  if (path) appendFileSync(path, JSON.stringify(event) + '\\n');
+}
+
+function response(content, stop_reason = 'end_turn') {
+  return {
+    id: 'msg_integration_test',
+    type: 'message',
+    role: 'assistant',
+    content,
+    stop_reason,
+    usage: { input_tokens: 11, output_tokens: 7 },
+  };
+}
+
+export default class Anthropic {
+  constructor(options = {}) {
+    trace({ event: 'construct', apiKey: options.apiKey ?? null });
+    this.callCount = 0;
+    this.messages = {
+      create: async (request) => {
+        this.callCount += 1;
+        trace({ event: 'create', call: this.callCount, request });
+
+        if (process.env.RLM_SDK_SCENARIO === 'api-error') {
+          throw new Error('synthetic API 401: invalid integration-test key');
+        }
+
+        if (process.env.RLM_SDK_SCENARIO === 'multi-tool') {
+          if (this.callCount === 1) {
+            return response([
+              { type: 'text', text: 'First tool round' },
+              { type: 'tool_use', id: 'tool-read', name: 'Read', input: { path: 'fixture.txt' } },
+              { type: 'tool_use', id: 'tool-glob', name: 'Glob', input: { pattern: '*.txt' } },
+            ], 'tool_use');
+          }
+          if (this.callCount === 2) {
+            return response([
+              { type: 'text', text: 'Second tool round' },
+              { type: 'tool_use', id: 'tool-grep', name: 'Grep', input: { pattern: 'needle', path: 'fixture.txt' } },
+              { type: 'tool_use', id: 'tool-read-2', name: 'Read', input: { path: 'other.txt' } },
+            ], 'tool_use');
+          }
+          return response([
+            { type: 'text', text: JSON.stringify({
+              intent: 'code_writing',
+              summary: 'SDK completed after two tool rounds',
+              relevant_files: [{ path: 'fixture.txt', purpose: 'contains the searched result' }],
+              tasks: ['Use the gathered findings'],
+              approach: 'Continue after every tool result and then complete',
+            }) },
+          ]);
+        }
+
+        return response([
+          { type: 'text', text: JSON.stringify({
+            intent: 'code_writing',
+            summary: 'SDK model response',
+            tasks: ['Use the direct SDK result'],
+            approach: 'Return the model response without spawning the CLI',
+          }) },
+        ]);
+      },
+    };
+  }
+}
+`,
 );
 
 // Prepend the fake claude to PATH so every subprocess finds it first
@@ -91,6 +193,33 @@ function spawnHook(stdinData, { cacheDir, env = {} } = {}) {
     if (stdinData !== undefined) proc.stdin.write(stdinData);
     proc.stdin.end();
   });
+}
+
+function sdkLoaderEnv(loader, traceFile, scenario = 'response') {
+  return {
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--experimental-loader=${loader}`]
+      .filter(Boolean)
+      .join(' '),
+    RLM_SDK_TRACE_FILE: traceFile,
+    RLM_SDK_SCENARIO: scenario,
+  };
+}
+
+async function readJsonLines(path) {
+  try {
+    const text = await readFile(path, 'utf8');
+    return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+async function readTextOrEmpty(path) {
+  try {
+    return await readFile(path, 'utf8');
+  } catch {
+    return '';
+  }
 }
 
 function cacheKey(prompt, cwd = '') {
@@ -494,5 +623,124 @@ describe('SDK-Direct mode', { timeout: 25000 }, () => {
       stdout.includes('code_writing'),
       `No-key path must use the subprocess; got: ${stdout.slice(0, 200)}`,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. SDK selection, responses, and tool-loop integration
+//
+// These scenarios use the local ESM loader above instead of a network server or
+// a real API key. That keeps the tests deterministic while still exercising the
+// real spawned hook, lazy SDK import, routing guard, response parsing, and
+// subprocess fallback boundaries.
+// ---------------------------------------------------------------------------
+
+describe('SDK selection and tool-loop integration', { timeout: 15000 }, () => {
+  const SDK_PROMPT =
+    'Review the authentication service and explain how to add refresh-token ' +
+    'rotation while preserving the existing integration-test conventions.';
+
+  it('SDK enabled with an API key selects SDK and returns the model response', async () => {
+    const trace = join(tmpdir(), `rlm-sdk-response-${Date.now()}-${Math.random()}.jsonl`);
+    const cliTrace = join(tmpdir(), `rlm-sdk-response-cli-${Date.now()}-${Math.random()}.log`);
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt: SDK_PROMPT }), {
+      env: {
+        ...sdkLoaderEnv(join(FAKE_DIR, 'sdk-loader.mjs'), trace),
+        RLM_CLAUDE_TRACE_FILE: cliTrace,
+        ANTHROPIC_API_KEY: 'integration-test-key',
+        RLM_USE_SDK: 'true',
+        RLM_AGENTIC_MODE: 'true',
+      },
+    });
+
+    assert.equal(code, 0, 'SDK success must exit 0');
+    assert.match(stdout, /SDK model response/, 'formatted output must contain the SDK text');
+    assert.equal(await readTextOrEmpty(cliTrace), '', 'successful SDK calls must not spawn claude');
+
+    const events = await readJsonLines(trace);
+    assert.equal(events[0]?.event, 'construct', 'SDK client must be constructed');
+    assert.equal(events[0]?.apiKey, 'integration-test-key', 'API key must reach the SDK client');
+    assert.equal(events.filter((event) => event.event === 'create').length, 1);
+    assert.equal(events[1].request.model, 'claude-haiku-4-5-20251001');
+    assert.equal(events[1].request.messages[0].role, 'user');
+  });
+
+  it('unavailable SDK falls back to the subprocess path', async () => {
+    const trace = join(tmpdir(), `rlm-sdk-unavailable-${Date.now()}-${Math.random()}.jsonl`);
+    const cliTrace = join(tmpdir(), `rlm-sdk-unavailable-cli-${Date.now()}-${Math.random()}.log`);
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt: SDK_PROMPT }), {
+      env: {
+        ...sdkLoaderEnv(join(FAKE_DIR, 'sdk-unavailable-loader.mjs'), trace),
+        RLM_CLAUDE_TRACE_FILE: cliTrace,
+        ANTHROPIC_API_KEY: 'integration-test-key',
+        RLM_USE_SDK: 'true',
+      },
+    });
+
+    assert.equal(code, 0, 'unavailable SDK must not block the hook');
+    assert.match(stdout, /code_writing/, 'subprocess fallback must emit its analysis');
+    assert.equal(await readJsonLines(trace).then((events) => events.length), 0);
+    assert.equal(await readTextOrEmpty(cliTrace), 'invoked\n', 'fallback must invoke claude once');
+  });
+
+  it('SDK API errors fall back to the subprocess response', async () => {
+    const trace = join(tmpdir(), `rlm-sdk-error-${Date.now()}-${Math.random()}.jsonl`);
+    const cliTrace = join(tmpdir(), `rlm-sdk-error-cli-${Date.now()}-${Math.random()}.log`);
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt: SDK_PROMPT }), {
+      env: {
+        ...sdkLoaderEnv(join(FAKE_DIR, 'sdk-loader.mjs'), trace, 'api-error'),
+        RLM_CLAUDE_TRACE_FILE: cliTrace,
+        ANTHROPIC_API_KEY: 'integration-test-key',
+        RLM_USE_SDK: 'true',
+      },
+    });
+
+    assert.equal(code, 0, 'SDK API errors must not block the hook');
+    assert.match(stdout, /code_writing/, 'API-error fallback must emit subprocess analysis');
+    const events = await readJsonLines(trace);
+    assert.equal(events.filter((event) => event.event === 'create').length, 1);
+    assert.equal(await readTextOrEmpty(cliTrace), 'invoked\n', 'API-error fallback must invoke claude once');
+  });
+
+  it('agentic SDK continues after multiple tool calls and completes', async () => {
+    const trace = join(tmpdir(), `rlm-sdk-tools-${Date.now()}-${Math.random()}.jsonl`);
+    const cliTrace = join(tmpdir(), `rlm-sdk-tools-cli-${Date.now()}-${Math.random()}.log`);
+    const projectDir = join(tmpdir(), `rlm-sdk-tools-project-${Date.now()}-${Math.random()}`);
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(join(projectDir, 'fixture.txt'), 'needle: first fixture result\n');
+    await writeFile(join(projectDir, 'other.txt'), 'second fixture result\n');
+
+    const { code, stdout } = await spawnHook(JSON.stringify({
+      prompt: SDK_PROMPT,
+      cwd: projectDir,
+    }), {
+      env: {
+        ...sdkLoaderEnv(join(FAKE_DIR, 'sdk-loader.mjs'), trace, 'multi-tool'),
+        RLM_CLAUDE_TRACE_FILE: cliTrace,
+        ANTHROPIC_API_KEY: 'integration-test-key',
+        RLM_USE_SDK: 'true',
+        RLM_AGENTIC_MODE: 'true',
+      },
+    });
+
+    assert.equal(code, 0, 'completed tool loop must exit 0');
+    assert.match(stdout, /SDK completed after two tool rounds/);
+    assert.equal(await readTextOrEmpty(cliTrace), '', 'successful tool loops must not spawn claude');
+
+    const calls = (await readJsonLines(trace)).filter((event) => event.event === 'create');
+    assert.equal(calls.length, 3, 'the model must receive two tool rounds and a final completion call');
+    assert.equal(calls[0].request.tools.length, 5, 'agentic SDK request must advertise all tools');
+    assert.equal(calls[0].request.messages.length, 1);
+
+    const firstResults = calls[1].request.messages.at(-1);
+    assert.equal(firstResults.role, 'user');
+    assert.deepEqual(firstResults.content.map((result) => result.tool_use_id), ['tool-read', 'tool-glob']);
+    assert.match(firstResults.content[0].content, /needle: first fixture result/);
+    assert.match(firstResults.content[1].content, /fixture\.txt/);
+
+    const secondResults = calls[2].request.messages.at(-1);
+    assert.deepEqual(secondResults.content.map((result) => result.tool_use_id), ['tool-grep', 'tool-read-2']);
+    assert.match(secondResults.content[0].content, /needle: first fixture result/);
+    assert.match(secondResults.content[1].content, /second fixture result/);
   });
 });
