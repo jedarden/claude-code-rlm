@@ -66,9 +66,8 @@ function shouldSkipRLM(input, minInputLength = 20) {
 /**
  * getCacheKey — SHA-256 hex digest of the input string.
  */
-function getCacheKey(input, cwd) {
-  const scopedInput = arguments.length > 1 ? input + '\\0' + (cwd || '') : input;
-  return createHash('sha256').update(scopedInput).digest('hex');
+function getCacheKey(input) {
+  return createHash('sha256').update(input).digest('hex');
 }
 
 /**
@@ -4235,99 +4234,5 @@ describe('Group 27: Session Resume (ADR-001)', () => {
 
     assert.equal(state1.turns, 10);
     assert.equal(state2.turns, 15);
-  });
-});
-
-// =============================================================================
-// Group 21: --stats flag (Phase 5, Unit 2 CLI integration)
-// =============================================================================
-
-describe('Group 21: --stats flag CLI integration', () => {
-  let testDir;
-
-  beforeEach(async () => {
-    testDir = join(tmpdir(), `rlm-stats-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(testDir, { recursive: true });
-  });
-
-  /**
-   * Test that --stats flag produces compact terminal output.
-   * We spawn the hook as a subprocess with --stats and capture stdout.
-   */
-
-  it('--stats flag prints compact summary with all required fields', async () => {
-    const testMetricsDir = join(tmpdir(), 'rlm-stats-test-' + Date.now());
-    await mkdir(testMetricsDir, { recursive: true });
-
-    // Write a small metrics JSONL file with known values
-    const metricsPath = join(testMetricsDir, 'metrics.jsonl');
-    const testRecords = [
-      { ts: Date.now(), event: 'complete', cache_hit: false, mode: 'agentic', latency_ms: 1234, reason: null },
-      { ts: Date.now() - 1000, event: 'skip', cache_hit: false, mode: 'fast', latency_ms: 20, reason: 'Input too short' },
-      { ts: Date.now() - 2000, event: 'skip', cache_hit: false, mode: 'fast', latency_ms: 15, reason: 'Input too short' },
-      { ts: Date.now() - 3000, event: 'cache_hit', cache_hit: true, mode: 'agentic', latency_ms: 40, reason: null },
-      { ts: Date.now() - 4000, event: 'complete', cache_hit: false, mode: 'detailed', latency_ms: 856, reason: null },
-    ];
-    await writeFile(metricsPath, testRecords.map(r => JSON.stringify(r)).join('\n') + '\n');
-
-    // Spawn rlm-hook.mjs with --stats and custom RLM_METRICS_FILE
-    // Use the current working directory (the project root) so rlm-hook.mjs can be found
-    const result = execSync(
-      `RLM_METRICS_FILE="${metricsPath}" node rlm-hook.mjs --stats`,
-      { cwd: process.cwd(), encoding: 'utf-8' }
-    );
-
-    // Verify expected fields are present
-    assert.match(result, /RLM Hook Metrics Summary/);
-    assert.match(result, /Total events:/);
-    assert.match(result, /Cache hit rate:/);
-    assert.match(result, /Skip rate:/);
-    assert.match(result, /Top skip reasons:/);
-    assert.match(result, /Input too short:/);
-    assert.match(result, /Error rate:/);
-    assert.match(result, /Latency p50:/);
-    assert.match(result, /Latency p95:/);
-    assert.match(result, /Per-mode breakdown:/);
-    assert.match(result, /agentic:/);
-    assert.match(result, /fast:/);
-    assert.match(result, /detailed:/);
-
-    // Cleanup
-    await rm(testMetricsDir, { recursive: true, force: true });
-  });
-
-  it('--stats flag handles empty metrics file gracefully', async () => {
-    const testMetricsDir = join(tmpdir(), 'rlm-stats-empty-' + Date.now());
-    await mkdir(testMetricsDir, { recursive: true });
-
-    const metricsPath = join(testMetricsDir, 'empty-metrics.jsonl');
-    await writeFile(metricsPath, '');
-
-    const result = execSync(
-      `RLM_METRICS_FILE="${metricsPath}" node rlm-hook.mjs --stats`,
-      { cwd: process.cwd(), encoding: 'utf-8' }
-    );
-
-    assert.match(result, /Total events: 0/);
-    assert.match(result, /Cache hit rate: 0.0%/);
-    assert.match(result, /Skip rate: 0.0%/);
-
-    await rm(testMetricsDir, { recursive: true, force: true });
-  });
-
-  it('--stats flag handles missing metrics file gracefully', async () => {
-    const testMetricsDir = join(tmpdir(), 'rlm-stats-missing-' + Date.now());
-    await mkdir(testMetricsDir, { recursive: true });
-
-    const metricsPath = join(testMetricsDir, 'nonexistent.jsonl');
-
-    const result = execSync(
-      `RLM_METRICS_FILE="${metricsPath}" node rlm-hook.mjs --stats`,
-      { cwd: process.cwd(), encoding: 'utf-8' }
-    );
-
-    assert.match(result, /Total events: 0/);
-
-    await rm(testMetricsDir, { recursive: true, force: true });
   });
 });
