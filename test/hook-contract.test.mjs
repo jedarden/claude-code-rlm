@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+/**
+ * End-to-end contract tests for rlm-hook.mjs.
+ *
+ * Each test starts the real hook as a subprocess and supplies a temporary
+ * fake `claude` executable. The fake executable lets these tests exercise the
+ * hook boundary without requiring a Claude CLI installation or an API key.
+ *
+ * Run with: node --test test/hook-contract.test.mjs
+ */
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const HOOK = fileURLToPath(new URL('../rlm-hook.mjs', import.meta.url));
+
+const ANALYSIS = {
+  intent: 'code_writing',
+  summary: 'The hook received and analyzed the user request.',
+  relevant_files: [
+    { path: 'src/contract.js', purpose: 'The contract implementation.' },
+  ],
+  existing_patterns: ['Temporary fake CLI output'],
+  recent_changes: 'No recent changes.',
+  tasks: ['Verify the hook contract'],
+  approach: 'Return structured context to the parent process.',
+  warnings: [],
+};
+
+/**
+ * Create a fake claude executable. Its behavior is selected through
+ * FAKE_CLAUDE_MODE so one script can cover success, failure, and timeout.
+ */
+async function createEnvironment() {
+  const root = await mkdtemp(join(tmpdir(), 'rlm-hook-contract-'));
+  const binDir = join(root, 'bin');
+  await mkdir(binDir, { recursive: true });
+
+  const capturePath = join(root, 'claude-args.json');
+  const fakeClaude = `#!/usr/bin/env node
+const { writeFileSync } = require('node:fs');
+
+if (process.env.FAKE_CLAUDE_CAPTURE) {
+  writeFileSync(process.env.FAKE_CLAUDE_CAPTURE, JSON.stringify(process.argv.slice(2)));
+}
+
+if (process.env.FAKE_CLAUDE_MODE === 'failure') {
+  process.stderr.write('synthetic subprocess failure');
+  process.exit(42);
+}
+
+if (process.env.FAKE_CLAUDE_MODE === 'timeout') {
+  setTimeout(() => {}, 60000);
+} else {
+  process.stdout.write(${JSON.stringify(JSON.stringify(ANALYSIS))});
+}
+`;
+  await writeFile(join(binDir, 'claude'), fakeClaude, { mode: 0o755 });
+
+  return {
+    root,
+    binDir,
+    capturePath,
+    env: {
+      PATH: `${binDir}:${process.env.PATH ?? ''}`,
+      RLM_AGENTIC_MODE: 'true',
+      RLM_GATHER_CONTEXT: 'false',
+      RLM_SEMANTIC_CACHE: 'false',
+      RLM_CACHE_DIR: join(root, 'cache'),
+      RLM_LOG_FILE: join(root, 'hook.log'),
+      RLM_METRICS_FILE: join(root, 'metrics.jsonl'),
+      FAKE_CLAUDE_CAPTURE: capturePath,
+    },
+  };
+}
+
+async function readIfPresent(path) {
+  try {
+    return await readFile(path, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+/** Spawn the real hook and collect its complete process boundary result. */
+function runHook(input, environment, extraEnv = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [HOOK], {
+      cwd: environment.root,
+      env: { ...process.env, ...environment.env, ...extraEnv },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (result) => {
+      if (!settled) {
+        settled = true;
+        resolve(result);
+      }
+    };
+
+    child.stdout.on('data', (data) => { stdout += data.toString(); });
+    child.stderr.on('data', (data) => { stderr += data.toString(); });
+    child.on('error', (error) => finish({ code: null, stdout, stderr, error }));
+    child.on('close', (code, signal) => finish({ code, signal, stdout, stderr }));
+
+    child.stdin.end(input);
+  });
+}
+
+async function destroyEnvironment(environment) {
+  await rm(environment.root, { recursive: true, force: true });
+}
+
+describe('hook process contract', { timeout: 10000 }, () => {
+  it('parses JSON stdin, forwards prompt/cwd, and injects stdout context', async () => {
+    const environment = await createEnvironment();
+    try {
+      const projectDir = join(environment.root, 'project');
+      await mkdir(projectDir, { recursive: true });
+      const prompt = 'Implement JSON stdin handling without losing hook context.';
+      const result = await runHook(
+        JSON.stringify({ prompt, cwd: projectDir }),
+        environment,
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stderr, '');
+      assert.match(result.stdout, /^<rlm_preresearch>/);
+      assert.match(result.stdout, /The hook received and analyzed the user request\./);
+      assert.match(result.stdout, /src\/contract\.js/);
+      assert.match(result.stdout, /PRERESEARCH COMPLETE:/);
+
+      const args = JSON.parse(await readFile(environment.capturePath, 'utf8'));
+      const promptIndex = args.indexOf('-p');
+      assert.notEqual(promptIndex, -1, 'claude must receive a -p prompt argument');
+      assert.match(args[promptIndex + 1], new RegExp(`USER REQUEST: ${prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+      const addDirIndex = args.indexOf('--add-dir');
+      assert.notEqual(addDirIndex, -1, 'JSON cwd must be forwarded as --add-dir');
+      assert.equal(args[addDirIndex + 1], projectDir);
+    } finally {
+      await destroyEnvironment(environment);
+    }
+  });
+
+  it('treats malformed JSON as raw input and still exits zero', async () => {
+    const environment = await createEnvironment();
+    try {
+      const malformed = '{"prompt":"Implement malformed input recovery.';
+      const result = await runHook(malformed, environment);
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /<rlm_preresearch>/);
+      const args = JSON.parse(await readFile(environment.capturePath, 'utf8'));
+      const prompt = args[args.indexOf('-p') + 1];
+      assert.match(prompt, new RegExp(`USER REQUEST: ${malformed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    } finally {
+      await destroyEnvironment(environment);
+    }
+  });
+
+  it('degrades on a failed subprocess with exit code zero and an error log', async () => {
+    const environment = await createEnvironment();
+    try {
+      const result = await runHook(
+        JSON.stringify({ prompt: 'Implement graceful subprocess failure handling.' }),
+        environment,
+        { FAKE_CLAUDE_MODE: 'failure' },
+      );
+      const log = await readIfPresent(environment.env.RLM_LOG_FILE);
+      const metrics = await readIfPresent(environment.env.RLM_METRICS_FILE);
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, '');
+      assert.match(log, /ERROR: Haiku failed \(exit 42\): synthetic subprocess failure/);
+      assert.match(metrics, /"event":"error"/);
+    } finally {
+      await destroyEnvironment(environment);
+    }
+  });
+
+  it('degrades on a timed-out subprocess with exit code zero and an error log', async () => {
+    const environment = await createEnvironment();
+    try {
+      const result = await runHook(
+        JSON.stringify({ prompt: 'Implement timeout recovery for the hook subprocess.' }),
+        environment,
+        { FAKE_CLAUDE_MODE: 'timeout', RLM_TIMEOUT: '100' },
+      );
+      const log = await readIfPresent(environment.env.RLM_LOG_FILE);
+      const metrics = await readIfPresent(environment.env.RLM_METRICS_FILE);
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, '');
+      assert.match(log, /ERROR: Haiku invocation timed out/);
+      assert.match(metrics, /"event":"error"/);
+    } finally {
+      await destroyEnvironment(environment);
+    }
+  });
+});
