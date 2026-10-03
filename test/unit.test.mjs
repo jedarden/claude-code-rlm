@@ -67,7 +67,7 @@ function shouldSkipRLM(input, minInputLength = 20) {
  * getCacheKey — SHA-256 hex digest of the input string.
  */
 function getCacheKey(input, cwd) {
-  const scopedInput = arguments.length > 1 ? input + '\\0' + (cwd || '') : input;
+  const scopedInput = arguments.length > 1 ? input + '\0' + (cwd || '') : input;
   return createHash('sha256').update(scopedInput).digest('hex');
 }
 
@@ -486,7 +486,7 @@ describe('Group 2: Cache Key Generation', () => {
   it('null cwd treated as empty string (no throw)', () => {
     const prompt = 'add retry logic';
     const key1 = getCacheKey(prompt + '\0' + '');
-    const key2 = getCacheKey(prompt + '\0' + (null ?? ''));
+    const key2 = getCacheKey(prompt, null);
     assert.equal(key1, key2, 'Null cwd must be treated as empty string');
   });
 
