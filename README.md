@@ -224,9 +224,13 @@ node bench/dashboard.mjs --serve
 - `latency_ms` — total hook runtime
 - `cache_hit` — whether the cache was used
 - `mode` — agentic, fast, or detailed
-- `input_length` — character count of the prompt
-- `output_length` — character count of the analysis
-- `token_estimate` — estimated tokens used (if SDK mode)
+- `input_len` — character count of the original prompt
+- `token_estimate` — `{ input_tokens, output_tokens }` when usage is available;
+  SDK runs use the provider's exact envelope, while text subprocess runs use
+  the deterministic conservative estimate `ceil(characters / 4)` for the
+  constructed Haiku prompt and raw CLI output. Exits that never receive a
+  Haiku response (for example, a cache hit or pre-analysis skip) omit this
+  field; unavailable usage never changes the hook's exit behavior.
 
 The dashboard shows latency distribution, cache hit rate over time, per-mode performance, and estimated Haiku cost when token estimates are available — useful for tuning timeouts, cache TTL, mode selection, and spend.
 

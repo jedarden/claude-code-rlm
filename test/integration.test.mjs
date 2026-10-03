@@ -35,17 +35,28 @@ await mkdir(FAKE_DIR, { recursive: true });
 await writeFile(
   join(FAKE_DIR, 'claude'),
   `#!/usr/bin/env node
-// Fake claude for rlm-hook integration tests — ignores all args
+// Fake claude for rlm-hook integration tests — accepts output/exit overrides
+// so the subprocess metric paths can be tested without the real CLI.
 if (process.env.RLM_CLAUDE_TRACE_FILE) {
   require('node:fs').appendFileSync(process.env.RLM_CLAUDE_TRACE_FILE, 'invoked\\n');
 }
-process.stdout.write(JSON.stringify({
+if (process.env.RLM_CLAUDE_PROMPT_TRACE_FILE) {
+  require('node:fs').writeFileSync(
+    process.env.RLM_CLAUDE_PROMPT_TRACE_FILE,
+    process.argv[3] || '',
+  );
+}
+const output = process.env.RLM_CLAUDE_OUTPUT || JSON.stringify({
   "intent": "code_writing",
   "tasks": ["Analyze request", "Implement solution", "Add tests"],
   "tech": ["Node.js"],
   "files": ["src/main.js"],
   "approach": "Follow existing codebase patterns"
-}));
+});
+process.stdout.write(output);
+if (process.env.RLM_CLAUDE_EXIT_CODE) {
+  process.exit(Number(process.env.RLM_CLAUDE_EXIT_CODE));
+}
 `,
   { mode: 0o755 },
 );
@@ -292,7 +303,120 @@ describe('CLI command skip', { timeout: 5000 }, () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Skip-detection boundaries
+// 5. Subprocess token metrics
+//
+// The text CLI has no provider usage envelope. The hook therefore records a
+// deterministic ceil(characters / 4) estimate for the constructed prompt and
+// raw CLI output, while exits that never receive a response leave usage absent.
+// ---------------------------------------------------------------------------
+
+describe('Subprocess token metrics', { timeout: 10000 }, () => {
+  const ceilTokens = (text) => Math.ceil(text.length / 4);
+
+  it('records the shared token_estimate field for a subprocess completion', async () => {
+    const prompt =
+      'Explain the existing cache invalidation flow and identify the safest place to add tests.';
+    const output = JSON.stringify({
+      intent: 'code_writing',
+      summary: 'Subprocess metric fixture',
+      tasks: ['Inspect the cache flow'],
+    });
+    const metrics = join(tmpdir(), `rlm-subprocess-complete-metrics-${Date.now()}-${Math.random()}.jsonl`);
+    const promptTrace = join(tmpdir(), `rlm-subprocess-prompt-${Date.now()}-${Math.random()}.txt`);
+
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt }), {
+      env: {
+        RLM_CLAUDE_OUTPUT: output,
+        RLM_CLAUDE_PROMPT_TRACE_FILE: promptTrace,
+        RLM_METRICS_FILE: metrics,
+      },
+    });
+
+    assert.equal(code, 0);
+    assert.match(stdout, /Subprocess metric fixture/);
+    const events = await readJsonLines(metrics);
+    const complete = events.find((event) => event.event === 'complete');
+    const constructedPrompt = await readFile(promptTrace, 'utf8');
+    assert.deepEqual(complete?.token_estimate, {
+      input_tokens: ceilTokens(constructedPrompt),
+      output_tokens: ceilTokens(output),
+    });
+  });
+
+  it('records the estimate for a subprocess Haiku skip', async () => {
+    const prompt = 'Determine whether this request needs repository exploration.';
+    const output = JSON.stringify({ skip: true, reason: 'No repository work requested' });
+    const metrics = join(tmpdir(), `rlm-subprocess-skip-metrics-${Date.now()}-${Math.random()}.jsonl`);
+    const promptTrace = join(tmpdir(), `rlm-subprocess-skip-prompt-${Date.now()}-${Math.random()}.txt`);
+
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt }), {
+      env: {
+        RLM_CLAUDE_OUTPUT: output,
+        RLM_CLAUDE_PROMPT_TRACE_FILE: promptTrace,
+        RLM_METRICS_FILE: metrics,
+      },
+    });
+
+    assert.equal(code, 0);
+    assert.equal(stdout, '');
+    const events = await readJsonLines(metrics);
+    const skipped = events.find((event) => event.event === 'haiku_skip');
+    const constructedPrompt = await readFile(promptTrace, 'utf8');
+    assert.deepEqual(skipped?.token_estimate, {
+      input_tokens: ceilTokens(constructedPrompt),
+      output_tokens: ceilTokens(output),
+    });
+  });
+
+  it('keeps the successful exit and omits usage when subprocess output is unavailable', async () => {
+    const prompt = 'Inspect the service boundary and report the relevant implementation files.';
+    const metrics = join(tmpdir(), `rlm-subprocess-error-metrics-${Date.now()}-${Math.random()}.jsonl`);
+
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt }), {
+      env: {
+        RLM_CLAUDE_EXIT_CODE: '7',
+        RLM_METRICS_FILE: metrics,
+      },
+    });
+
+    assert.equal(code, 0, 'subprocess failures must not block the hook');
+    assert.equal(stdout, '');
+    const error = (await readJsonLines(metrics)).find((event) => event.event === 'error');
+    assert.ok(error, 'an error metric should still be emitted');
+    assert.equal(Object.hasOwn(error, 'token_estimate'), false,
+      'no response means token usage is unavailable');
+  });
+
+  it('omits usage for pre-Haiku skip and cache-hit exits', async () => {
+    const skipMetrics = join(tmpdir(), `rlm-pre-haiku-skip-metrics-${Date.now()}-${Math.random()}.jsonl`);
+    const skipped = await spawnHook(JSON.stringify({ prompt: 'ls' }), {
+      env: { RLM_METRICS_FILE: skipMetrics },
+    });
+    assert.equal(skipped.code, 0);
+    const skipEvent = (await readJsonLines(skipMetrics)).find((event) => event.event === 'skip');
+    assert.ok(skipEvent);
+    assert.equal(Object.hasOwn(skipEvent, 'token_estimate'), false);
+
+    const cacheDir = join(tmpdir(), `rlm-cache-usage-unavailable-${Date.now()}-${Math.random()}`);
+    const cacheMetrics = join(tmpdir(), `rlm-cache-usage-metrics-${Date.now()}-${Math.random()}.jsonl`);
+    const cachePrompt = 'Explain the existing cache invalidation flow for this repository.';
+    await spawnHook(JSON.stringify({ prompt: cachePrompt }), {
+      cacheDir,
+      env: { RLM_METRICS_FILE: cacheMetrics },
+    });
+    const cached = await spawnHook(JSON.stringify({ prompt: cachePrompt }), {
+      cacheDir,
+      env: { RLM_METRICS_FILE: cacheMetrics },
+    });
+    assert.equal(cached.code, 0);
+    const cacheHit = (await readJsonLines(cacheMetrics)).find((event) => event.event === 'cache_hit');
+    assert.ok(cacheHit);
+    assert.equal(Object.hasOwn(cacheHit, 'token_estimate'), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Skip-detection boundaries
 //
 // These cases deliberately use prompts at or above the default minimum so
 // command and code-shape detection cannot pass accidentally via the length
