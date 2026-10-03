@@ -164,17 +164,45 @@ describe('hook process contract', { timeout: 10000 }, () => {
     }
   });
 
-  it('treats malformed JSON as raw input and still exits zero', async () => {
+  it('rejects malformed JSON without invoking the subprocess or emitting context', async () => {
     const environment = await createEnvironment();
     try {
       const malformed = '{"prompt":"Implement malformed input recovery.';
       const result = await runHook(malformed, environment);
+      const log = await readIfPresent(environment.env.RLM_LOG_FILE);
+      const metrics = (await readIfPresent(environment.env.RLM_METRICS_FILE))
+        .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 
       assert.equal(result.code, 0);
-      assert.match(result.stdout, /<rlm_preresearch>/);
-      const args = JSON.parse(await readFile(environment.capturePath, 'utf8'));
-      const prompt = args[args.indexOf('-p') + 1];
-      assert.match(prompt, new RegExp(`USER REQUEST: ${malformed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+      assert.equal(result.stdout, '');
+      assert.equal(result.stderr, '');
+      assert.equal(await readIfPresent(environment.capturePath), '');
+      assert.match(log, /ERROR: Invalid hook input: stdin must be valid JSON/);
+      assert.equal(metrics.at(-1).event, 'error');
+      assert.equal(metrics.at(-1).cache_hit, false);
+      assert.equal(metrics.at(-1).reason, 'Invalid hook input: stdin must be valid JSON');
+    } finally {
+      await destroyEnvironment(environment);
+    }
+  });
+
+  it('rejects an incomplete JSON object without a false success', async () => {
+    const environment = await createEnvironment();
+    try {
+      const result = await runHook(
+        JSON.stringify({ cwd: environment.root }),
+        environment,
+      );
+      const log = await readIfPresent(environment.env.RLM_LOG_FILE);
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, '');
+      assert.equal(result.stderr, '');
+      assert.equal(await readIfPresent(environment.capturePath), '');
+      assert.match(
+        log,
+        /ERROR: Invalid hook input: stdin JSON must include a non-empty prompt, message, input, or content string/,
+      );
     } finally {
       await destroyEnvironment(environment);
     }
@@ -189,12 +217,16 @@ describe('hook process contract', { timeout: 10000 }, () => {
         { FAKE_CLAUDE_MODE: 'failure' },
       );
       const log = await readIfPresent(environment.env.RLM_LOG_FILE);
-      const metrics = await readIfPresent(environment.env.RLM_METRICS_FILE);
+      const metrics = (await readIfPresent(environment.env.RLM_METRICS_FILE))
+        .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 
       assert.equal(result.code, 0);
       assert.equal(result.stdout, '');
+      assert.equal(result.stderr, '');
       assert.match(log, /ERROR: Haiku failed \(exit 42\): synthetic subprocess failure/);
-      assert.match(metrics, /"event":"error"/);
+      assert.equal(metrics.at(-1).event, 'error');
+      assert.equal(metrics.at(-1).cache_hit, false);
+      assert.equal(metrics.at(-1).reason, 'Haiku failed (exit 42): synthetic subprocess failure');
     } finally {
       await destroyEnvironment(environment);
     }

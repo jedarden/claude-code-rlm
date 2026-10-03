@@ -105,20 +105,33 @@ function parseHaikuResponse(response) {
  * parseHookInput — decodes Claude Code hook stdin into (userMessage, cwd, transcriptPath).
  */
 function parseHookInput(rawInput) {
-  let userMessage = rawInput;
-  let cwd = null;
-  let transcriptPath = null;
-
+  let hookInput;
   try {
-    const hookInput = JSON.parse(rawInput);
-    userMessage = hookInput.prompt || hookInput.message || hookInput.input || hookInput.content || rawInput;
-    cwd = hookInput.cwd || null;
-    transcriptPath = hookInput.transcript_path || null;
+    hookInput = JSON.parse(rawInput);
   } catch {
-    // Use raw text
+    return { error: 'stdin must be valid JSON' };
   }
 
-  return { userMessage, cwd, transcriptPath };
+  if (!hookInput || typeof hookInput !== 'object' || Array.isArray(hookInput)) {
+    return { error: 'stdin must contain a JSON object' };
+  }
+
+  const userMessage = ['prompt', 'message', 'input', 'content']
+    .map((field) => hookInput[field])
+    .find((value) => typeof value === 'string' && value.trim().length > 0);
+  if (!userMessage) {
+    return {
+      error: 'stdin JSON must include a non-empty prompt, message, input, or content string',
+    };
+  }
+
+  return {
+    userMessage,
+    cwd: typeof hookInput.cwd === 'string' && hookInput.cwd ? hookInput.cwd : null,
+    transcriptPath: typeof hookInput.transcript_path === 'string' && hookInput.transcript_path
+      ? hookInput.transcript_path
+      : null,
+  };
 }
 
 /**
@@ -642,16 +655,22 @@ describe('Group 5: Hook Input Parsing', () => {
     assert.equal(cwd, null);
   });
 
-  it('plain text (not JSON) → raw text used as message', () => {
-    const raw = 'Just a plain text message not wrapped in JSON';
-    const { userMessage } = parseHookInput(raw);
-    assert.equal(userMessage, raw);
+  it('plain text (not JSON) → rejected as invalid hook input', () => {
+    const { error } = parseHookInput('Just a plain text message not wrapped in JSON');
+    assert.equal(error, 'stdin must be valid JSON');
   });
 
-  it('malformed JSON → raw text used as message', () => {
-    const raw = '{not: valid json';
-    const { userMessage } = parseHookInput(raw);
-    assert.equal(userMessage, raw);
+  it('malformed JSON → rejected as invalid hook input', () => {
+    const { error } = parseHookInput('{not: valid json');
+    assert.equal(error, 'stdin must be valid JSON');
+  });
+
+  it('missing message field → rejected as incomplete hook input', () => {
+    const { error } = parseHookInput(JSON.stringify({ cwd: '/some/path' }));
+    assert.equal(
+      error,
+      'stdin JSON must include a non-empty prompt, message, input, or content string',
+    );
   });
 });
 

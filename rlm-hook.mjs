@@ -1958,6 +1958,44 @@ async function readStdin() {
   return Buffer.concat(chunks).toString('utf-8');
 }
 
+/**
+ * parseHookInput — decode Claude Code hook stdin into the request fields.
+ *
+ * Claude Code invokes hooks with a JSON object. Treating malformed or
+ * incomplete stdin as a plain-text prompt can produce convincing but
+ * unrelated preresearch output, so invalid input is returned as a contract
+ * error for the caller to handle through the normal fail-open error path.
+ */
+function parseHookInput(rawInput) {
+  let hookInput;
+  try {
+    hookInput = JSON.parse(rawInput);
+  } catch {
+    return { error: 'stdin must be valid JSON' };
+  }
+
+  if (!hookInput || typeof hookInput !== 'object' || Array.isArray(hookInput)) {
+    return { error: 'stdin must contain a JSON object' };
+  }
+
+  const userMessage = ['prompt', 'message', 'input', 'content']
+    .map((field) => hookInput[field])
+    .find((value) => typeof value === 'string' && value.trim().length > 0);
+  if (!userMessage) {
+    return {
+      error: 'stdin JSON must include a non-empty prompt, message, input, or content string',
+    };
+  }
+
+  return {
+    userMessage,
+    cwd: typeof hookInput.cwd === 'string' && hookInput.cwd ? hookInput.cwd : null,
+    transcriptPath: typeof hookInput.transcript_path === 'string' && hookInput.transcript_path
+      ? hookInput.transcript_path
+      : null,
+  };
+}
+
 // =============================================================================
 // MAIN
 // =============================================================================
@@ -1984,18 +2022,15 @@ async function main() {
     const input = await readStdin();
 
     userMessage = input;
-    let cwd = null;
-    let transcriptPath = null;
 
-    // Claude Code hook format: JSON with prompt, cwd, transcript_path
-    try {
-      const hookInput = JSON.parse(input);
-      userMessage = hookInput.prompt || hookInput.message || hookInput.input || hookInput.content || input;
-      cwd = hookInput.cwd || null;
-      transcriptPath = hookInput.transcript_path || null;
-    } catch {
-      // Fall back to treating raw input as the message
+    // Claude Code hook format: JSON with prompt, cwd, transcript_path.
+    // Invalid input must not be reinterpreted as a successful plain-text request.
+    const parsedInput = parseHookInput(input);
+    if (parsedInput.error) {
+      throw new Error(`Invalid hook input: ${parsedInput.error}`);
     }
+    ({ userMessage } = parsedInput);
+    const { cwd, transcriptPath } = parsedInput;
 
     await log(`Processing input of length ${userMessage.length}${cwd ? ` in ${cwd}` : ''}`);
 

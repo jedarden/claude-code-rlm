@@ -530,14 +530,26 @@ describe('Very long input truncation', { timeout: 5000 }, () => {
 // ---------------------------------------------------------------------------
 
 describe('Malformed JSON input', { timeout: 5000 }, () => {
-  it('raw non-JSON string longer than 20 chars → exit 0', async () => {
-    // JSON.parse fails → hook treats raw stdin as the message.
-    // The raw string is long enough to pass skip checks; fake claude handles it.
+  it('raw non-JSON string longer than 20 chars → exit 0 with no false success', async () => {
+    // Invalid hook input follows the documented fail-open error path instead
+    // of being reinterpreted as a plain-text prompt.
     const raw =
       'just text that is long enough to not be skipped immediately ' +
       'but is not JSON at all and will cause parse to use raw text';
-    const { code } = await spawnHook(raw);
+    const traceFile = join(tmpdir(), `rlm-malformed-trace-${Date.now()}-${Math.random()}.txt`);
+    const metrics = join(tmpdir(), `rlm-malformed-metrics-${Date.now()}-${Math.random()}.jsonl`);
+    const { code, stdout } = await spawnHook(raw, {
+      env: {
+        RLM_CLAUDE_TRACE_FILE: traceFile,
+        RLM_METRICS_FILE: metrics,
+      },
+    });
+
     assert.equal(code, 0, 'Hook must exit 0 for non-JSON stdin');
+    assert.equal(stdout, '', 'Malformed stdin must not emit preresearch context');
+    assert.equal(await readTextOrEmpty(traceFile), '', 'Malformed stdin must not invoke claude');
+    const error = (await readJsonLines(metrics)).find((event) => event.event === 'error');
+    assert.equal(error?.reason, 'Invalid hook input: stdin must be valid JSON');
   });
 });
 
