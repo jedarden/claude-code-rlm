@@ -353,6 +353,22 @@ describe('Group 1: Skip Detection (shouldSkipRLM logic)', () => {
     assert.equal(result.skip, false, '20 chars should pass the length gate');
   });
 
+  it('immediately above the minimum: 21 chars → do not skip', () => {
+    const input = 'a'.repeat(21);
+    assert.equal(input.length, 21);
+    assert.equal(shouldSkipRLM(input).skip, false, '21 chars should pass the length gate');
+  });
+
+  it('empty prompt → skip as below the minimum', () => {
+    assert.equal(shouldSkipRLM('').skip, true);
+  });
+
+  it('whitespace-only prompt below the minimum → skip', () => {
+    const input = ' '.repeat(19);
+    assert.equal(input.length, 19);
+    assert.equal(shouldSkipRLM(input).skip, true, '19 whitespace characters are below the minimum');
+  });
+
   it('/help → skip (slash command)', () => {
     assert.equal(shouldSkipRLM('/help').skip, true);
   });
