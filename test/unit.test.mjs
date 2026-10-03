@@ -4040,6 +4040,32 @@ describe('Group 25: Metrics log parse & aggregate (Phase 5)', () => {
     assert.equal(recs[0].ts, 1);
   });
 
+  it('parseLog and aggregate tolerate mixed legacy and normalized token lines', () => {
+    const text = [
+      JSON.stringify(metricRec('2026-06-23', '01:00:00', {
+        event: 'complete',
+        latency_ms: 125,
+      })),
+      JSON.stringify(metricRec('2026-06-23', '02:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: 100, output_tokens: 20 },
+      })),
+    ].join('\n');
+
+    const recs = parseLog(text);
+    assert.doesNotThrow(() => aggregate(recs));
+    const agg = aggregate(recs);
+
+    assert.equal(agg.overall.total, 2);
+    assert.deepEqual(agg.overall.token_totals, {
+      input_tokens: 100,
+      output_tokens: 20,
+      total_tokens: 120,
+    });
+    assert.equal(agg.overall.latency.count, 1);
+    assert.ok(agg.overall.estimated_cost_usd > 0);
+  });
+
   it('parseLog tolerates empty / non-string input', () => {
     assert.deepEqual(parseLog(''), []);
     assert.deepEqual(parseLog(null), []);
