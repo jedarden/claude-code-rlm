@@ -401,6 +401,93 @@ describe('Group 1: Skip Detection (shouldSkipRLM logic)', () => {
     assert.equal(shouldSkipRLM('yarn add react').skip, true);
   });
 
+  it('recognizes every supported CLI prefix above the minimum length', () => {
+    const commands = [
+      ['ls', 'ls --all /home/coding/claude-code-rlm'],
+      ['cd', 'cd /home/coding/claude-code-rlm'],
+      ['pwd', 'pwd --physical /home/coding/claude-code-rlm'],
+      ['cat', 'cat /etc/nginx/nginx.conf'],
+      ['echo', 'echo hello from the shell command line'],
+      ['git status', 'git status --short --branch'],
+      ['npm', 'npm install --save-dev dependencies'],
+      ['yarn', 'yarn add --dev dependencies'],
+    ];
+
+    for (const [command, input] of commands) {
+      assert.ok(input.length >= 20, `${command} case must pass the length gate`);
+      assert.equal(
+        shouldSkipRLM(input).skip,
+        true,
+        `${command} invocation should be skipped as a simple command`,
+      );
+    }
+  });
+
+  it('recognizes single-word slash commands regardless of command name', () => {
+    const commands = [
+      '/help',
+      '/clear',
+      '/config',
+      '/exit',
+      '/status',
+      '/reset',
+      '/model',
+      '/compact',
+      '/history',
+      '/review',
+      '/aaaaaaaaaaaaaaaaaaaa',
+    ];
+
+    for (const command of commands) {
+      assert.equal(
+        shouldSkipRLM(command).skip,
+        true,
+        `${command} should be skipped as a slash command`,
+      );
+    }
+  });
+
+  it('does not skip close CLI-prefix lookalikes', () => {
+    const nearMisses = [
+      'lsight --all files in the project',
+      'cdrom contains the installation media',
+      'pwdx prints a process working directory',
+      'catenate these files for the report',
+      'echoes from the previous command output',
+      'git statuss should not match git status',
+      'npms are not the npm command',
+      'yarned fibers are used in this example',
+    ];
+
+    for (const input of nearMisses) {
+      assert.ok(input.length >= 20, `${input} must pass the length gate`);
+      assert.equal(
+        shouldSkipRLM(input).skip,
+        false,
+        `${input} should remain eligible for RLM`,
+      );
+    }
+  });
+
+  it('does not skip slash-command lookalikes', () => {
+    const nearMisses = [
+      '/help now in this session',
+      '/help-me-with-this-now',
+      '/help? please explain',
+      '//help with this request',
+      'please run /help for guidance',
+    ];
+
+    for (const input of nearMisses) {
+      assert.ok(input.length >= 20, `${input} must pass the length gate`);
+      assert.equal(
+        shouldSkipRLM(input).skip,
+        false,
+        `${input} should remain eligible for RLM`,
+      );
+    }
+  });
+
   it('"yes" → skip (simple affirmative)', () => {
     assert.equal(shouldSkipRLM('yes').skip, true);
   });
