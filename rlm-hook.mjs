@@ -1116,15 +1116,19 @@ function extractSDKText(response) {
  * Defensive against missing/partial shapes.
  */
 function extractSDKUsage(response) {
-  if (!response || typeof response !== 'object') return null;
-  const usage = response.usage;
-  if (!usage || typeof usage !== 'object') return null;
-  const input = usage.input_tokens;
-  const output = usage.output_tokens;
-  if (typeof input === 'number' && Number.isFinite(input) &&
-      input >= 0 && typeof output === 'number' && Number.isFinite(output) &&
-      output >= 0) {
-    return { input_tokens: input, output_tokens: output };
+  try {
+    if (!response || typeof response !== 'object') return null;
+    const usage = response.usage;
+    if (!usage || typeof usage !== 'object') return null;
+    const input = usage.input_tokens;
+    const output = usage.output_tokens;
+    if (typeof input === 'number' && Number.isFinite(input) &&
+        input >= 0 && typeof output === 'number' && Number.isFinite(output) &&
+        output >= 0) {
+      return { input_tokens: input, output_tokens: output };
+    }
+  } catch {
+    // SDK response/usage objects may be partial or otherwise malformed.
   }
   return null;
 }
@@ -1144,15 +1148,17 @@ function estimateTokenUsage(inputText, outputText) {
 }
 
 /**
- * metricTokenEstimate — prefer exact Anthropic usage, otherwise estimate from
- * the prompt and returned text. Responses from SDK calls are `{ text, usage }`;
- * the subprocess returns its text directly.
+ * metricTokenEstimate — normalize exact usage from SDK responses. The
+ * subprocess returns raw text, so it gets the conservative character estimate;
+ * an SDK response with no usable usage stays null rather than being estimated.
  */
 function metricTokenEstimate(response, prompt) {
-  const exact = extractSDKUsage(response);
-  if (exact) return exact;
-  const output = typeof response === 'string' ? response : response?.text;
-  return estimateTokenUsage(prompt, output);
+  if (typeof response === 'string') {
+    return estimateTokenUsage(prompt, response);
+  }
+  // SDK responses are wrapped as { text, usage }. Do not turn a missing or
+  // malformed SDK usage envelope into a made-up estimate.
+  return extractSDKUsage(response);
 }
 
 function responseText(response) {
@@ -2141,7 +2147,14 @@ async function main() {
     }
 
     // Parse and validate
-    tokenEstimate = metricTokenEstimate(response, prompt);
+    try {
+      tokenEstimate = metricTokenEstimate(response, prompt);
+    } catch (err) {
+      // Usage is observability only. Preserve the response/text path if an
+      // unusual SDK object defeats the defensive extractor.
+      tokenEstimate = null;
+      await log(`SDK usage capture skipped: ${String(err?.message ?? err)}`);
+    }
     const analysis = normalizePreresearch(parseHaikuResponse(responseText(response)));
 
     if (analysis.skip_rlm || analysis.skip) {
@@ -2160,7 +2173,7 @@ async function main() {
     console.log(formatOutput(analysis));
 
     await log('RLM analysis complete');
-    await recordMetric('complete', false, { token_estimate: tokenEstimate });
+    await recordMetric('complete', false, tokenEstimate ? { token_estimate: tokenEstimate } : {});
   } catch (error) {
     await log(`ERROR: ${String(error?.message ?? error)}`);
     await recordMetric('error', false, {

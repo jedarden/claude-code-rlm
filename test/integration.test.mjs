@@ -757,6 +757,25 @@ describe('SDK selection and tool-loop integration', { timeout: 15000 }, () => {
     'Review the authentication service and explain how to add refresh-token ' +
     'rotation while preserving the existing integration-test conventions.';
 
+  it('direct SDK usage reaches the complete metric with normalized fields', async () => {
+    const trace = join(tmpdir(), `rlm-sdk-direct-usage-${Date.now()}-${Math.random()}.jsonl`);
+    const metrics = join(tmpdir(), `rlm-sdk-direct-metrics-${Date.now()}-${Math.random()}.jsonl`);
+    const { code, stdout } = await spawnHook(JSON.stringify({ prompt: SDK_PROMPT }), {
+      env: {
+        ...sdkLoaderEnv(join(FAKE_DIR, 'sdk-loader.mjs'), trace),
+        ANTHROPIC_API_KEY: 'integration-test-key',
+        RLM_USE_SDK: 'true',
+        RLM_AGENTIC_MODE: 'false',
+        RLM_METRICS_FILE: metrics,
+      },
+    });
+
+    assert.equal(code, 0);
+    assert.match(stdout, /SDK model response/);
+    const complete = (await readJsonLines(metrics)).find((event) => event.event === 'complete');
+    assert.deepEqual(complete?.token_estimate, { input_tokens: 11, output_tokens: 7 });
+  });
+
   it('SDK enabled with an API key selects SDK and returns the model response', async () => {
     const trace = join(tmpdir(), `rlm-sdk-response-${Date.now()}-${Math.random()}.jsonl`);
     const cliTrace = join(tmpdir(), `rlm-sdk-response-cli-${Date.now()}-${Math.random()}.log`);
@@ -822,6 +841,7 @@ describe('SDK selection and tool-loop integration', { timeout: 15000 }, () => {
   it('agentic SDK continues after multiple tool calls and completes', async () => {
     const trace = join(tmpdir(), `rlm-sdk-tools-${Date.now()}-${Math.random()}.jsonl`);
     const cliTrace = join(tmpdir(), `rlm-sdk-tools-cli-${Date.now()}-${Math.random()}.log`);
+    const metrics = join(tmpdir(), `rlm-sdk-tools-metrics-${Date.now()}-${Math.random()}.jsonl`);
     const projectDir = join(tmpdir(), `rlm-sdk-tools-project-${Date.now()}-${Math.random()}`);
     await mkdir(projectDir, { recursive: true });
     await writeFile(join(projectDir, 'fixture.txt'), 'needle: first fixture result\n');
@@ -837,6 +857,7 @@ describe('SDK selection and tool-loop integration', { timeout: 15000 }, () => {
         ANTHROPIC_API_KEY: 'integration-test-key',
         RLM_USE_SDK: 'true',
         RLM_AGENTIC_MODE: 'true',
+        RLM_METRICS_FILE: metrics,
       },
     });
 
@@ -859,5 +880,9 @@ describe('SDK selection and tool-loop integration', { timeout: 15000 }, () => {
     assert.deepEqual(secondResults.content.map((result) => result.tool_use_id), ['tool-grep', 'tool-read-2']);
     assert.match(secondResults.content[0].content, /needle: first fixture result/);
     assert.match(secondResults.content[1].content, /second fixture result/);
+
+    const complete = (await readJsonLines(metrics)).find((event) => event.event === 'complete');
+    assert.deepEqual(complete?.token_estimate, { input_tokens: 33, output_tokens: 21 },
+      'complete metric sums usage from all three SDK turns');
   });
 });

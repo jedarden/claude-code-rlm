@@ -1100,6 +1100,23 @@ function extractSDKText(response) {
     .join('');
 }
 
+function extractSDKUsage(response) {
+  try {
+    if (!response || typeof response !== 'object') return null;
+    const usage = response.usage;
+    if (!usage || typeof usage !== 'object') return null;
+    const input = usage.input_tokens;
+    const output = usage.output_tokens;
+    if (typeof input === 'number' && Number.isFinite(input) && input >= 0 &&
+        typeof output === 'number' && Number.isFinite(output) && output >= 0) {
+      return { input_tokens: input, output_tokens: output };
+    }
+  } catch {
+    // Malformed SDK usage must not affect the response text path.
+  }
+  return null;
+}
+
 // callMessagesSDK — shared single-turn core for both fast and detailed SDK paths
 // (matches the hook). callHaikuFastSDK / callHaikuDetailedSDK are thin wrappers.
 async function callMessagesSDK(prompt, apiKey, client, { model = 'claude-haiku-4-5-20251001', maxTokens = 2048 } = {}) {
@@ -1108,7 +1125,10 @@ async function callMessagesSDK(prompt, apiKey, client, { model = 'claude-haiku-4
     max_tokens: maxTokens,
     messages: [{ role: 'user', content: prompt }],
   });
-  return extractSDKText(response);
+  return {
+    text: extractSDKText(response),
+    usage: extractSDKUsage(response),
+  };
 }
 
 async function callHaikuFastSDK(prompt, apiKey, client, opts) {
@@ -1188,10 +1208,38 @@ describe('Group 10: SDK-Direct Fast Path (Phase 2)', () => {
   it('callHaikuFastSDK: returns raw text that parseHaikuResponse can decode', async () => {
     const json = '{"intent":"code_writing","tasks":["a","b"]}';
     const client = makeFakeClient({ content: [{ type: 'text', text: json }] });
-    const text = await callHaikuFastSDK('msg', 'sk-x', client);
-    const parsed = parseHaikuResponse(text);
+    const result = await callHaikuFastSDK('msg', 'sk-x', client);
+    const parsed = parseHaikuResponse(result.text);
     assert.equal(parsed.intent, 'code_writing');
     assert.deepEqual(parsed.tasks, ['a', 'b']);
+  });
+
+  it('callHaikuFastSDK: returns normalized SDK usage without changing text', async () => {
+    const client = makeFakeClient({
+      content: [{ type: 'text', text: '{"intent":"debugging"}' }],
+      usage: { input_tokens: 23, output_tokens: 9, cache_read_input_tokens: 100 },
+    });
+    const result = await callHaikuFastSDK('msg', 'sk-x', client);
+    assert.equal(result.text, '{"intent":"debugging"}');
+    assert.deepEqual(result.usage, { input_tokens: 23, output_tokens: 9 });
+  });
+
+  it('callHaikuFastSDK: missing or malformed usage is null and non-fatal', async () => {
+    for (const usage of [undefined, { input_tokens: '23', output_tokens: 9 }, { input_tokens: 23 }]) {
+      const response = { content: [{ type: 'text', text: '{"skip":true}' }] };
+      if (usage !== undefined) response.usage = usage;
+      const result = await callHaikuFastSDK('msg', 'sk-x', makeFakeClient(response));
+      assert.equal(result.text, '{"skip":true}');
+      assert.equal(result.usage, null);
+    }
+
+    const response = { content: [{ type: 'text', text: '{"skip":true}' }] };
+    Object.defineProperty(response, 'usage', {
+      get() { throw new Error('malformed usage getter'); },
+    });
+    const result = await callHaikuFastSDK('msg', 'sk-x', makeFakeClient(response));
+    assert.equal(result.text, '{"skip":true}');
+    assert.equal(result.usage, null);
   });
 
   it('callHaikuFastSDK: SDK error propagates so the caller can fall back', async () => {
@@ -1242,8 +1290,8 @@ describe('Group 11: SDK-Direct Detailed Path (Phase 2)', () => {
       skip_reason: null,
     });
     const client = makeFakeClient({ content: [{ type: 'text', text: json }] });
-    const text = await callHaikuDetailedSDK('msg', 'sk-x', client);
-    const parsed = parseHaikuResponse(text);
+    const result = await callHaikuDetailedSDK('msg', 'sk-x', client);
+    const parsed = parseHaikuResponse(result.text);
     assert.equal(parsed.intent.primary, 'architecture');
     assert.equal(parsed.suggested_approach, 'layered');
     assert.equal(parsed.skip_rlm, false);
@@ -1454,11 +1502,27 @@ async function callHaikuAgenticSDK(
 ) {
   const messages = [{ role: 'user', content: prompt }];
   let lastText = '';
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let usageSeen = false;
   for (let turn = 0; turn < maxTurns; turn++) {
     const response = await client.messages.create({ model, max_tokens: maxTokens, tools: AGENTIC_TOOLS, messages });
     const text = extractSDKText(response);
     if (text) lastText = text;
-    if (response.stop_reason !== 'tool_use') return text || lastText;
+    const usage = extractSDKUsage(response);
+    if (usage) {
+      usageSeen = true;
+      totalInputTokens += usage.input_tokens;
+      totalOutputTokens += usage.output_tokens;
+    }
+    if (response.stop_reason !== 'tool_use') {
+      return {
+        text: text || lastText,
+        usage: usageSeen
+          ? { input_tokens: totalInputTokens, output_tokens: totalOutputTokens }
+          : null,
+      };
+    }
     messages.push({ role: 'assistant', content: response.content });
     const toolResults = [];
     for (const block of response.content || []) {
@@ -1469,7 +1533,12 @@ async function callHaikuAgenticSDK(
     }
     messages.push({ role: 'user', content: toolResults });
   }
-  return lastText;
+  return {
+    text: lastText,
+    usage: usageSeen
+      ? { input_tokens: totalInputTokens, output_tokens: totalOutputTokens }
+      : null,
+  };
 }
 
 // A fake client that returns a SEQUENCE of responses (one per turn), recording
@@ -1514,20 +1583,21 @@ describe('Group 12: SDK-Direct Agentic Path (Phase 2)', () => {
   // --- the tool-use loop ---
   it('loop: dispatches tool_use blocks, threads tool_results, returns final text', async () => {
     const client = makeSequenceClient([
-      { stop_reason: 'tool_use', content: [
+      { stop_reason: 'tool_use', usage: { input_tokens: 10, output_tokens: 2 }, content: [
         { type: 'text', text: 'looking' },
         { type: 'tool_use', id: 't1', name: 'Glob', input: { pattern: '**/*.js' } },
       ] },
-      { stop_reason: 'tool_use', content: [
+      { stop_reason: 'tool_use', usage: { input_tokens: 20, output_tokens: 3 }, content: [
         { type: 'tool_use', id: 't2', name: 'Read', input: { path: 'a.js' } },
       ] },
-      { stop_reason: 'end_turn', content: [{ type: 'text', text: '{"intent":"code_writing"}' }] },
+      { stop_reason: 'end_turn', usage: { input_tokens: 30, output_tokens: 4 }, content: [{ type: 'text', text: '{"intent":"code_writing"}' }] },
     ]);
     const { dispatch, calls } = makeRecordingDispatch((name) => `${name} result`);
 
     const out = await callHaikuAgenticSDK('explore', 'sk-x', '/proj', client, dispatch);
 
-    assert.equal(out, '{"intent":"code_writing"}', 'returns final non-tool_use text');
+    assert.equal(out.text, '{"intent":"code_writing"}', 'returns final non-tool_use text');
+    assert.deepEqual(out.usage, { input_tokens: 60, output_tokens: 9 }, 'sums usage across every agentic turn');
     assert.equal(client.calls.length, 3, 'three Messages calls (2 tool turns + final)');
     assert.deepEqual(calls.map(c => c.name), ['Glob', 'Read'], 'each tool dispatched once, in order');
     assert.equal(calls[0].input.pattern, '**/*.js');
@@ -1563,7 +1633,24 @@ describe('Group 12: SDK-Direct Agentic Path (Phase 2)', () => {
 
     assert.equal(client.calls.length, 3, 'stops after maxTurns Messages calls');
     assert.equal(calls.length, 3, 'dispatches a tool each capped turn');
-    assert.equal(out, 'partial', 'returns best text seen so far on cap');
+    assert.equal(out.text, 'partial', 'returns best text seen so far on cap');
+    assert.equal(out.usage, null, 'absent turn usage stays non-fatal and absent');
+  });
+
+  it('loop: ignores malformed usage on one turn while retaining valid usage from others', async () => {
+    const malformed = { stop_reason: 'tool_use', usage: { input_tokens: 'bad', output_tokens: 2 }, content: [
+      { type: 'tool_use', id: 'bad-usage', name: 'Glob', input: { pattern: '*' } },
+    ] };
+    const final = { stop_reason: 'end_turn', usage: { input_tokens: 7, output_tokens: 3 }, content: [
+      { type: 'text', text: '{}' },
+    ] };
+    const client = makeSequenceClient([malformed, final]);
+    const { dispatch } = makeRecordingDispatch();
+
+    const out = await callHaikuAgenticSDK('p', 'sk-x', dir, client, dispatch);
+
+    assert.equal(out.text, '{}');
+    assert.deepEqual(out.usage, { input_tokens: 7, output_tokens: 3 });
   });
 
   it('loop: passes model/maxTokens through to the API', async () => {
@@ -3614,14 +3701,18 @@ function currentMode_copy(cfg) {
 // usage; text subprocess responses fall back to a four-characters-per-token
 // estimate so both paths can populate the same metric field.
 function extractSDKUsage_copy(response) {
-  if (!response || typeof response !== 'object') return null;
-  const usage = response.usage;
-  if (!usage || typeof usage !== 'object') return null;
-  const input = usage.input_tokens;
-  const output = usage.output_tokens;
-  if (typeof input === 'number' && Number.isFinite(input) && input >= 0 &&
-      typeof output === 'number' && Number.isFinite(output) && output >= 0) {
-    return { input_tokens: input, output_tokens: output };
+  try {
+    if (!response || typeof response !== 'object') return null;
+    const usage = response.usage;
+    if (!usage || typeof usage !== 'object') return null;
+    const input = usage.input_tokens;
+    const output = usage.output_tokens;
+    if (typeof input === 'number' && Number.isFinite(input) && input >= 0 &&
+        typeof output === 'number' && Number.isFinite(output) && output >= 0) {
+      return { input_tokens: input, output_tokens: output };
+    }
+  } catch {
+    // Keep malformed SDK usage from affecting the metric path.
   }
   return null;
 }
@@ -3632,10 +3723,12 @@ function estimateTokenUsage_copy(inputText, outputText) {
 }
 
 function metricTokenEstimate_copy(response, prompt) {
-  const exact = extractSDKUsage_copy(response);
-  if (exact) return exact;
-  const output = typeof response === 'string' ? response : response?.text;
-  return estimateTokenUsage_copy(prompt, output);
+  if (typeof response === 'string') return estimateTokenUsage_copy(prompt, response);
+  return extractSDKUsage_copy(response);
+}
+
+function completeMetricFields_copy(tokenEstimate) {
+  return tokenEstimate ? { token_estimate: tokenEstimate } : {};
 }
 
 describe('Group 24: Metrics JSONL append (Phase 5)', () => {
@@ -3735,6 +3828,21 @@ describe('Group 24: Metrics JSONL append (Phase 5)', () => {
     assert.deepEqual(rec.token_estimate, { input_tokens: 17, output_tokens: 8 });
   });
 
+  it('complete metrics omit token usage when an SDK response has none', async () => {
+    const metricsFile = join(testDir, 'metrics.jsonl');
+    await appendMetric_copy(
+      { event: 'complete', cache_hit: false, ...completeMetricFields_copy({ input_tokens: 17, output_tokens: 8 }) },
+      { metricsFile, writeImpl: realAppend, now: () => 10 }
+    );
+    await appendMetric_copy(
+      { event: 'complete', cache_hit: false, ...completeMetricFields_copy(null) },
+      { metricsFile, writeImpl: realAppend, now: () => 11 }
+    );
+    const records = (await readFile(metricsFile, 'utf-8')).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(records[0].token_estimate, { input_tokens: 17, output_tokens: 8 });
+    assert.equal(Object.hasOwn(records[1], 'token_estimate'), false);
+  });
+
   it('estimates token usage for text subprocess responses', () => {
     assert.deepEqual(
       metricTokenEstimate_copy('12345', '123456789'),
@@ -3742,9 +3850,11 @@ describe('Group 24: Metrics JSONL append (Phase 5)', () => {
     );
     assert.deepEqual(
       metricTokenEstimate_copy({ text: '1234', usage: { input_tokens: -1, output_tokens: 2 } }, '12345678'),
-      { input_tokens: 2, output_tokens: 1 },
-      'invalid SDK usage falls back without throwing'
+      null,
+      'invalid SDK usage is omitted without throwing'
     );
+    assert.equal(metricTokenEstimate_copy({ text: '1234' }, '12345678'), null,
+      'missing SDK usage is omitted without throwing');
   });
 });
 
