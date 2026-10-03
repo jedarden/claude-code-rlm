@@ -16,6 +16,7 @@ import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
 import { execSync } from 'child_process';
+import { createConfig, DEFAULTS } from '../rlm-config.mjs';
 // parse-log.mjs has NO main()-on-import side effect (CLI is guarded by
 // import.meta.url), so unlike rlm-hook.mjs we import its real exports directly.
 import { parseLog, aggregate, percentile, summarize } from '../bench/parse-log.mjs';
@@ -539,6 +540,95 @@ describe('Group 1: Skip Detection (shouldSkipRLM logic)', () => {
       'I am working on a web application that handles user authentication and I need help ' +
       'thinking through the token refresh mechanism so users stay logged in seamlessly.';
     assert.equal(shouldSkipRLM(input).skip, false);
+  });
+});
+
+describe('Code-heavy skip boundaries', () => {
+  const block1 = '```typescript\nconst first = await loadConfig();\n```';
+  const block2 = '```python\ndef second(value):\n    return value + 1\n```';
+  const blocks = `${block1}\n${block2}`;
+  const codeLength = block1.length + block2.length;
+  const separatorLength = blocks.length - codeLength;
+  const outsideCode = (length) =>
+    ' Review the implementation and explain any migration risks.'.repeat(
+      Math.ceil(length / 58),
+    ).slice(0, length);
+  const promptWithOutsideCode = (length) => `${blocks}${outsideCode(length)}`;
+
+  it('skips two fenced snippets when code is barely more than half the prompt', () => {
+    const input = promptWithOutsideCode(codeLength - separatorLength - 1);
+
+    assert.equal(input.length, codeLength * 2 - 1);
+    assert.equal(shouldSkipRLM(input).skip, true);
+    assert.equal(shouldSkipRLM(input).reason, 'Code-heavy input');
+  });
+
+  it('does not skip two fenced snippets at exactly the 50% boundary', () => {
+    const input = promptWithOutsideCode(codeLength - separatorLength);
+
+    assert.equal(input.length, codeLength * 2);
+    assert.equal(shouldSkipRLM(input).skip, false);
+  });
+
+  it('does not skip two fenced snippets when code is barely less than half', () => {
+    const input = promptWithOutsideCode(codeLength - separatorLength + 1);
+
+    assert.equal(input.length, codeLength * 2 + 1);
+    assert.equal(shouldSkipRLM(input).skip, false);
+  });
+
+  it('does not skip a single fenced snippet even when it is most of the prompt', () => {
+    const input = `${block1}\nExplain the failure mode.`;
+    const codeMatches = input.match(/```[\s\S]*?```/g) || [];
+
+    assert.equal(codeMatches.length, 1);
+    assert.ok(codeMatches[0].length > input.length * 0.5);
+    assert.equal(shouldSkipRLM(input).skip, false);
+  });
+});
+
+describe('RLM_MIN_LENGTH environment override', () => {
+  const originalOverride = process.env.RLM_MIN_LENGTH;
+
+  beforeEach(() => {
+    delete process.env.RLM_MIN_LENGTH;
+  });
+
+  afterEach(() => {
+    if (originalOverride === undefined) {
+      delete process.env.RLM_MIN_LENGTH;
+    } else {
+      process.env.RLM_MIN_LENGTH = originalOverride;
+    }
+  });
+
+  const skipWithRuntimeConfig = (input) => {
+    const config = createConfig(process.env);
+    return shouldSkipRLM(input, config.minInputLength);
+  };
+
+  it('honors an enabled numeric override when the prompt is below it', () => {
+    process.env.RLM_MIN_LENGTH = '30';
+    const prompt = 'x'.repeat(25);
+
+    assert.equal(createConfig(process.env).minInputLength, 30);
+    assert.equal(skipWithRuntimeConfig(prompt).skip, true);
+  });
+
+  it('uses the documented default when the override is disabled by being unset', () => {
+    const prompt = 'x'.repeat(25);
+
+    assert.equal(process.env.RLM_MIN_LENGTH, undefined);
+    assert.equal(createConfig(process.env).minInputLength, DEFAULTS.minInputLength);
+    assert.equal(skipWithRuntimeConfig(prompt).skip, false);
+  });
+
+  it('falls back to the documented default for an invalid override', () => {
+    process.env.RLM_MIN_LENGTH = 'not-a-number';
+    const prompt = 'x'.repeat(25);
+
+    assert.equal(createConfig(process.env).minInputLength, DEFAULTS.minInputLength);
+    assert.equal(skipWithRuntimeConfig(prompt).skip, false);
   });
 });
 
