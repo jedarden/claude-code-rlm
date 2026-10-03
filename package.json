@@ -7,7 +7,7 @@
     "rlm-hook": "./rlm-hook.mjs"
   },
   "scripts": {
-    "test": "node --test test/unit.test.mjs test/preresearch-schema.test.mjs",
+    "test": "node --test test/unit.test.mjs test/preresearch-schema.test.mjs test/config-mode.test.mjs",
     "test:integration": "RUN_INTEGRATION_TESTS=1 node --test test/integration.test.mjs",
     "test:contract": "node --test test/hook-contract.test.mjs",
     "bench": "node bench/benchmark.mjs",

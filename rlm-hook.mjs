@@ -20,6 +20,7 @@ import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { parseLog, aggregate, readLog, defaultLogPath } from './bench/parse-log.mjs';
 import { normalizePreresearch, parsePreresearchResponse } from './preresearch-schema.mjs';
+import { createConfig, selectMode, shouldUseSDK as isSDKConfigured } from './rlm-config.mjs';
 
 // --version flag
 if (process.argv.includes('--version')) {
@@ -85,61 +86,8 @@ if (process.argv.includes('--stats')) {
 }
 
 // Expand leading ~/ to the home directory (Node.js does not do shell tilde expansion)
-const expandTilde = p => (p && p.startsWith('~/')) ? join(homedir(), p.slice(2)) : p;
-
 // Configuration — all values overridable via environment variables
-const CONFIG = {
-  minInputLength: parseInt(process.env.RLM_MIN_LENGTH || '20', 10),
-  maxInputLength: parseInt(process.env.RLM_MAX_LENGTH || '4000', 10),
-  cacheTTL: parseInt(process.env.RLM_CACHE_TTL || '3600', 10), // seconds
-  haikuModel: process.env.RLM_MODEL || 'claude-haiku-4-5-20251001',
-  timeout: parseInt(process.env.RLM_TIMEOUT || '60000', 10), // ms
-  cacheDir: expandTilde(process.env.RLM_CACHE_DIR) || join(homedir(), '.cache', 'rlm-hook'),
-  logFile: expandTilde(process.env.RLM_LOG_FILE) || join(homedir(), '.local', 'share', 'rlm-hook', 'rlm-hook.log'),
-  // Metrics JSONL log (Phase 5): one JSON line per hook outcome for the
-  // dashboard. Same dir family as logFile; best-effort write, never blocks.
-  metricsFile: expandTilde(process.env.RLM_METRICS_FILE) || join(homedir(), '.local', 'share', 'rlm-hook', 'metrics.jsonl'),
-  // Agentic mode: allow Haiku to use tools (Read, Glob, Grep, Write, Bash) to explore the codebase
-  agenticMode: process.env.RLM_AGENTIC_MODE !== 'false',
-  // Max turns for agentic exploration (each turn = one tool call cycle)
-  maxTurns: parseInt(process.env.RLM_MAX_TURNS || '10', 10),
-  // Fast mode: concise prompt (~3s) vs detailed (~9s). Default: fast
-  fastMode: process.env.RLM_FAST_MODE !== 'false',
-  // Context gathering: detect project type, git state, recent files
-  gatherContext: process.env.RLM_GATHER_CONTEXT !== 'false',
-  // SDK-Direct mode (Phase 2): call the Anthropic API directly instead of the
-  // `claude` subprocess. Requires RLM_USE_SDK=true AND ANTHROPIC_API_KEY set —
-  // otherwise we fall back to the subprocess path (unchanged behavior).
-  useSDK: process.env.RLM_USE_SDK === 'true',
-  apiKey: process.env.ANTHROPIC_API_KEY || null,
-  sdkMaxTokens: parseInt(process.env.RLM_SDK_MAX_TOKENS || '2048', 10),
-  // Semantic caching (Phase 3): reuse a cached analysis when a new prompt is
-  // cosine-similar (not just SHA-256 identical) to a cached one. Gated behind
-  // RLM_SEMANTIC_CACHE=true; default off until embedding latency/quality are
-  // validated. Embeddings come from an OpenAI-compatible endpoint
-  // (text-embedding-3-small) using OPENAI_API_KEY — the Anthropic SDK does not
-  // expose embeddings. Whenever embedding is unavailable or fails, the cache
-  // layer degrades to plain SHA-256 lookup (the hook never breaks).
-  semanticCache: process.env.RLM_SEMANTIC_CACHE === 'true',
-  semanticThreshold: parseFloat(process.env.RLM_SEMANTIC_THRESHOLD || '0.92'),
-  embedModel: process.env.RLM_EMBED_MODEL || 'text-embedding-3-small',
-  embedApiKey: process.env.OPENAI_API_KEY || null,
-  embedBaseUrl: process.env.RLM_EMBED_BASE_URL || 'https://api.openai.com/v1',
-  // Conversation context awareness (Phase 4): how many of the most recent prior
-  // RLM blocks to look back over when deciding whether the current intent/files
-  // were already explored. Always-on optimization (no enable gate); only the
-  // look-back depth is tunable.
-  contextWindow: parseInt(process.env.RLM_CONTEXT_WINDOW || '5', 10),
-  // Debug mode
-  debug: process.env.RLM_DEBUG === 'true',
-  // Session resume (ADR-001): warm Haiku sessions across cache-miss turns.
-  // Opt-in feature gated behind RLM_SESSION_RESUME=true to validate latency/cost
-  // before making it default. Derives a stable session UUID from transcript_path.
-  sessionResume: process.env.RLM_SESSION_RESUME === 'true',
-  // Max turns per resumed session before starting fresh (bounds history growth).
-  // Default 20 turns per ADR-001's Consequences section.
-  sessionResumeMaxTurns: parseInt(process.env.RLM_SESSION_RESUME_MAX_TURNS || '20', 10),
-};
+const CONFIG = createConfig();
 
 // =============================================================================
 // LOGGING
@@ -165,8 +113,7 @@ async function log(message) {
 // mirroring the precedence the SDK dispatch / formatOutput use: agentic wins,
 // else fast vs detailed.
 function currentMode() {
-  if (CONFIG.agenticMode) return 'agentic';
-  return CONFIG.fastMode ? 'fast' : 'detailed';
+  return selectMode(CONFIG);
 }
 
 // Append one JSON line to the metrics JSONL log. Bullet-proof exactly like
@@ -1149,10 +1096,6 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
  * API key is present. Anything else routes through the subprocess path so the
  * hook keeps working with a bare Max subscription (no key on disk).
  */
-function shouldUseSDK() {
-  return CONFIG.useSDK && !!CONFIG.apiKey;
-}
-
 /**
  * extractSDKText — concatenate the text from an Anthropic Messages response.
  * The API returns `content` as an array of typed blocks; we want only the
@@ -2107,7 +2050,7 @@ async function main() {
     // the subprocess entirely — both are single-turn, tool-free calls that differ
     // only in the prompt. On any SDK error, fall through to the subprocess so the
     // hook never breaks just because the SDK/key path is misconfigured.
-    if (shouldUseSDK() && !CONFIG.agenticMode) {
+    if (isSDKConfigured(CONFIG) && !CONFIG.agenticMode) {
       const label = CONFIG.fastMode ? 'fast' : 'detailed';
       try {
         response = CONFIG.fastMode
@@ -2123,7 +2066,7 @@ async function main() {
     // SDK-Direct agentic path (Phase 2, Unit 5): drive the tool-use loop directly
     // instead of spawning the CLI. Cleans up its own pid-scoped scratch file. On
     // any SDK error, fall through to the subprocess path below.
-    if (response === null && shouldUseSDK() && CONFIG.agenticMode) {
+    if (response === null && isSDKConfigured(CONFIG) && CONFIG.agenticMode) {
       try {
         response = await callHaikuAgenticSDK(prompt, CONFIG.apiKey, cwd);
         await log('Used SDK-Direct agentic path');
