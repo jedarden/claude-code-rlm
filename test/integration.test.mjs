@@ -13,7 +13,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -476,7 +476,124 @@ describe('Cache round-trip', { timeout: 10000 }, () => {
 });
 
 // ---------------------------------------------------------------------------
-// 8. RLM_DEBUG=true
+// 8. SHA cache TTL and corruption handling
+//
+// Cache reads are deliberately best-effort: an expired or malformed entry,
+// or an unavailable cache directory, must never prevent the normal Haiku path
+// from running or make the hook return a failure status.
+// ---------------------------------------------------------------------------
+
+describe('SHA cache TTL and corruption handling', { timeout: 10000 }, () => {
+  const cachedAnalysis = {
+    intent: 'cached_sha',
+    tasks: ['Use the exact cached result'],
+    approach: 'Return the SHA cache entry without invoking Haiku',
+  };
+
+  it('uses a fresh SHA entry and skips normal processing', async () => {
+    const cacheDir = join(tmpdir(), `rlm-sha-hit-${Date.now()}`);
+    const traceFile = join(cacheDir, 'claude-trace.log');
+    const prompt = 'Use the fresh SHA cache entry for this integration test.';
+    const key = cacheKey(prompt);
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(join(cacheDir, `${key}.json`), JSON.stringify(cachedAnalysis));
+
+    try {
+      const result = await spawnHook(JSON.stringify({ prompt }), {
+        cacheDir,
+        env: { RLM_CLAUDE_TRACE_FILE: traceFile },
+      });
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /Use the exact cached result/);
+      assert.equal(await readTextOrEmpty(traceFile), '', 'a fresh SHA hit must not invoke Haiku');
+    } finally {
+      await rm(cacheDir, { recursive: true, force: true });
+    }
+  });
+
+  it('lazily evicts expired entries and falls through to normal processing', async () => {
+    const cacheDir = join(tmpdir(), `rlm-sha-expired-${Date.now()}`);
+    const traceFile = join(cacheDir, 'claude-trace.log');
+    const prompt = 'Replace the expired SHA cache entry in this integration test.';
+    const key = cacheKey(prompt);
+    const cacheFile = join(cacheDir, `${key}.json`);
+    const orphanedEmbedding = join(cacheDir, `${key}.embedding`);
+    const expiredAt = new Date(Date.now() - 10_000);
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(cacheFile, JSON.stringify({ ...cachedAnalysis, tasks: ['Expired result'] }));
+    await writeFile(orphanedEmbedding, Buffer.from([0, 0, 0, 0]));
+    await utimes(cacheFile, expiredAt, expiredAt);
+
+    try {
+      const result = await spawnHook(JSON.stringify({ prompt }), {
+        cacheDir,
+        env: {
+          RLM_CACHE_TTL: '1',
+          RLM_CLAUDE_TRACE_FILE: traceFile,
+        },
+      });
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /Follow existing codebase patterns/);
+      assert.doesNotMatch(result.stdout, /Expired result/);
+      assert.equal((await readTextOrEmpty(traceFile)).trim(), 'invoked');
+      assert.ok((await stat(cacheFile)).mtimeMs > expiredAt.getTime(), 'normal processing must repopulate the expired key');
+      await assert.rejects(() => readFile(orphanedEmbedding), /ENOENT/);
+    } finally {
+      await rm(cacheDir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats malformed cache JSON as a miss and replaces it with normal output', async () => {
+    const cacheDir = join(tmpdir(), `rlm-sha-malformed-${Date.now()}`);
+    const traceFile = join(cacheDir, 'claude-trace.log');
+    const prompt = 'Recover from malformed SHA cache JSON in this integration test.';
+    const key = cacheKey(prompt);
+    const cacheFile = join(cacheDir, `${key}.json`);
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(cacheFile, '{ this is not valid JSON');
+
+    try {
+      const result = await spawnHook(JSON.stringify({ prompt }), {
+        cacheDir,
+        env: { RLM_CLAUDE_TRACE_FILE: traceFile },
+      });
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /Follow existing codebase patterns/);
+      assert.equal((await readTextOrEmpty(traceFile)).trim(), 'invoked');
+      assert.equal(JSON.parse(await readFile(cacheFile, 'utf8')).approach, 'Follow existing codebase patterns');
+    } finally {
+      await rm(cacheDir, { recursive: true, force: true });
+    }
+  });
+
+  it('continues through an unreadable cache directory without blocking the hook', async () => {
+    const cacheDir = join(tmpdir(), `rlm-sha-unreadable-${Date.now()}`);
+    const traceFile = join(tmpdir(), `rlm-sha-unreadable-trace-${Date.now()}`);
+    const prompt = 'Continue normal processing when the SHA cache is unreadable.';
+    await mkdir(cacheDir, { recursive: true });
+    await chmod(cacheDir, 0o000);
+
+    try {
+      const result = await spawnHook(JSON.stringify({ prompt }), {
+        cacheDir,
+        env: { RLM_CLAUDE_TRACE_FILE: traceFile },
+      });
+
+      assert.equal(result.code, 0);
+      assert.equal((await readTextOrEmpty(traceFile)).trim(), 'invoked', 'cache read failure must fall through to Haiku');
+    } finally {
+      await chmod(cacheDir, 0o700);
+      await rm(cacheDir, { recursive: true, force: true });
+      await rm(traceFile, { force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. RLM_DEBUG=true
 // ---------------------------------------------------------------------------
 
 describe('RLM_DEBUG=true', { timeout: 5000 }, () => {
@@ -490,7 +607,7 @@ describe('RLM_DEBUG=true', { timeout: 5000 }, () => {
 });
 
 // ---------------------------------------------------------------------------
-// 9. Empty prompt
+// 10. Empty prompt
 // ---------------------------------------------------------------------------
 
 describe('Empty prompt', { timeout: 5000 }, () => {
@@ -502,7 +619,7 @@ describe('Empty prompt', { timeout: 5000 }, () => {
 });
 
 // ---------------------------------------------------------------------------
-// 10. Concurrent safety
+// 11. Concurrent safety
 // ---------------------------------------------------------------------------
 
 describe('Concurrent safety', { timeout: 15000 }, () => {
