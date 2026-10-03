@@ -66,8 +66,9 @@ function shouldSkipRLM(input, minInputLength = 20) {
 /**
  * getCacheKey — SHA-256 hex digest of the input string.
  */
-function getCacheKey(input) {
-  return createHash('sha256').update(input).digest('hex');
+function getCacheKey(input, cwd) {
+  const scopedInput = arguments.length > 1 ? input + '\\0' + (cwd || '') : input;
+  return createHash('sha256').update(scopedInput).digest('hex');
 }
 
 /**
@@ -3609,6 +3610,34 @@ function currentMode_copy(cfg) {
   return cfg.fastMode ? 'fast' : 'detailed';
 }
 
+// Faithful copies of the hook's usage helpers. SDK responses carry exact
+// usage; text subprocess responses fall back to a four-characters-per-token
+// estimate so both paths can populate the same metric field.
+function extractSDKUsage_copy(response) {
+  if (!response || typeof response !== 'object') return null;
+  const usage = response.usage;
+  if (!usage || typeof usage !== 'object') return null;
+  const input = usage.input_tokens;
+  const output = usage.output_tokens;
+  if (typeof input === 'number' && Number.isFinite(input) && input >= 0 &&
+      typeof output === 'number' && Number.isFinite(output) && output >= 0) {
+    return { input_tokens: input, output_tokens: output };
+  }
+  return null;
+}
+
+function estimateTokenUsage_copy(inputText, outputText) {
+  const estimate = (value) => typeof value === 'string' ? Math.ceil(value.length / 4) : 0;
+  return { input_tokens: estimate(inputText), output_tokens: estimate(outputText) };
+}
+
+function metricTokenEstimate_copy(response, prompt) {
+  const exact = extractSDKUsage_copy(response);
+  if (exact) return exact;
+  const output = typeof response === 'string' ? response : response?.text;
+  return estimateTokenUsage_copy(prompt, output);
+}
+
 describe('Group 24: Metrics JSONL append (Phase 5)', () => {
   let testDir;
 
@@ -3690,6 +3719,32 @@ describe('Group 24: Metrics JSONL append (Phase 5)', () => {
     assert.equal(currentMode_copy({ agenticMode: true, fastMode: false }), 'agentic');
     assert.equal(currentMode_copy({ agenticMode: false, fastMode: true }), 'fast');
     assert.equal(currentMode_copy({ agenticMode: false, fastMode: false }), 'detailed');
+  });
+
+  it('preserves token_estimate fields and prefers exact SDK usage', async () => {
+    const metricsFile = join(testDir, 'metrics.jsonl');
+    const tokenEstimate = metricTokenEstimate_copy(
+      { text: 'ignored', usage: { input_tokens: 17, output_tokens: 8 } },
+      'prompt text'
+    );
+    await appendMetric_copy(
+      { event: 'complete', cache_hit: false, token_estimate: tokenEstimate },
+      { metricsFile, writeImpl: realAppend, now: () => 10 }
+    );
+    const rec = JSON.parse((await readFile(metricsFile, 'utf-8')).trim());
+    assert.deepEqual(rec.token_estimate, { input_tokens: 17, output_tokens: 8 });
+  });
+
+  it('estimates token usage for text subprocess responses', () => {
+    assert.deepEqual(
+      metricTokenEstimate_copy('12345', '123456789'),
+      { input_tokens: 3, output_tokens: 2 }
+    );
+    assert.deepEqual(
+      metricTokenEstimate_copy({ text: '1234', usage: { input_tokens: -1, output_tokens: 2 } }, '12345678'),
+      { input_tokens: 2, output_tokens: 1 },
+      'invalid SDK usage falls back without throwing'
+    );
   });
 });
 
@@ -3898,6 +3953,31 @@ describe('Group 25: Metrics log parse & aggregate (Phase 5)', () => {
     assert.ok(agg.days[1].estimated_cost_usd > 0);
     assert.ok(agg.overall.estimated_cost_usd > 0);
     assert.equal(aggregate([]).overall.estimated_cost_usd, null);
+  });
+
+  it('sums token totals per day and overall, with null when usage is absent', () => {
+    const agg = aggregate([
+      metricRec('2026-06-23', '01:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: 100, output_tokens: 20 },
+      }),
+      metricRec('2026-06-23', '02:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: 50, output_tokens: 5 },
+      }),
+      metricRec('2026-06-24', '01:00:00', { event: 'skip' }),
+    ]);
+    assert.deepEqual(agg.days[0].token_totals, {
+      input_tokens: 150,
+      output_tokens: 25,
+      total_tokens: 175,
+    });
+    assert.equal(agg.days[1].token_totals, null);
+    assert.deepEqual(agg.overall.token_totals, {
+      input_tokens: 150,
+      output_tokens: 25,
+      total_tokens: 175,
+    });
   });
 
   it('latency block of an empty/latency-less set reports nulls, not throws', () => {
@@ -4234,5 +4314,99 @@ describe('Group 27: Session Resume (ADR-001)', () => {
 
     assert.equal(state1.turns, 10);
     assert.equal(state2.turns, 15);
+  });
+});
+
+// =============================================================================
+// Group 21: --stats flag (Phase 5, Unit 2 CLI integration)
+// =============================================================================
+
+describe('Group 21: --stats flag CLI integration', () => {
+  let testDir;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `rlm-stats-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  /**
+   * Test that --stats flag produces compact terminal output.
+   * We spawn the hook as a subprocess with --stats and capture stdout.
+   */
+
+  it('--stats flag prints compact summary with all required fields', async () => {
+    const testMetricsDir = join(tmpdir(), 'rlm-stats-test-' + Date.now());
+    await mkdir(testMetricsDir, { recursive: true });
+
+    // Write a small metrics JSONL file with known values
+    const metricsPath = join(testMetricsDir, 'metrics.jsonl');
+    const testRecords = [
+      { ts: Date.now(), event: 'complete', cache_hit: false, mode: 'agentic', latency_ms: 1234, reason: null },
+      { ts: Date.now() - 1000, event: 'skip', cache_hit: false, mode: 'fast', latency_ms: 20, reason: 'Input too short' },
+      { ts: Date.now() - 2000, event: 'skip', cache_hit: false, mode: 'fast', latency_ms: 15, reason: 'Input too short' },
+      { ts: Date.now() - 3000, event: 'cache_hit', cache_hit: true, mode: 'agentic', latency_ms: 40, reason: null },
+      { ts: Date.now() - 4000, event: 'complete', cache_hit: false, mode: 'detailed', latency_ms: 856, reason: null },
+    ];
+    await writeFile(metricsPath, testRecords.map(r => JSON.stringify(r)).join('\n') + '\n');
+
+    // Spawn rlm-hook.mjs with --stats and custom RLM_METRICS_FILE
+    // Use the current working directory (the project root) so rlm-hook.mjs can be found
+    const result = execSync(
+      `RLM_METRICS_FILE="${metricsPath}" node rlm-hook.mjs --stats`,
+      { cwd: process.cwd(), encoding: 'utf-8' }
+    );
+
+    // Verify expected fields are present
+    assert.match(result, /RLM Hook Metrics Summary/);
+    assert.match(result, /Total events:/);
+    assert.match(result, /Cache hit rate:/);
+    assert.match(result, /Skip rate:/);
+    assert.match(result, /Top skip reasons:/);
+    assert.match(result, /Input too short:/);
+    assert.match(result, /Error rate:/);
+    assert.match(result, /Latency p50:/);
+    assert.match(result, /Latency p95:/);
+    assert.match(result, /Per-mode breakdown:/);
+    assert.match(result, /agentic:/);
+    assert.match(result, /fast:/);
+    assert.match(result, /detailed:/);
+
+    // Cleanup
+    await rm(testMetricsDir, { recursive: true, force: true });
+  });
+
+  it('--stats flag handles empty metrics file gracefully', async () => {
+    const testMetricsDir = join(tmpdir(), 'rlm-stats-empty-' + Date.now());
+    await mkdir(testMetricsDir, { recursive: true });
+
+    const metricsPath = join(testMetricsDir, 'empty-metrics.jsonl');
+    await writeFile(metricsPath, '');
+
+    const result = execSync(
+      `RLM_METRICS_FILE="${metricsPath}" node rlm-hook.mjs --stats`,
+      { cwd: process.cwd(), encoding: 'utf-8' }
+    );
+
+    assert.match(result, /Total events: 0/);
+    assert.match(result, /Cache hit rate: 0.0%/);
+    assert.match(result, /Skip rate: 0.0%/);
+
+    await rm(testMetricsDir, { recursive: true, force: true });
+  });
+
+  it('--stats flag handles missing metrics file gracefully', async () => {
+    const testMetricsDir = join(tmpdir(), 'rlm-stats-missing-' + Date.now());
+    await mkdir(testMetricsDir, { recursive: true });
+
+    const metricsPath = join(testMetricsDir, 'nonexistent.jsonl');
+
+    const result = execSync(
+      `RLM_METRICS_FILE="${metricsPath}" node rlm-hook.mjs --stats`,
+      { cwd: process.cwd(), encoding: 'utf-8' }
+    );
+
+    assert.match(result, /Total events: 0/);
+
+    await rm(testMetricsDir, { recursive: true, force: true });
   });
 });

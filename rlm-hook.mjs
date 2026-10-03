@@ -1122,10 +1122,41 @@ function extractSDKUsage(response) {
   const input = usage.input_tokens;
   const output = usage.output_tokens;
   if (typeof input === 'number' && Number.isFinite(input) &&
-      typeof output === 'number' && Number.isFinite(output)) {
+      input >= 0 && typeof output === 'number' && Number.isFinite(output) &&
+      output >= 0) {
     return { input_tokens: input, output_tokens: output };
   }
   return null;
+}
+
+/**
+ * estimateTokenUsage — conservative fallback for the text subprocess path.
+ * The CLI's text output has no usage envelope, so estimate four characters per
+ * token. This is intentionally best-effort: exact SDK usage wins whenever it
+ * is available, and a missing estimate must never affect hook behavior.
+ */
+function estimateTokenUsage(inputText, outputText) {
+  const estimate = (value) => typeof value === 'string' ? Math.ceil(value.length / 4) : 0;
+  return {
+    input_tokens: estimate(inputText),
+    output_tokens: estimate(outputText),
+  };
+}
+
+/**
+ * metricTokenEstimate — prefer exact Anthropic usage, otherwise estimate from
+ * the prompt and returned text. Responses from SDK calls are `{ text, usage }`;
+ * the subprocess returns its text directly.
+ */
+function metricTokenEstimate(response, prompt) {
+  const exact = extractSDKUsage(response);
+  if (exact) return exact;
+  const output = typeof response === 'string' ? response : response?.text;
+  return estimateTokenUsage(prompt, output);
+}
+
+function responseText(response) {
+  return typeof response === 'string' ? response : response?.text || '';
 }
 
 /**
@@ -1437,6 +1468,7 @@ async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch 
   let lastText = '';
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let usageSeen = false;
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
     const response = await c.messages.create({
@@ -1452,6 +1484,7 @@ async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch 
     // Accumulate usage across turns
     const usage = extractSDKUsage(response);
     if (usage) {
+      usageSeen = true;
       totalInputTokens += usage.input_tokens;
       totalOutputTokens += usage.output_tokens;
     }
@@ -1460,7 +1493,7 @@ async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch 
       await log(`Haiku SDK (agentic) completed in ${Date.now() - startTime}ms over ${turn + 1} turn(s)`);
       return {
         text: text || lastText,
-        usage: (totalInputTokens > 0 || totalOutputTokens > 0)
+        usage: usageSeen
           ? { input_tokens: totalInputTokens, output_tokens: totalOutputTokens }
           : null,
       };
@@ -1481,7 +1514,7 @@ async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch 
   await log(`Haiku SDK (agentic) hit turn cap (${CONFIG.maxTurns}) in ${Date.now() - startTime}ms`);
   return {
     text: lastText,
-    usage: (totalInputTokens > 0 || totalOutputTokens > 0)
+    usage: usageSeen
       ? { input_tokens: totalInputTokens, output_tokens: totalOutputTokens }
       : null,
   };
@@ -1929,6 +1962,7 @@ async function main() {
   // input_len even if stdin parsing failed.
   const start = Date.now();
   let userMessage = '';
+  let tokenEstimate = null;
   // Sugar over appendMetric: stamps latency/mode/input_len for every exit point.
   const recordMetric = (event, cache_hit, extra = {}) =>
     appendMetric({
@@ -2107,11 +2141,15 @@ async function main() {
     }
 
     // Parse and validate
-    const analysis = normalizePreresearch(parseHaikuResponse(response));
+    tokenEstimate = metricTokenEstimate(response, prompt);
+    const analysis = normalizePreresearch(parseHaikuResponse(responseText(response)));
 
     if (analysis.skip_rlm || analysis.skip) {
       await log(`RLM skipped by Haiku: ${analysis.skip_reason || analysis.reason}`);
-      await recordMetric('haiku_skip', false, { reason: analysis.skip_reason || analysis.reason });
+      await recordMetric('haiku_skip', false, {
+        reason: analysis.skip_reason || analysis.reason,
+        token_estimate: tokenEstimate,
+      });
       process.exit(0);
     }
 
@@ -2122,10 +2160,13 @@ async function main() {
     console.log(formatOutput(analysis));
 
     await log('RLM analysis complete');
-    await recordMetric('complete', false);
+    await recordMetric('complete', false, { token_estimate: tokenEstimate });
   } catch (error) {
     await log(`ERROR: ${String(error?.message ?? error)}`);
-    await recordMetric('error', false, { reason: String(error?.message ?? error) });
+    await recordMetric('error', false, {
+      reason: String(error?.message ?? error),
+      ...(tokenEstimate ? { token_estimate: tokenEstimate } : {}),
+    });
     // Always exit 0 — never block the user's conversation
     process.exit(0);
   }

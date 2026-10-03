@@ -4,7 +4,7 @@
  *
  * Reads the JSONL metrics log written by rlm-hook.mjs (`appendMetric`) and
  * aggregates it into per-UTC-day stats: total events, hit rate, skip rate
- * (+ per-reason breakdown), error rate, and latency P50/P95/P99.
+ * (+ per-reason breakdown), error rate, latency P50/P95/P99, and token totals.
  *
  * Dependency-free — Node built-ins only.
  *
@@ -70,7 +70,7 @@ export function percentile(values, p) {
  * @param {object[]} records
  * @returns {object} { total, hits, hit_rate, skips, skip_rate, skip_reasons,
  *                     errors, error_rate, events, modes, latency,
- *                     estimated_cost_usd }
+ *                     token_totals, estimated_cost_usd }
  */
 export function summarize(records) {
   const list = Array.isArray(records) ? records : [];
@@ -84,6 +84,8 @@ export function summarize(records) {
   const latencies = [];
   let estimatedCostUsd = 0;
   let tokenEstimateCount = 0;
+  let inputTokenTotal = 0;
+  let outputTokenTotal = 0;
 
   for (const r of list) {
     if (!r || typeof r !== 'object') continue;
@@ -120,6 +122,8 @@ export function summarize(records) {
       estimatedCostUsd +=
         tokenEstimate.input_tokens * HAIKU_PRICING_USD_PER_TOKEN.input +
         tokenEstimate.output_tokens * HAIKU_PRICING_USD_PER_TOKEN.output;
+      inputTokenTotal += tokenEstimate.input_tokens;
+      outputTokenTotal += tokenEstimate.output_tokens;
       tokenEstimateCount++;
     }
   }
@@ -135,6 +139,13 @@ export function summarize(records) {
     error_rate: total ? errors / total : 0,
     events,
     modes,
+    token_totals: tokenEstimateCount
+      ? {
+          input_tokens: inputTokenTotal,
+          output_tokens: outputTokenTotal,
+          total_tokens: inputTokenTotal + outputTokenTotal,
+        }
+      : null,
     estimated_cost_usd: tokenEstimateCount ? estimatedCostUsd : null,
     latency: {
       count: latencies.length,
