@@ -13,7 +13,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -513,7 +513,125 @@ describe('Skip-detection boundaries', { timeout: 10000 }, () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. Very long input truncation
+// 7. Skip detection and cache interaction
+//
+// Skip detection runs before both exact and semantic cache lookups. These
+// process-boundary cases verify that ordering does not leave a skipped prompt
+// in the cache, or interfere with the normal miss/write/hit lifecycle for a
+// neighboring eligible prompt that shares the same cache directory.
+// ---------------------------------------------------------------------------
+
+describe('Skip detection and cache interaction', { timeout: 10000 }, () => {
+  const SKIPPED_PROMPT = 'git status --short --branch';
+  const ELIGIBLE_PROMPT =
+    'Explain how to add regression tests for the cache interaction flow.';
+
+  it('does not create or reuse an RLM cache result for a skipped prompt', async () => {
+    const cacheDir = join(tmpdir(), `rlm-skip-cache-${Date.now()}-${Math.random()}`);
+    const traceFile = join(tmpdir(), `rlm-skip-cache-trace-${Date.now()}-${Math.random()}`);
+    const key = cacheKey(SKIPPED_PROMPT);
+    const cacheFile = join(cacheDir, `${key}.json`);
+    const cachedResult = {
+      intent: 'cached-skip-result-must-not-be-used',
+      summary: 'This result must remain unread by skip detection',
+    };
+
+    await mkdir(cacheDir, { recursive: true });
+    try {
+      const withoutCache = await spawnHook(JSON.stringify({ prompt: SKIPPED_PROMPT }), {
+        cacheDir,
+        env: {
+          RLM_CLAUDE_TRACE_FILE: traceFile,
+          RLM_SEMANTIC_CACHE: 'false',
+        },
+      });
+
+      assert.equal(withoutCache.code, 0);
+      assert.equal(withoutCache.stdout, '', 'a skipped prompt must not produce output');
+      assert.deepEqual(await readdir(cacheDir), [], 'skip detection must not create a cache entry');
+      assert.equal(await readTextOrEmpty(traceFile), '', 'skip detection must not invoke Haiku');
+
+      const serialized = JSON.stringify(cachedResult);
+      await writeFile(cacheFile, serialized);
+
+      const withCache = await spawnHook(JSON.stringify({ prompt: SKIPPED_PROMPT }), {
+        cacheDir,
+        env: {
+          RLM_CLAUDE_TRACE_FILE: traceFile,
+          RLM_SEMANTIC_CACHE: 'false',
+        },
+      });
+
+      assert.equal(withCache.code, 0);
+      assert.equal(withCache.stdout, '', 'a skipped prompt must not reuse a matching cache entry');
+      assert.equal(await readFile(cacheFile, 'utf8'), serialized, 'skip detection must leave the entry untouched');
+      assert.equal(await readTextOrEmpty(traceFile), '', 'a skipped prompt must not fall through to Haiku');
+    } finally {
+      await rm(cacheDir, { recursive: true, force: true });
+      await rm(traceFile, { force: true });
+    }
+  });
+
+  it('preserves the eligible prompt miss/write/hit lifecycle after a skip', async () => {
+    const cacheDir = join(tmpdir(), `rlm-skip-then-cache-${Date.now()}-${Math.random()}`);
+    const skipTrace = join(tmpdir(), `rlm-skip-then-cache-skip-${Date.now()}-${Math.random()}`);
+    const missTrace = join(tmpdir(), `rlm-skip-then-cache-miss-${Date.now()}-${Math.random()}`);
+    const hitTrace = join(tmpdir(), `rlm-skip-then-cache-hit-${Date.now()}-${Math.random()}`);
+    const skippedKey = cacheKey(SKIPPED_PROMPT);
+    const eligibleKey = cacheKey(ELIGIBLE_PROMPT);
+
+    assert.notEqual(skippedKey, eligibleKey, 'skip and eligible prompts must have distinct cache keys');
+    await mkdir(cacheDir, { recursive: true });
+    try {
+      const skipped = await spawnHook(JSON.stringify({ prompt: SKIPPED_PROMPT }), {
+        cacheDir,
+        env: {
+          RLM_CLAUDE_TRACE_FILE: skipTrace,
+          RLM_SEMANTIC_CACHE: 'false',
+        },
+      });
+      assert.equal(skipped.code, 0);
+      assert.equal(skipped.stdout, '');
+      assert.deepEqual(await readdir(cacheDir), [], 'a skipped turn must not poison the shared cache');
+
+      const miss = await spawnHook(JSON.stringify({ prompt: ELIGIBLE_PROMPT }), {
+        cacheDir,
+        env: {
+          RLM_CLAUDE_TRACE_FILE: missTrace,
+          RLM_SEMANTIC_CACHE: 'false',
+        },
+      });
+      assert.equal(miss.code, 0);
+      assert.match(miss.stdout, /code_writing/, 'the eligible prompt must reach the analyzer on its first call');
+      assert.equal((await readTextOrEmpty(missTrace)).trim(), 'invoked');
+      assert.deepEqual(await readdir(cacheDir), [`${eligibleKey}.json`]);
+
+      const hit = await spawnHook(JSON.stringify({ prompt: ELIGIBLE_PROMPT }), {
+        cacheDir,
+        env: {
+          RLM_CLAUDE_TRACE_FILE: hitTrace,
+          RLM_SEMANTIC_CACHE: 'false',
+        },
+      });
+      assert.equal(hit.code, 0);
+      assert.match(hit.stdout, /code_writing/, 'the eligible prompt must reuse its cached analysis');
+      assert.equal(await readTextOrEmpty(hitTrace), '', 'an exact cache hit must skip Haiku');
+      assert.equal(await readTextOrEmpty(skipTrace), '', 'the skipped turn must never invoke Haiku');
+      assert.deepEqual(await readdir(cacheDir), [`${eligibleKey}.json`]);
+      assert.equal(await readFile(join(cacheDir, `${skippedKey}.json`), 'utf8').catch(() => null), null);
+    } finally {
+      await rm(cacheDir, { recursive: true, force: true });
+      await Promise.all([
+        rm(skipTrace, { force: true }),
+        rm(missTrace, { force: true }),
+        rm(hitTrace, { force: true }),
+      ]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Very long input truncation
 // ---------------------------------------------------------------------------
 
 describe('Very long input truncation', { timeout: 5000 }, () => {
