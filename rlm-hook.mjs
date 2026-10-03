@@ -2196,7 +2196,7 @@ async function main() {
       await log(`RLM skipped by Haiku: ${analysis.skip_reason || analysis.reason}`);
       await recordMetric('haiku_skip', false, {
         reason: analysis.skip_reason || analysis.reason,
-        token_estimate: tokenEstimate,
+        ...(tokenEstimate ? { token_estimate: tokenEstimate } : {}),
       });
       process.exit(0);
     }

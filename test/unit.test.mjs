@@ -3853,6 +3853,18 @@ function completeMetricFields_copy(tokenEstimate) {
   return tokenEstimate ? { token_estimate: tokenEstimate } : {};
 }
 
+// Faithful copy of the token-related portion of main()'s metric exits. Cache
+// and pre-Haiku skip exits never receive a response, while Haiku skip,
+// complete, and error exits include usage only when capture succeeded.
+function metricExit_copy(event, cacheHit, { tokenEstimate = null, ...extra } = {}) {
+  return {
+    event,
+    cache_hit: cacheHit,
+    ...extra,
+    ...completeMetricFields_copy(tokenEstimate),
+  };
+}
+
 describe('Group 24: Metrics JSONL append (Phase 5)', () => {
   let testDir;
 
@@ -3977,6 +3989,85 @@ describe('Group 24: Metrics JSONL append (Phase 5)', () => {
     );
     assert.equal(metricTokenEstimate_copy({ text: '1234' }, '12345678'), null,
       'missing SDK usage is omitted without throwing');
+  });
+
+  it('keeps SDK, subprocess, and absent usage cases distinct', async () => {
+    const metricsFile = join(testDir, 'metrics.jsonl');
+    const cases = [
+      {
+        event: 'complete',
+        response: { text: '{"intent":"code_writing"}', usage: { input_tokens: 41, output_tokens: 13 } },
+        expected: { input_tokens: 41, output_tokens: 13 },
+      },
+      {
+        event: 'complete',
+        response: '{"intent":"code_writing"}',
+        prompt: '123456789',
+        expected: { input_tokens: 3, output_tokens: 7 },
+      },
+      {
+        event: 'complete',
+        response: { text: '{"intent":"code_writing"}' },
+        expected: null,
+      },
+      { event: 'skip', response: null, expected: null },
+    ];
+
+    for (const [index, testCase] of cases.entries()) {
+      const tokenEstimate = metricTokenEstimate_copy(testCase.response, testCase.prompt || 'prompt');
+      assert.deepEqual(tokenEstimate, testCase.expected, `${testCase.event} usage shape`);
+      await appendMetric_copy(
+        metricExit_copy(testCase.event, false, { tokenEstimate }),
+        { metricsFile, writeImpl: realAppend, now: () => index + 1 }
+      );
+    }
+
+    const records = (await readFile(metricsFile, 'utf-8')).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(records.map((record) => record.token_estimate ?? null), [
+      { input_tokens: 41, output_tokens: 13 },
+      { input_tokens: 3, output_tokens: 7 },
+      null,
+      null,
+    ]);
+    assert.equal(Object.hasOwn(records[2], 'token_estimate'), false,
+      'an SDK response without usage omits the field rather than writing null');
+  });
+
+  it('omits usage on cache and pre-Haiku skip exits, but keeps usable Haiku-skip usage', async () => {
+    const metricsFile = join(testDir, 'metrics.jsonl');
+    const exact = { input_tokens: 19, output_tokens: 4 };
+    const metrics = [
+      metricExit_copy('skip', false, { reason: 'Input too short' }),
+      metricExit_copy('cache_hit', true, { source: 'sha' }),
+      metricExit_copy('haiku_skip', false, { reason: 'No repository work', tokenEstimate: null }),
+      metricExit_copy('haiku_skip', false, { reason: 'No repository work', tokenEstimate: exact }),
+    ];
+    for (const [index, metric] of metrics.entries()) {
+      await appendMetric_copy(metric, { metricsFile, writeImpl: realAppend, now: () => index + 1 });
+    }
+
+    const written = (await readFile(metricsFile, 'utf-8')).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(written.map((record) => record.token_estimate ?? null), [null, null, null, exact]);
+    assert.equal(Object.hasOwn(written[0], 'token_estimate'), false);
+    assert.equal(Object.hasOwn(written[1], 'token_estimate'), false);
+    assert.equal(Object.hasOwn(written[2], 'token_estimate'), false);
+  });
+
+  it('treats a throwing SDK usage getter as unavailable without breaking the metric write', async () => {
+    const response = { text: '{"intent":"code_writing"}' };
+    Object.defineProperty(response, 'usage', {
+      get() { throw new Error('provider usage unavailable'); },
+    });
+    const metricsFile = join(testDir, 'metrics.jsonl');
+    const tokenEstimate = metricTokenEstimate_copy(response, 'prompt');
+    await assert.doesNotReject(
+      appendMetric_copy(
+        metricExit_copy('complete', false, { tokenEstimate }),
+        { metricsFile, writeImpl: realAppend, now: () => 1 }
+      )
+    );
+    const record = JSON.parse((await readFile(metricsFile, 'utf-8')).trim());
+    assert.equal(Object.hasOwn(record, 'token_estimate'), false);
   });
 });
 
@@ -4235,6 +4326,40 @@ describe('Group 25: Metrics log parse & aggregate (Phase 5)', () => {
       input_tokens: 150,
       output_tokens: 25,
       total_tokens: 175,
+    });
+  });
+
+  it('ignores malformed token estimates while retaining valid aggregation totals', () => {
+    const agg = aggregate([
+      metricRec('2026-06-23', '01:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: 100, output_tokens: 20 },
+      }),
+      metricRec('2026-06-23', '02:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: '200', output_tokens: 10 },
+      }),
+      metricRec('2026-06-23', '03:00:00', {
+        event: 'error',
+        token_estimate: { input_tokens: -1, output_tokens: 5 },
+      }),
+      metricRec('2026-06-24', '01:00:00', {
+        event: 'complete',
+        token_estimate: { input_tokens: NaN, output_tokens: 5 },
+      }),
+      metricRec('2026-06-24', '02:00:00', { event: 'skip' }),
+    ]);
+
+    assert.deepEqual(agg.days[0].token_totals, {
+      input_tokens: 100,
+      output_tokens: 20,
+      total_tokens: 120,
+    });
+    assert.equal(agg.days[1].token_totals, null);
+    assert.deepEqual(agg.overall.token_totals, {
+      input_tokens: 100,
+      output_tokens: 20,
+      total_tokens: 120,
     });
   });
 
