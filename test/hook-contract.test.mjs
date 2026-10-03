@@ -12,7 +12,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -43,10 +43,24 @@ async function createEnvironment() {
 
   const capturePath = join(root, 'claude-args.json');
   const fakeClaude = `#!/usr/bin/env node
-const { writeFileSync } = require('node:fs');
+const { mkdirSync, writeFileSync } = require('node:fs');
+const { join } = require('node:path');
+const args = process.argv.slice(2);
 
 if (process.env.FAKE_CLAUDE_CAPTURE) {
-  writeFileSync(process.env.FAKE_CLAUDE_CAPTURE, JSON.stringify(process.argv.slice(2)));
+  writeFileSync(process.env.FAKE_CLAUDE_CAPTURE, JSON.stringify(args));
+}
+
+if (process.env.FAKE_CLAUDE_CREATE_SCRATCH === 'true') {
+  const addDirIndex = args.indexOf('--add-dir');
+  const projectDir = addDirIndex >= 0 ? args[addDirIndex + 1] : null;
+  if (projectDir) {
+    mkdirSync(join(projectDir, '.claude'), { recursive: true });
+    writeFileSync(
+      join(projectDir, '.claude', 'rlm-scratch-' + process.ppid + '.md'),
+      'temporary notes',
+    );
+  }
 }
 
 if (process.env.FAKE_CLAUDE_MODE === 'failure') {
@@ -203,6 +217,58 @@ describe('hook process contract', { timeout: 10000 }, () => {
       assert.match(metrics, /"event":"error"/);
     } finally {
       await destroyEnvironment(environment);
+    }
+  });
+
+  it('uses the narrow agentic allowlist and cleans scratch files on success and failure', async () => {
+    for (const mode of ['success', 'failure']) {
+      const environment = await createEnvironment();
+      try {
+        const projectDir = join(environment.root, 'project');
+        await mkdir(projectDir, { recursive: true });
+        const result = await runHook(
+          JSON.stringify({
+            prompt: `Verify agentic permissions on the ${mode} path and clean scratch safely.`,
+            cwd: projectDir,
+          }),
+          environment,
+          {
+            FAKE_CLAUDE_MODE: mode,
+            FAKE_CLAUDE_CREATE_SCRATCH: 'true',
+          },
+        );
+
+        const args = JSON.parse(await readFile(environment.capturePath, 'utf8'));
+        const allowedToolsIndex = args.indexOf('--allowedTools');
+        assert.notEqual(allowedToolsIndex, -1, `${mode}: allowlist flag must be present`);
+        assert.equal(
+          args[allowedToolsIndex + 1],
+          'Read,Glob,Grep,Write,Bash(git:*),Bash(rm .claude/rlm-scratch-*.md)',
+          `${mode}: only exploration, git, and scoped scratch cleanup are allowed`,
+        );
+        assert.equal(
+          args[args.indexOf('--permission-mode') + 1],
+          'bypassPermissions',
+          `${mode}: hook must use its isolated permission mode`,
+        );
+        assert.equal(args.includes('Edit'), false, `${mode}: Edit must not be allowed`);
+        assert.equal(args.includes('Bash'), false, `${mode}: unrestricted Bash must not be allowed`);
+
+        assert.equal(result.code, 0, `${mode}: hook must degrade to exit 0`);
+        if (mode === 'success') {
+          assert.match(result.stdout, /The hook received and analyzed the user request\./);
+        } else {
+          assert.equal(result.stdout, '', 'failure path must not emit partial context');
+        }
+
+        assert.deepEqual(
+          await readdir(join(projectDir, '.claude')),
+          [],
+          `${mode}: PID-scoped scratch file must be removed after the hook finishes`,
+        );
+      } finally {
+        await destroyEnvironment(environment);
+      }
     }
   });
 });
