@@ -239,8 +239,9 @@ describe('hook process contract', { timeout: 10000 }, () => {
   it('degrades on a failed subprocess with exit code zero and an error log', async () => {
     const environment = await createEnvironment();
     try {
+      const sensitivePrompt = 'Review the failure path; bearer-token=do-not-log-this-value';
       const result = await runHook(
-        JSON.stringify({ prompt: 'Implement graceful subprocess failure handling.' }),
+        JSON.stringify({ prompt: sensitivePrompt }),
         environment,
         { FAKE_CLAUDE_MODE: 'failure' },
       );
@@ -249,12 +250,16 @@ describe('hook process contract', { timeout: 10000 }, () => {
         .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 
       assert.equal(result.code, 0);
+      assert.equal(result.signal, null);
+      assert.equal(result.error, undefined);
       assert.equal(result.stdout, '');
       assert.equal(result.stderr, '');
       assert.match(log, /ERROR: Haiku failed \(exit 42\): synthetic subprocess failure/);
+      assert.equal(log.includes(sensitivePrompt), false, 'error log must not include the user prompt');
       assert.equal(metrics.at(-1).event, 'error');
       assert.equal(metrics.at(-1).cache_hit, false);
       assert.equal(metrics.at(-1).reason, 'Haiku failed (exit 42): synthetic subprocess failure');
+      assert.equal(JSON.stringify(metrics).includes(sensitivePrompt), false, 'error metrics must not include the user prompt');
     } finally {
       await destroyEnvironment(environment);
     }
@@ -263,8 +268,9 @@ describe('hook process contract', { timeout: 10000 }, () => {
   it('degrades on a timed-out subprocess with exit code zero and an error log', async () => {
     const environment = await createEnvironment();
     try {
+      const sensitivePrompt = 'Recover from timeout; session-secret=do-not-log-this-value';
       const result = await runHook(
-        JSON.stringify({ prompt: 'Implement timeout recovery for the hook subprocess.' }),
+        JSON.stringify({ prompt: sensitivePrompt }),
         environment,
         { FAKE_CLAUDE_MODE: 'timeout', RLM_TIMEOUT: '100' },
       );
@@ -272,9 +278,15 @@ describe('hook process contract', { timeout: 10000 }, () => {
       const metrics = await readIfPresent(environment.env.RLM_METRICS_FILE);
 
       assert.equal(result.code, 0);
+      assert.equal(result.signal, null);
+      assert.equal(result.error, undefined);
       assert.equal(result.stdout, '');
+      assert.equal(result.stderr, '');
       assert.match(log, /ERROR: Haiku invocation timed out/);
+      assert.equal(log.includes(sensitivePrompt), false, 'timeout log must not include the user prompt');
       assert.match(metrics, /"event":"error"/);
+      assert.match(metrics, /"reason":"Haiku invocation timed out"/);
+      assert.equal(metrics.includes(sensitivePrompt), false, 'timeout metrics must not include the user prompt');
     } finally {
       await destroyEnvironment(environment);
     }
