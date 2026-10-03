@@ -42,6 +42,7 @@ async function createEnvironment() {
   await mkdir(binDir, { recursive: true });
 
   const capturePath = join(root, 'claude-args.json');
+  const pidPath = join(root, 'claude.pid');
   const fakeClaude = `#!/usr/bin/env node
 const { mkdirSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
@@ -70,6 +71,12 @@ if (process.env.FAKE_CLAUDE_MODE === 'failure') {
 
 if (process.env.FAKE_CLAUDE_MODE === 'timeout') {
   setTimeout(() => {}, 60000);
+} else if (process.env.FAKE_CLAUDE_MODE === 'stubborn-timeout') {
+  if (process.env.FAKE_CLAUDE_PID) {
+    writeFileSync(process.env.FAKE_CLAUDE_PID, String(process.pid));
+  }
+  process.on('SIGTERM', () => {});
+  setTimeout(() => {}, 60000);
 } else {
   process.stdout.write(${JSON.stringify(JSON.stringify(ANALYSIS))});
 }
@@ -80,6 +87,7 @@ if (process.env.FAKE_CLAUDE_MODE === 'timeout') {
     root,
     binDir,
     capturePath,
+    pidPath,
     env: {
       PATH: `${binDir}:${process.env.PATH ?? ''}`,
       RLM_AGENTIC_MODE: 'true',
@@ -89,6 +97,7 @@ if (process.env.FAKE_CLAUDE_MODE === 'timeout') {
       RLM_LOG_FILE: join(root, 'hook.log'),
       RLM_METRICS_FILE: join(root, 'metrics.jsonl'),
       FAKE_CLAUDE_CAPTURE: capturePath,
+      FAKE_CLAUDE_PID: pidPath,
     },
   };
 }
@@ -131,6 +140,25 @@ function runHook(input, environment, extraEnv = {}) {
 
 async function destroyEnvironment(environment) {
   await rm(environment.root, { recursive: true, force: true });
+}
+
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+async function waitForProcessExit(pid, timeout = 1000) {
+  const deadline = Date.now() + timeout;
+  while (isProcessRunning(pid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return true;
 }
 
 describe('hook process contract', { timeout: 10000 }, () => {
@@ -248,6 +276,47 @@ describe('hook process contract', { timeout: 10000 }, () => {
       assert.match(log, /ERROR: Haiku invocation timed out/);
       assert.match(metrics, /"event":"error"/);
     } finally {
+      await destroyEnvironment(environment);
+    }
+  });
+
+  it('kills a timed-out child that ignores SIGTERM before returning', async () => {
+    const environment = await createEnvironment();
+    let childPid = null;
+    try {
+      const startedAt = Date.now();
+      const result = await runHook(
+        JSON.stringify({ prompt: 'Implement cleanup for a stubborn timeout subprocess.' }),
+        environment,
+        { FAKE_CLAUDE_MODE: 'stubborn-timeout', RLM_TIMEOUT: '250' },
+      );
+      const elapsed = Date.now() - startedAt;
+      const log = await readIfPresent(environment.env.RLM_LOG_FILE);
+      const metrics = (await readIfPresent(environment.env.RLM_METRICS_FILE))
+        .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      const pidText = await readIfPresent(environment.pidPath);
+      childPid = Number(pidText);
+
+      assert.ok(Number.isInteger(childPid) && childPid > 0, 'stalled child must report its PID');
+      assert.ok(elapsed >= 200, `timeout must not fire before its configured window (${elapsed}ms)`);
+      assert.ok(elapsed < 5000, `timeout cleanup must return promptly (${elapsed}ms)`);
+      assert.equal(result.code, 0);
+      assert.equal(result.signal, null);
+      assert.equal(result.stdout, '');
+      assert.equal(result.stderr, '');
+      assert.match(log, /ERROR: Haiku invocation timed out/);
+      assert.equal(metrics.at(-1).event, 'error');
+      assert.equal(metrics.at(-1).cache_hit, false);
+      assert.equal(metrics.at(-1).reason, 'Haiku invocation timed out');
+      assert.equal(
+        await waitForProcessExit(childPid),
+        true,
+        'timeout cleanup must not leave the stalled child running',
+      );
+    } finally {
+      if (childPid && isProcessRunning(childPid)) {
+        try { process.kill(childPid, 'SIGKILL'); } catch {}
+      }
       await destroyEnvironment(environment);
     }
   });

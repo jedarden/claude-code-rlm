@@ -1041,10 +1041,18 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
       let stdout = '';
       let stderr = '';
 
+      let forceKillId = null;
+      let timedOut = false;
+
       const timeoutId = setTimeout(() => {
-        proc.kill('SIGTERM');
-        setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 2000);
-        reject(new Error('Haiku invocation timed out'));
+        timedOut = true;
+        try { proc.kill('SIGTERM'); } catch {}
+        // Do not reject until the child has actually closed. The hook's error
+        // path exits immediately, so rejecting here would orphan a child that
+        // ignores SIGTERM before the escalation timer can run.
+        forceKillId = setTimeout(() => {
+          try { proc.kill('SIGKILL'); } catch {}
+        }, 2000);
       }, CONFIG.timeout);
 
       proc.stdout.on('data', (data) => { stdout += data.toString(); });
@@ -1052,11 +1060,14 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
 
       proc.on('close', (code) => {
         clearTimeout(timeoutId);
+        if (forceKillId) clearTimeout(forceKillId);
         const latency = Date.now() - startTime;
         const mode = useResume ? 'resume' : (actualSessionId ? 'session-id' : 'cold');
         log(`Haiku (${mode}) completed in ${latency}ms with exit code ${code}`);
 
-        if (code === 0) {
+        if (timedOut) {
+          reject(new Error('Haiku invocation timed out'));
+        } else if (code === 0) {
           resolve(stdout);
         } else {
           reject(new Error(`Haiku failed (exit ${code}): ${stderr.slice(0, 500)}`));
@@ -1065,6 +1076,7 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
 
       proc.on('error', (err) => {
         clearTimeout(timeoutId);
+        if (forceKillId) clearTimeout(forceKillId);
         reject(err);
       });
 
