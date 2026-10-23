@@ -1,2 +1,8 @@
 bead_cli:
   backend: bead-rs
+
+gates:
+  - type: command
+    run_in: clean
+    commands:
+      - npm test
