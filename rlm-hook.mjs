@@ -853,7 +853,7 @@ EXPLORATION TOOLS AVAILABLE:
 - Grep: Search file contents (e.g., search for "authenticate", "middleware")
 - Read: Read specific files to understand implementation
 - Write: Write intermediate notes to ${scratchFile}
-- Bash: Run git commands ONLY (git log, git show, git diff, git blame)
+- Bash: Run read-only git commands ONLY (git status, git log, git diff, git show, git branch, git ls-files, git remote)
 
 EXPLORATION WORKFLOW:
 1. Start by writing your initial understanding to ${scratchFile}
@@ -1019,8 +1019,8 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
       args.push('--permission-mode', 'bypassPermissions');
 
       if (CONFIG.agenticMode) {
-        // Enable file exploration tools + git + scratch file cleanup
-        args.push('--allowedTools', 'Read,Glob,Grep,Write,Bash(git:*),Bash(rm .claude/rlm-scratch-*.md)');
+        // Enable file exploration tools + read-only git + scratch file cleanup
+        args.push('--allowedTools', 'Read,Glob,Grep,Write,Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git branch:*),Bash(git ls-files:*),Bash(git remote:*),Bash(rm .claude/rlm-scratch-*.md)');
         args.push('--max-turns', String(CONFIG.maxTurns));
       }
 
@@ -1280,7 +1280,7 @@ const AGENTIC_TOOLS = [
   },
   {
     name: 'Bash',
-    description: 'Run a read-only git command ONLY (e.g. "git log --oneline -10", "git diff", "git show", "git blame"). Non-git commands are rejected.',
+    description: 'Run an explicitly read-only git command ONLY (git status, log, diff, show, branch, ls-files, or remote). Other git subcommands and non-git commands are rejected.',
     input_schema: {
       type: 'object',
       properties: { command: { type: 'string', description: 'A git command' } },
@@ -1307,8 +1307,13 @@ function resolveWithin(root, p) {
   return full;
 }
 
+const READ_ONLY_GIT_SUBCOMMANDS = new Set([
+  'status', 'log', 'diff', 'show', 'branch', 'ls-files', 'remote',
+]);
+
 /**
- * isAllowedGitCommand — the Bash tool only permits read-only git invocations.
+ * isAllowedGitCommand — the Bash tool only permits explicitly allowlisted,
+ * read-only git subcommands.
  * The command must start with `git` and contain no shell metacharacters that
  * would allow chaining, redirection, or substitution (the command is run via a
  * shell, so this guard is what prevents `git log; rm -rf /`).
@@ -1317,7 +1322,8 @@ function isAllowedGitCommand(command) {
   const cmd = String(command || '').trim();
   if (!/^git(\s|$)/.test(cmd)) return false;
   if (/[;&|`$()<>{}\n]/.test(cmd)) return false;
-  return true;
+  const subcommand = cmd.match(/^git\s+(\S+)/)?.[1];
+  return READ_ONLY_GIT_SUBCOMMANDS.has(subcommand);
 }
 
 /** glob → anchored RegExp. `**` crosses directory separators, `*`/`?` do not. */

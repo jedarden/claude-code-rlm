@@ -356,9 +356,24 @@ describe('hook process contract', { timeout: 10000 }, () => {
         assert.notEqual(allowedToolsIndex, -1, `${mode}: allowlist flag must be present`);
         assert.equal(
           args[allowedToolsIndex + 1],
-          'Read,Glob,Grep,Write,Bash(git:*),Bash(rm .claude/rlm-scratch-*.md)',
-          `${mode}: only exploration, git, and scoped scratch cleanup are allowed`,
+          'Read,Glob,Grep,Write,Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git branch:*),Bash(git ls-files:*),Bash(git remote:*),Bash(rm .claude/rlm-scratch-*.md)',
+          `${mode}: only exploration, read-only git, and scoped scratch cleanup are allowed`,
         );
+        assert.equal(args[allowedToolsIndex + 1].includes('Bash(git:*)'), false, `${mode}: broad git must not be allowed`);
+        for (const subcommand of ['status', 'log', 'diff', 'show', 'branch', 'ls-files', 'remote']) {
+          assert.equal(
+            args[allowedToolsIndex + 1].includes(`Bash(git ${subcommand}:*)`),
+            true,
+            `${mode}: git ${subcommand} must be allowed`,
+          );
+        }
+        for (const subcommand of ['commit', 'push', 'reset', 'clean', 'checkout', 'restore', 'blame']) {
+          assert.equal(
+            args[allowedToolsIndex + 1].includes(`Bash(git ${subcommand}:*)`),
+            false,
+            `${mode}: git ${subcommand} must not be allowed`,
+          );
+        }
         assert.equal(
           args[args.indexOf('--permission-mode') + 1],
           'bypassPermissions',

@@ -18,7 +18,7 @@ rlm-hook.mjs
   ├── Cache lookup (SHA-256 of message)
   ├── Project context gathering (project type, git state)
   ├── Haiku invocation (agentic or fast mode)
-  │     ├── Agentic: Glob, Grep, Read, Write scratch, Bash(git)
+  │     ├── Agentic: Glob, Grep, Read, Write scratch, read-only Bash(git status/log/diff/show/branch/ls-files/remote)
   │     └── Fast: pure text analysis from initial context
   ├── Parse JSON response
   ├── Save to cache
@@ -45,7 +45,7 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 - `UserPromptSubmit` hook integration (stdin JSON → stdout context)
 - Skip detection: short inputs, simple commands, code-heavy inputs
 - SHA-256 caching with configurable TTL (`~/.cache/rlm-hook/`)
-- Agentic mode: Haiku uses Glob/Grep/Read/Write/Bash(git) to explore codebase
+- Agentic mode: Haiku uses Glob/Grep/Read/Write and an explicit read-only Bash git allowlist (status/log/diff/show/branch/ls-files/remote) to explore the codebase
 - Fast mode: pure text analysis (~2–4s, no tool use)
 - Detailed mode: verbose structured JSON with confidence/ambiguity fields
 - Project context gathering: project type, tech stack, git branch/status, file list

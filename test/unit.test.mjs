@@ -305,7 +305,7 @@ function buildRLMPrompt(userMessage, projectContext, conversationContext, { agen
       `- Grep: Search file contents (e.g., search for "authenticate", "middleware")\n` +
       `- Read: Read specific files to understand implementation\n` +
       `- Write: Write intermediate notes to ${scratchFile}\n` +
-      `- Bash: Run git commands ONLY (git log, git show, git diff, git blame)\n\n` +
+      `- Bash: Run read-only git commands ONLY (git status, git log, git diff, git show, git branch, git ls-files, git remote)\n\n` +
       `BEGIN: Write initial understanding to ${scratchFile}, then explore systematically.`
     );
   }
@@ -1567,7 +1567,8 @@ function isAllowedGitCommand(command) {
   const cmd = String(command || '').trim();
   if (!/^git(\s|$)/.test(cmd)) return false;
   if (/[;&|`$()<>{}\n]/.test(cmd)) return false;
-  return true;
+  const subcommand = cmd.match(/^git\s+(\S+)/)?.[1];
+  return new Set(['status', 'log', 'diff', 'show', 'branch', 'ls-files', 'remote']).has(subcommand);
 }
 
 function globToRegExp(pattern) {
@@ -1883,10 +1884,14 @@ describe('Group 12: SDK-Direct Agentic Path (Phase 2)', () => {
   });
 
   // --- git command guard ---
-  it('isAllowedGitCommand: accepts read-only git, rejects everything else', () => {
-    assert.equal(isAllowedGitCommand('git log --oneline -10'), true);
-    assert.equal(isAllowedGitCommand('git diff HEAD~1'), true);
-    assert.equal(isAllowedGitCommand('git show HEAD:src/a.js'), true);
+  it('isAllowedGitCommand: accepts only the explicit read-only git allowlist', () => {
+    for (const subcommand of ['status', 'log', 'diff', 'show', 'branch', 'ls-files', 'remote']) {
+      assert.equal(isAllowedGitCommand(`git ${subcommand}`), true, `git ${subcommand} must be allowed`);
+      assert.equal(isAllowedGitCommand(`git ${subcommand} --help`), true, `git ${subcommand} args must be allowed`);
+    }
+    for (const subcommand of ['commit', 'push', 'reset', 'clean', 'checkout', 'restore', 'blame', 'config']) {
+      assert.equal(isAllowedGitCommand(`git ${subcommand}`), false, `git ${subcommand} must be rejected`);
+    }
     assert.equal(isAllowedGitCommand('rm -rf /'), false, 'non-git rejected');
     assert.equal(isAllowedGitCommand('gitfoo'), false, 'must be the git binary, not a prefix');
     assert.equal(isAllowedGitCommand('git log; rm -rf /'), false, 'no command chaining');
@@ -1960,10 +1965,17 @@ describe('Group 12: SDK-Direct Agentic Path (Phase 2)', () => {
     assert.equal(await readFile(scratch, 'utf-8'), '# notes\nsome findings');
   });
 
-  it('toolBashGit: runs git but rejects non-git via dispatch', async () => {
+  it('toolBashGit: allows read-only git and rejects non-git via dispatch', async () => {
     const version = toolBashGit('git --version', dir);
-    assert.match(version, /git version/);
+    assert.match(version, /only read-only "git \.\.\." commands/);
+    execSync('git init -q', { cwd: dir });
+    assert.match(toolBashGit('git status', dir), /On branch/);
     const rejected = toolBashGit('ls -la', dir);
+    assert.match(rejected, /only read-only "git \.\.\." commands/);
+  });
+
+  it('toolBashGit: rejects a mutating git command before execution', async () => {
+    const rejected = toolBashGit('git clean -fd', dir);
     assert.match(rejected, /only read-only "git \.\.\." commands/);
   });
 
