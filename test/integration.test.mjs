@@ -13,7 +13,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -117,6 +117,28 @@ export default class Anthropic {
 
         if (process.env.RLM_SDK_SCENARIO === 'api-error') {
           throw new Error('synthetic API 401: invalid integration-test key');
+        }
+
+        if (process.env.RLM_SDK_SCENARIO === 'scope-probe') {
+          if (this.callCount === 1) {
+            return response([
+              { type: 'tool_use', id: 'inside-read', name: 'Read', input: { path: 'inside.txt' } },
+              { type: 'tool_use', id: 'outside-read', name: 'Read', input: { path: '../outside.txt' } },
+              { type: 'tool_use', id: 'absolute-read', name: 'Read', input: { path: process.env.RLM_SDK_OUTSIDE_FILE } },
+              { type: 'tool_use', id: 'link-read', name: 'Read', input: { path: 'outside-link.txt' } },
+              { type: 'tool_use', id: 'outside-grep', name: 'Grep', input: { pattern: 'scope-secret', path: '../outside.txt' } },
+              { type: 'tool_use', id: 'link-grep', name: 'Grep', input: { pattern: 'scope-secret', path: 'outside-link.txt' } },
+              { type: 'tool_use', id: 'root-grep', name: 'Grep', input: { pattern: 'scope-secret' } },
+              { type: 'tool_use', id: 'inside-grep', name: 'Grep', input: { pattern: 'project-safe', path: 'inside.txt' } },
+              { type: 'tool_use', id: 'root-glob', name: 'Glob', input: { pattern: '**/*.txt' } },
+              { type: 'tool_use', id: 'outside-glob', name: 'Glob', input: { pattern: '../*.txt' } },
+            ], 'tool_use');
+          }
+          return response([{ type: 'text', text: JSON.stringify({
+            intent: 'code_review', summary: 'Scope probe completed',
+            relevant_files: [{ path: 'inside.txt', purpose: 'local fixture' }],
+            tasks: ['Review scope'], approach: 'Use only local findings',
+          }) }]);
         }
 
         if (process.env.RLM_SDK_SCENARIO === 'multi-tool') {
@@ -1138,5 +1160,50 @@ describe('SDK selection and tool-loop integration', { timeout: 15000 }, () => {
     const complete = (await readJsonLines(metrics)).find((event) => event.event === 'complete');
     assert.deepEqual(complete?.token_estimate, { input_tokens: 33, output_tokens: 21 },
       'complete metric sums usage from all three SDK turns');
+  });
+
+  it('agentic SDK excludes out-of-project Read, Grep, and Glob results', async () => {
+    const fixtureRoot = join(tmpdir(), `rlm-sdk-scope-${Date.now()}-${Math.random()}`);
+    const projectDir = join(fixtureRoot, 'project');
+    const outsideFile = join(fixtureRoot, 'outside.txt');
+    const trace = join(fixtureRoot, 'trace.jsonl');
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(join(projectDir, 'inside.txt'), 'project-safe content\n');
+    await writeFile(outsideFile, 'scope-secret must stay outside\n');
+    await symlink(outsideFile, join(projectDir, 'outside-link.txt'));
+    try {
+      const { code, stdout } = await spawnHook(JSON.stringify({
+        prompt: SDK_PROMPT, cwd: projectDir,
+      }), {
+        env: {
+          ...sdkLoaderEnv(join(FAKE_DIR, 'sdk-loader.mjs'), trace, 'scope-probe'),
+          RLM_SDK_OUTSIDE_FILE: outsideFile,
+          ANTHROPIC_API_KEY: 'integration-test-key',
+          RLM_USE_SDK: 'true',
+          RLM_AGENTIC_MODE: 'true',
+        },
+      });
+
+      assert.equal(code, 0);
+      assert.match(stdout, /Scope probe completed/);
+      const calls = (await readJsonLines(trace)).filter((event) => event.event === 'create');
+      assert.equal(calls.length, 2);
+      const results = Object.fromEntries(calls[1].request.messages.at(-1).content
+        .map((result) => [result.tool_use_id, result.content]));
+      assert.match(results['inside-read'], /project-safe/);
+      assert.match(results['inside-grep'], /project-safe/);
+      assert.match(results['root-glob'], /inside\.txt/);
+      assert.equal(results['root-glob'].includes('outside-link.txt'), false,
+        'SDK Glob must skip the outward symlink');
+      assert.equal(results['root-grep'], 'No matches found.',
+        'SDK recursive Grep must not follow the outward symlink');
+      for (const id of ['outside-read', 'absolute-read', 'link-read', 'outside-grep', 'link-grep', 'outside-glob']) {
+        assert.match(results[id], /^Error:/, `${id} must fail`);
+      }
+      assert.equal(JSON.stringify(results).includes('scope-secret'), false,
+        'no outside file content reaches the SDK model');
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
   });
 });

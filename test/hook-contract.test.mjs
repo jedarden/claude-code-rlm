@@ -12,7 +12,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -398,9 +398,66 @@ describe('hook process contract', { timeout: 10000 }, () => {
         assert.equal(args[args.indexOf('--disallowedTools') + 1], 'mcp__*');
         const settings = JSON.parse(args[args.indexOf('--settings') + 1]);
         const [toolHook] = settings.hooks.PreToolUse;
-        assert.equal(toolHook.matcher, 'Write|Bash');
+        assert.equal(toolHook.matcher, 'Read|Glob|Grep|Write|Bash');
         const guardCommand = toolHook.hooks[0].command;
         assert.match(guardCommand, /--guard-agentic-tool/);
+        assert.ok(guardCommand.includes(projectDir), `${mode}: guard receives the project root`);
+
+        const insideFile = join(projectDir, 'inside.txt');
+        const outsideFile = join(environment.root, 'outside.txt');
+        const outsideDir = join(environment.root, 'outside-dir');
+        await writeFile(insideFile, 'project content');
+        await writeFile(outsideFile, 'outside content');
+        await mkdir(outsideDir);
+        await writeFile(join(outsideDir, 'secret.txt'), 'outside content');
+        await symlink(insideFile, join(projectDir, 'inside-link.txt'));
+
+        for (const event of [
+          { tool_name: 'Read', tool_input: { file_path: insideFile } },
+          { tool_name: 'Read', tool_input: { file_path: 'inside.txt' } },
+          { tool_name: 'Read', tool_input: { file_path: 'inside-link.txt' } },
+          { tool_name: 'Glob', tool_input: { pattern: '**/*.txt' } },
+          { tool_name: 'Glob', tool_input: { pattern: '*.txt', path: '.' } },
+          { tool_name: 'Grep', tool_input: { pattern: 'project' } },
+          { tool_name: 'Grep', tool_input: { pattern: 'project', path: insideFile } },
+          { tool_name: 'Grep', tool_input: { pattern: 'project', path: 'inside-link.txt' } },
+        ]) {
+          const allowedRead = await runToolGuard(guardCommand, event, projectDir);
+          assert.equal(allowedRead.code, 0);
+          assert.equal(allowedRead.stdout, '', `${mode}: project-local ${event.tool_name} must pass`);
+        }
+
+        for (const event of [
+          { tool_name: 'Read', tool_input: { file_path: '../outside.txt' } },
+          { tool_name: 'Read', tool_input: { file_path: outsideFile } },
+          { tool_name: 'Read', tool_input: {} },
+          { tool_name: 'Glob', tool_input: { pattern: '**/*.txt', path: outsideDir } },
+          { tool_name: 'Glob', tool_input: { pattern: '../*.txt' } },
+          { tool_name: 'Glob', tool_input: { pattern: '/etc/*' } },
+          { tool_name: 'Grep', tool_input: { pattern: 'outside', path: '../outside.txt' } },
+          { tool_name: 'Grep', tool_input: { pattern: 'outside', path: outsideDir } },
+          { tool_name: 'Grep', tool_input: { pattern: 'outside', glob: '../*.txt' } },
+          { tool_name: 'Grep', tool_input: {} },
+        ]) {
+          const blockedRead = await runToolGuard(guardCommand, event, projectDir);
+          assert.equal(blockedRead.code, 0);
+          assert.equal(JSON.parse(blockedRead.stdout).hookSpecificOutput.permissionDecision, 'deny',
+            `${mode}: out-of-project or malformed ${event.tool_name} must be denied`);
+        }
+
+        await symlink(outsideFile, join(projectDir, 'outside-link.txt'));
+        await symlink(outsideDir, join(projectDir, 'outside-link-dir'));
+        for (const event of [
+          { tool_name: 'Read', tool_input: { file_path: 'outside-link.txt' } },
+          { tool_name: 'Grep', tool_input: { pattern: 'outside', path: 'outside-link.txt' } },
+          { tool_name: 'Glob', tool_input: { pattern: '**/*.txt' } },
+          { tool_name: 'Grep', tool_input: { pattern: 'outside' } },
+        ]) {
+          const blockedLink = await runToolGuard(guardCommand, event, projectDir);
+          assert.equal(blockedLink.code, 0);
+          assert.equal(JSON.parse(blockedLink.stdout).hookSpecificOutput.permissionDecision, 'deny',
+            `${mode}: ${event.tool_name} must not follow an external project symlink`);
+        }
 
         const scratchPath = join(projectDir, '.claude', `rlm-scratch-${result.pid}.md`);
         const allowed = await runToolGuard(guardCommand, {

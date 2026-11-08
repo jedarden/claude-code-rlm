@@ -15,9 +15,9 @@
 import { spawn, execSync } from 'child_process';
 import { createHash } from 'crypto';
 import { mkdir, readFile, writeFile, stat, rm, rename, readdir } from 'fs/promises';
-import { join, basename, resolve, relative, isAbsolute } from 'path';
+import { join, basename, resolve, relative, isAbsolute, sep } from 'path';
 import { fileURLToPath } from 'url';
-import { existsSync } from 'fs';
+import { existsSync, realpathSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { parseLog, aggregate, readLog, defaultLogPath } from './bench/parse-log.mjs';
 import { normalizePreresearch, parsePreresearchResponse } from './preresearch-schema.mjs';
@@ -32,6 +32,7 @@ const READ_ONLY_GIT_SUBCOMMANDS = new Set([
 // inputs fail closed; the parent hook passes its exact PID-scoped target.
 if (process.argv[2] === '--guard-agentic-tool') {
   const scratchPath = process.argv[3];
+  const projectRoot = process.argv[4];
   let event;
   try {
     let input = '';
@@ -49,11 +50,12 @@ if (process.argv[2] === '--guard-agentic-tool') {
   const bashAllowed = event?.tool_name === 'Bash' && validScratch &&
     typeof command === 'string' &&
     (isAllowedGitCommand(command) || command.trim() === `rm .claude/${scratchName}`);
-  if (!writeAllowed && !bashAllowed) {
+  const readAllowed = isAllowedAgenticRead(event, projectRoot);
+  if (!writeAllowed && !bashAllowed && !readAllowed) {
     console.log(JSON.stringify({ hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: 'deny',
-      permissionDecisionReason: 'RLM preresearch permits only scratch Write, read-only git, and scratch cleanup.',
+      permissionDecisionReason: 'RLM preresearch permits project-local exploration, scratch Write, read-only git, and scratch cleanup.',
     } }));
   }
   process.exit(0);
@@ -1048,18 +1050,18 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
 
       // The scratch path is under .claude/, which Claude Code protects even
       // from explicit allow rules in dontAsk mode. Keep bypassPermissions for
-      // that write, and guard Write and Bash calls with PreToolUse.
+      // that write, and guard every agentic tool call with PreToolUse.
       args.push('--permission-mode', 'bypassPermissions');
 
       if (CONFIG.agenticMode) {
         const scratchPath = join(workingDir || process.cwd(), '.claude', `rlm-scratch-${process.pid}.md`);
-        const guardCommand = [process.execPath, fileURLToPath(import.meta.url), '--guard-agentic-tool', scratchPath]
+        const guardCommand = [process.execPath, fileURLToPath(import.meta.url), '--guard-agentic-tool', scratchPath, workingDir || process.cwd()]
           .map(shellQuote).join(' ') + ' || exit 2';
         // Safe mode suppresses hooks. Load only this session's explicit hook
         // settings and expose only the tools needed for preresearch.
         args.push('--setting-sources', '');
         args.push('--settings', JSON.stringify({ hooks: { PreToolUse: [{
-          matcher: 'Write|Bash', hooks: [{ type: 'command', command: guardCommand }],
+          matcher: 'Read|Glob|Grep|Write|Bash', hooks: [{ type: 'command', command: guardCommand }],
         }] } }));
         args.push('--tools', 'Read,Glob,Grep,Write,Bash');
         args.push('--disallowedTools', 'mcp__*');
@@ -1340,17 +1342,75 @@ function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
-/**
- * resolveWithin — resolve `p` against `root` and refuse anything that escapes
- * the project root (path traversal / absolute paths pointing elsewhere).
- * Returns the absolute path, or null if it escapes.
- */
-function resolveWithin(root, p) {
-  const full = isAbsolute(p) ? p : resolve(root, p);
+/** Resolve existing paths through symlinks before checking the project boundary. */
+function isWithinRoot(root, full) {
   const rel = relative(root, full);
-  if (rel === '' ) return full;
-  if (rel.startsWith('..') || isAbsolute(rel)) return null;
-  return full;
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function resolveWithin(root, p) {
+  if (typeof p !== 'string' || !p || !root) return null;
+  try {
+    const project = realpathSync(root);
+    const full = realpathSync(resolve(project, p));
+    return isWithinRoot(project, full) ? full : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Glob filters must remain relative even when the tool also supplies a path. */
+function isProjectGlob(pattern) {
+  return typeof pattern === 'string' && pattern.length > 0 &&
+    !isAbsolute(pattern) && !pattern.startsWith('~') && !pattern.includes('..');
+}
+
+/** Recursive native CLI searches may follow symlinks; refuse such a tree. */
+function searchTreeStaysWithin(root, start) {
+  try {
+    const project = realpathSync(root);
+    const stack = [realpathSync(start)];
+    const visited = new Set();
+    while (stack.length) {
+      const dir = stack.pop();
+      if (visited.has(dir)) continue;
+      visited.add(dir);
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isSymbolicLink()) {
+          const target = realpathSync(path);
+          if (!isWithinRoot(project, target)) return false;
+          if (statSync(target).isDirectory()) stack.push(target);
+        } else if (entry.isDirectory()) {
+          stack.push(path);
+        }
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedAgenticRead(event, root) {
+  const input = event?.tool_input;
+  if (!input || typeof input !== 'object' || !root) return false;
+  if (event.tool_name === 'Read') return Boolean(resolveWithin(root, input.file_path));
+  if (event.tool_name === 'Glob' || event.tool_name === 'Grep') {
+    const path = input.path ?? '.';
+    const target = resolveWithin(root, path);
+    if (!target) return false;
+    if (event.tool_name === 'Glob' && !isProjectGlob(input.pattern)) return false;
+    if (event.tool_name === 'Grep' &&
+      (typeof input.pattern !== 'string' || !input.pattern ||
+       (input.glob !== undefined && !isProjectGlob(input.glob)))) return false;
+    try {
+      return statSync(target).isDirectory() ? searchTreeStaysWithin(root, target) : true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 /**
@@ -1402,6 +1462,7 @@ const GLOB_SKIP_DIRS = new Set(['node_modules', '.git']);
 /** Glob tool — recursive readdir (fs.glob is Node 22+; we target Node 20). */
 async function toolGlob(pattern, cwd, limit = 100) {
   if (!pattern) return 'Error: Glob requires a pattern';
+  if (!isProjectGlob(pattern)) return 'Error: Glob pattern escapes project root';
   const root = cwd || process.cwd();
   const re = globToRegExp(pattern);
   const matches = [];
@@ -1432,7 +1493,8 @@ async function toolGlob(pattern, cwd, limit = 100) {
 function toolGrep(pattern, path, cwd) {
   if (!pattern) return 'Error: Grep requires a pattern';
   const root = cwd || process.cwd();
-  const target = path ? (resolveWithin(root, path) || root) : root;
+  const target = resolveWithin(root, path || '.');
+  if (!target) return `Error: path escapes project root: ${path}`;
   try {
     const out = execSync(
       `grep -rn --exclude-dir=node_modules --exclude-dir=.git -e ${shellQuote(pattern)} ${shellQuote(target)} 2>/dev/null | head -50`,

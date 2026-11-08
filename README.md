@@ -30,6 +30,8 @@ When you type a prompt in Claude Code, this hook fires first. Haiku (fast, cheap
 
 The hook injects a structured analysis block before your prompt reaches the main model. In agentic mode (default), the output includes pretty-printed JSON followed by a plain-text summary:
 
+Agentic Read, Glob, and Grep are limited to the hook's project directory (`cwd`) in both CLI and SDK modes. Paths that leave the project, including symlinks to outside files, are rejected. CLI recursive searches are denied if their search tree contains an outward symlink; SDK Glob skips symlinks. The CLI check runs before each tool call, so a project writable by an untrusted process during the call is outside this boundary's trust model. Read-only Git commands have a separate allowlist.
+
 ```
 <rlm_preresearch>
 {
