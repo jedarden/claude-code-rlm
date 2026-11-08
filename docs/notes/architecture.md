@@ -118,6 +118,48 @@ Every error path exits 0. The hook contract with Claude Code is:
 
 Since we never want the preresearch hook to interrupt a conversation, all `catch` blocks call `process.exit(0)`. Errors are logged to `~/.local/share/rlm-hook/rlm-hook.log` for debugging. The metrics JSONL, error log, and `RLM_DEBUG` verbose log share a content-safety boundary: they retain counts, fixed labels, token numbers, and bounded operational diagnostics only. Raw prompts, transcript excerpts, and explored-file contents are not persisted; subprocess stderr and model-provided skip reasons are dropped when they could carry such content. Known sensitive values reaching an unavoidable diagnostic are replaced with a short SHA-256 plus length marker, and log entries remain bounded by the rotating-log limits.
 
+### Claude Code transcript compatibility
+
+The `UserPromptSubmit` JSON input supplies `transcript_path`. The hook reads that
+path directly; it does not search for a transcript by `session_id`. Observed
+Claude Code session files live at
+`~/.claude/projects/<project-key>/<session-uuid>.jsonl`, with subagent files
+under `<session-uuid>/subagents/`. The hook separately hashes
+`transcript_path` to derive its own stable Haiku resume ID; that hash does not
+locate the transcript. Claude Code's JSONL layout is an internal, undocumented
+contract and may change between CLI versions.
+
+Each line is expected to be a JSON object. Conversation previews select records
+whose `type` is `user` or `assistant`. Text comes from `message.content` as a
+string or an array of `{ "type": "text", "text": "..." }` blocks; tool,
+thinking, and image blocks contain no preview text. A top-level `content`
+fallback is retained for compatibility, but no observed user or assistant
+record required it. The last `RLM_CONTEXT_WINDOW` text-bearing conversation
+records are kept, regardless of interleaved metadata records. For Phase 4
+reuse, the hook scans the full JSONL for `<rlm_preresearch>` and
+`<rlm_analysis>` text in either content location, including synthetic records.
+It uses the record's ISO-string or numeric `timestamp` to decide whether
+referenced files have changed; missing or invalid timestamps prevent reuse.
+
+Compatibility fixtures in `test/fixtures/transcripts/` are anonymized
+projections of real local transcript records. They preserve the consumed field
+names, content types, block types, and version values while replacing prompt,
+response, path, and identifier content. `current-2.1.319.jsonl` was derived
+from records written by Claude Code 2.1.319 (also the installed CLI version at
+verification on 2026-11-08). `legacy-2.1.223.jsonl` was derived from records
+written by 2.1.223, including its queue metadata and `message.role` shape.
+The parser tests exercise both fixtures; versions between them were not
+individually certified by this fixture suite.
+
+A nonempty transcript with no JSONL objects, no conversation records, or an
+unsupported conversation content shape logs a fixed `Transcript parse error`
+reason and adds one `transcript_parse_error` metric. The metrics dashboard and
+`rlm-hook.mjs --stats` count these events. The hook continues with empty or
+partial conversation context and exits 0 as usual. An empty file, missing
+`transcript_path`, and a partial final JSONL write after valid records do not
+raise an error. Parsing runs only after the skip and cache gates when
+`RLM_GATHER_CONTEXT=true`; those early exits do not inspect the transcript.
+
 ## Why subprocess instead of SDK
 
 The hook uses `spawn('claude', ...)` to invoke the Claude CLI rather than the Anthropic SDK directly. Reasons (verified against Anthropic's live docs, 2026-11-08 — see the next section for the evidence and citations):

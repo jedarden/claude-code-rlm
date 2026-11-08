@@ -387,7 +387,7 @@ You ask "add error handling to the API client." Haiku explores `src/api.ts`, fin
 
 ## Phase 5: Metrics dashboard
 
-Phase 5 adds a metrics JSONL log (`RLM_METRICS_FILE`, default: `~/.local/share/rlm-hook/metrics.jsonl`). One JSON line per hook outcome captures latency, cache status, mode, and token counts. The bundled dashboard visualizes these metrics:
+Phase 5 adds a metrics JSONL log (`RLM_METRICS_FILE`, default: `~/.local/share/rlm-hook/metrics.jsonl`). Each hook outcome adds a JSON line with latency, cache status, mode, and token counts. A transcript format failure adds a separate `transcript_parse_error` diagnostic line so the hook can continue while the failure remains countable. Diagnostic lines count toward event totals but are excluded from outcome-rate denominators. The bundled dashboard visualizes these metrics:
 
 The hook rotates this file before an append would exceed 8 MiB, retaining three
 backups (`metrics.jsonl.1` through `.3`). The dashboard, `bench/parse-log.mjs`,
@@ -414,6 +414,7 @@ the port with an appropriate firewall or access-control boundary.
 
 **Metrics tracked:**
 
+- `event` — hook outcome or `transcript_parse_error` diagnostic
 - `timestamp` — when the hook ran
 - `latency_ms` — total hook runtime
 - `cache_hit` — whether the cache was used

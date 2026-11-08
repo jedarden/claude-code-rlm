@@ -20,7 +20,8 @@
  *   RLM_METRICS_FILE=/path node bench/parse-log.mjs
  *
  * Event taxonomy (from Unit 1): skip, cache_hit (source: sha|semantic),
- * context_reuse, haiku_skip, complete, error. The canonical hit flag is the
+ * context_reuse, haiku_skip, complete, error, transcript_parse_error (an
+ * additional diagnostic event during a hook run). The canonical hit flag is the
  * boolean `cache_hit` field (true for cache_hit + context_reuse), NOT the event
  * name — hit rate is computed off the boolean.
  */
@@ -75,6 +76,9 @@ export function percentile(values, p) {
 export function summarize(records) {
   const list = Array.isArray(records) ? records : [];
   const total = list.length;
+  // Parse diagnostics are extra records emitted during an otherwise normal
+  // hook run. Keep them in event counts, not the denominator for outcome rates.
+  const outcomes = list.filter((record) => record?.event !== 'transcript_parse_error').length;
   let hits = 0;
   let skips = 0;
   let errors = 0;
@@ -131,12 +135,12 @@ export function summarize(records) {
   return {
     total,
     hits,
-    hit_rate: total ? hits / total : 0,
+    hit_rate: outcomes ? hits / outcomes : 0,
     skips,
-    skip_rate: total ? skips / total : 0,
+    skip_rate: outcomes ? skips / outcomes : 0,
     skip_reasons,
     errors,
-    error_rate: total ? errors / total : 0,
+    error_rate: outcomes ? errors / outcomes : 0,
     events,
     modes,
     token_totals: tokenEstimateCount

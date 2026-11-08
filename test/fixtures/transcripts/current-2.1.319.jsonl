@@ -1,0 +1,4 @@
+{"type":"system","version":"2.1.319","timestamp":"2026-11-08T12:00:00.000Z"}
+{"type":"user","version":"2.1.319","timestamp":"2026-11-08T12:00:01.000Z","message":{"content":"Please inspect the parser."}}
+{"type":"assistant","version":"2.1.319","timestamp":"2026-11-08T12:00:02.000Z","message":{"content":[{"type":"text","text":"The parser reads recent turns."}]}}
+{"type":"user","version":"2.1.319","timestamp":"2026-11-08T12:00:03.000Z","message":{"content":"<rlm_preresearch>{\"intent\":\"debugging\",\"relevant_files\":[\"src/parser.js\"]}</rlm_preresearch>"}}

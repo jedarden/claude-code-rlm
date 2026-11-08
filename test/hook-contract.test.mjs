@@ -214,6 +214,37 @@ describe('hook process contract', { timeout: 10000 }, () => {
     }
   });
 
+  it('logs and counts an unparseable transcript while continuing the hook', async () => {
+    const environment = await createEnvironment();
+    try {
+      const privateText = 'transcript-private-token-7c32a1';
+      const transcriptPath = join(environment.root, 'conversation.jsonl');
+      await writeFile(transcriptPath, `unrecognized ${privateText}\n`);
+      const result = await runHook(
+        JSON.stringify({
+          prompt: 'Inspect the transcript compatibility path for format changes.',
+          transcript_path: transcriptPath,
+        }),
+        environment,
+        { RLM_GATHER_CONTEXT: 'true' },
+      );
+      const log = await readIfPresent(environment.env.RLM_LOG_FILE);
+      const metricsText = await readIfPresent(environment.env.RLM_METRICS_FILE);
+      const metrics = metricsText.trim().split('\n').map((line) => JSON.parse(line));
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /^<rlm_preresearch>/);
+      assert.match(log, /Transcript parse error: no_jsonl_records/);
+      assert.equal(log.includes(privateText), false);
+      assert.equal(metricsText.includes(privateText), false);
+      assert.deepEqual(metrics.filter((metric) => metric.event === 'transcript_parse_error')
+        .map((metric) => metric.reason), ['no_jsonl_records']);
+      assert.equal(metrics.at(-1).event, 'complete');
+    } finally {
+      await destroyEnvironment(environment);
+    }
+  });
+
   it('rejects malformed JSON without invoking the subprocess or emitting context', async () => {
     const environment = await createEnvironment();
     try {

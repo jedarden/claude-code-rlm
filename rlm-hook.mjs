@@ -129,6 +129,7 @@ if (process.argv.includes('--stats')) {
   }
 
   console.log(`Error rate: ${pct(overall.error_rate)}`);
+  console.log(`Transcript parse errors: ${num(overall.events?.transcript_parse_error ?? 0)}`);
   console.log(`Latency p50: ${num(overall.latency.p50)}ms`);
   console.log(`Latency p95: ${num(overall.latency.p95)}ms`);
 
@@ -517,37 +518,102 @@ async function gatherConversationContext(transcriptPath, maxMessages = CONFIG.co
     // unexpected downstream error that echoes it is redacted before logging;
     // no transcript bytes are returned in a metric or log field.
     rememberSensitiveContent(content);
-    const lines = content.trim().split('\n').slice(-maxMessages * 2);
-
-    const messages = [];
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        if (entry.type === 'user' || entry.type === 'assistant') {
-          const raw = entry.message?.content || entry.content || '';
-          const text = Array.isArray(raw)
-            ? raw.filter(b => b.type === 'text').map(b => b.text).join(' ')
-            : (typeof raw === 'string' ? raw : '');
-          if (text) {
-            rememberSensitiveContent(text);
-            messages.push({
-              role: entry.type,
-              preview: text.slice(0, 200) + (text.length > 200 ? '...' : '')
-            });
-          }
-        }
-      } catch {}
+    const { messages, priorBlocks, parseIssue } = parseTranscriptText(content, { window: maxMessages });
+    if (parseIssue) {
+      // The transcript path and content may contain user data. Persist only a
+      // fixed reason label, once per hook invocation, while continuing normally.
+      await log(`Transcript parse error: ${parseIssue}`);
+      await appendMetric({
+        event: 'transcript_parse_error',
+        mode: currentMode(),
+        cache_hit: false,
+        reason: parseIssue,
+      });
     }
-
-    // Recover prior RLM blocks from the FULL transcript (not the truncated
-    // previews above) so the early-exit can reuse earlier exploration.
-    const priorBlocks = extractPriorBlocksFromTranscript(content, { window: maxMessages });
-
-    return { messages: messages.slice(-maxMessages), priorBlocks };
+    return { messages, priorBlocks };
   } catch (err) {
     await log(`Transcript read error: ${err.message}`);
     return null;
   }
+}
+
+/**
+ * Decode the JSONL shape used by Claude Code for conversation context. The
+ * diagnostic is deliberately a fixed label, never transcript data. A partial
+ * final JSONL write is tolerated when other records are readable.
+ */
+export function parseTranscriptText(content, { window = CONFIG.contextWindow } = {}) {
+  const lines = typeof content === 'string' ? content.split('\n') : [];
+  const nonempty = typeof content === 'string' && content.trim().length > 0;
+  const messages = [];
+  const allBlocks = [];
+  let jsonRecords = 0;
+  let conversationRecords = 0;
+  let unsupportedContent = false;
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    jsonRecords++;
+    const isConversation = entry.type === 'user' || entry.type === 'assistant';
+    if (isConversation) conversationRecords++;
+
+    const raw = entry.message?.content ?? entry.content;
+    let parts = [];
+    if (typeof raw === 'string') {
+      parts = [raw];
+    } else if (Array.isArray(raw)) {
+      parts = raw.filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+        .map((block) => block.text);
+      // Tool, thinking, and image blocks can legitimately contain no text.
+      // A malformed text block or unknown text-free shape signals drift.
+      if (isConversation && raw.some((block) =>
+          !block || typeof block !== 'object' ||
+          (block.type === 'text' && typeof block.text !== 'string') ||
+          (parts.length === 0 &&
+            !['text', 'tool_use', 'tool_result', 'thinking', 'redacted_thinking', 'image'].includes(block.type)))) {
+        unsupportedContent = true;
+      }
+    } else if (isConversation) {
+      unsupportedContent = true;
+    }
+
+    const previewText = parts.join(' ');
+    if (isConversation && previewText) {
+      messages.push({
+        role: entry.type,
+        preview: previewText.slice(0, 200) + (previewText.length > 200 ? '...' : ''),
+      });
+    }
+
+    // Prior RLM output may appear in a synthetic record. Parse its full text
+    // with that record's timestamp, independent of the preview window.
+    const fullText = parts.join('\n');
+    if (fullText) {
+      let ts;
+      if (typeof entry.timestamp === 'number' && Number.isFinite(entry.timestamp)) {
+        ts = entry.timestamp;
+      } else if (typeof entry.timestamp === 'string') {
+        const parsed = Date.parse(entry.timestamp);
+        ts = Number.isFinite(parsed) ? parsed : undefined;
+      }
+      allBlocks.push(...extractPriorRLMBlocks(fullText, { window: Infinity, ts }).reverse());
+    }
+  }
+
+  const parseIssue = unsupportedContent ? 'unsupported_content' :
+    nonempty && jsonRecords === 0 ? 'no_jsonl_records' :
+    nonempty && conversationRecords === 0 ? 'no_conversation_records' : null;
+
+  const limit = Number.isFinite(window) && window > 0 ? window : allBlocks.length;
+  const priorBlocks = allBlocks.reverse().slice(0, limit);
+  return { messages: messages.slice(-window), priorBlocks, parseIssue };
 }
 
 // =============================================================================
@@ -647,74 +713,6 @@ function extractPriorRLMBlocks(transcriptText, { window = CONFIG.contextWindow, 
   blocks.reverse();
   const limit = Number.isFinite(window) && window > 0 ? window : blocks.length;
   return blocks.slice(0, limit);
-}
-
-/**
- * JSONL-aware wrapper around extractPriorRLMBlocks.
- *
- * gatherConversationContext only keeps a 200-char `preview` of each message —
- * far too short to hold a whole <rlm_preresearch> block. This reads the raw
- * transcript JSONL, decodes each record's message text IN FULL, and runs the
- * pure extractor per record with that record's own `timestamp` as `ts`. The
- * per-record stamp matters: computeChangedFiles needs each recovered block's
- * production time to judge whether its files have since changed, and stamping
- * the whole transcript blob with one `ts` (the alternative) would be wrong.
- *
- * We do NOT filter by entry.type: the hook's injected output can be stored under
- * a user turn, an assistant turn, or a synthetic record depending on Claude
- * Code internals, so we scan every parseable record's text content. The window
- * caps the COMBINED result (newest-first), not each record individually —
- * roughly "the last N turns' worth of blocks" since a turn yields ≤1 block.
- *
- * Pure: string in → array out. Never throws; unparseable lines are skipped.
- *
- * @param {string} transcriptText  raw transcript file contents (JSONL)
- * @param {{window?: number}} opts  look-back depth (combined block cap)
- * @returns {Array<{intent: string|null, relevant_files: string[], ts: number|null, raw: object}>}
- */
-function extractPriorBlocksFromTranscript(transcriptText, { window = CONFIG.contextWindow } = {}) {
-  if (typeof transcriptText !== 'string' || transcriptText.length === 0) return [];
-
-  const all = []; // accumulate chronological (oldest → newest), reverse once at end
-  for (const line of transcriptText.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let entry;
-    try {
-      entry = JSON.parse(trimmed);
-    } catch {
-      continue; // not a JSONL record (or truncated mid-write)
-    }
-    if (!entry || typeof entry !== 'object') continue;
-
-    const raw = entry.message?.content ?? entry.content ?? '';
-    const text = Array.isArray(raw)
-      ? raw.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n')
-      : (typeof raw === 'string' ? raw : '');
-    if (!text) continue;
-
-    // Records carry an ISO-string timestamp; tolerate a numeric epoch too. An
-    // unparseable/absent timestamp ⇒ undefined ⇒ extractor stamps ts:null ⇒
-    // computeChangedFiles treats those files as changed (fail-safe).
-    let ts;
-    const t = entry.timestamp;
-    if (typeof t === 'number' && Number.isFinite(t)) {
-      ts = t;
-    } else if (typeof t === 'string') {
-      const p = Date.parse(t);
-      ts = Number.isFinite(p) ? p : undefined;
-    }
-
-    // Pure extractor returns this record's blocks newest-first; re-reverse to
-    // chronological so the single reverse below yields a clean global order.
-    const blocks = extractPriorRLMBlocks(text, { window: Infinity, ts });
-    blocks.reverse();
-    for (const b of blocks) all.push(b);
-  }
-
-  all.reverse(); // newest-first overall
-  const limit = Number.isFinite(window) && window > 0 ? window : all.length;
-  return all.slice(0, limit);
 }
 
 /**

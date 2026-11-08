@@ -134,6 +134,7 @@ export function renderHTML(agg, opts = {}) {
     ['Hit rate', pct(overall.hit_rate)],
     ['Skip rate', pct(overall.skip_rate)],
     ['Error rate', pct(overall.error_rate)],
+    ['Transcript parse errors', num(overall.events?.transcript_parse_error ?? 0)],
     ['Estimated cost', usd(overall.estimated_cost_usd)],
     ['p50', `${num(oLat.p50)}${oLat.p50 == null ? '' : 'ms'}`],
     ['p95', `${num(oLat.p95)}${oLat.p95 == null ? '' : 'ms'}`],

@@ -1,0 +1,5 @@
+{"type":"queue-operation","content":"sanitized queue metadata"}
+{"type":"user","version":"2.1.223","timestamp":"2026-07-01T09:00:00.000Z","message":{"role":"user","content":"Review the legacy transcript shape."}}
+{"type":"attachment","version":"2.1.223"}
+{"type":"assistant","version":"2.1.223","timestamp":"2026-07-01T09:00:00.500Z","message":{"role":"assistant","content":[{"type":"thinking"}]}}
+{"type":"assistant","version":"2.1.223","timestamp":"2026-07-01T09:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"<rlm_analysis>{\"intent\":{\"primary\":\"learning\"},\"files\":[\"legacy.js\"]}</rlm_analysis>"}]}}

@@ -2,10 +2,9 @@
 /**
  * Context-gathering coverage for project metadata and recent transcript turns.
  *
- * The hook is intentionally a single executable module, so these tests keep
- * faithful local copies of the two context collectors, matching unit.test.mjs.
- * The fixtures use real temporary directories and JSONL transcripts to cover
- * the filesystem and transcript-shape boundaries that prompt-only tests miss.
+ * These historical logic tests keep local copies of the context collectors,
+ * matching unit.test.mjs. Transcript format compatibility is tested against
+ * the real parser and anonymized observed records in transcript-format.test.mjs.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
