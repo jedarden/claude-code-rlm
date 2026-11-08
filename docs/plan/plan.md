@@ -97,7 +97,7 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 - Integrated into `main()` after SHA-256 miss
 
 **Features implemented:**
-- Embedding via OpenAI-compatible endpoint (`RLM_EMBEDDING_ENDPOINT`, default OpenAI, keyed by `OPENAI_API_KEY`)
+- Embedding via OpenAI-compatible endpoint (`RLM_EMBED_BASE_URL`, default `https://api.openai.com/v1`, keyed by `OPENAI_API_KEY`)
 - Cosine similarity with dimension mismatch safety and zero-magnitude handling
 - `index.json` design: inline `{dim, vec: Array.from(float32)}` per entry, single-read lookup, tolerant of absent/malformed index (falls back to file scan)
 - Per-record `ts` stamping for accurate timestamping

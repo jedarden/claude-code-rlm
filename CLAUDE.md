@@ -55,6 +55,7 @@ All `RLM_*` vars are documented in `rlm-hook.mjs` at the top (lines 32-76). Key 
 - `RLM_SEMANTIC_THRESHOLD` — Cosine similarity threshold for semantic cache (0-1, default: 0.92)
 - `RLM_EMBED_MODEL` — OpenAI embedding model (default: text-embedding-3-small)
 - `RLM_EMBED_BASE_URL` — Embedding API endpoint (default: https://api.openai.com/v1)
+- `OPENAI_API_KEY` — API key for the embedding endpoint when semantic caching is enabled
 - `RLM_CONTEXT_WINDOW` — How many prior RLM blocks to look back for context reuse (default: 5)
 - `RLM_GATHER_CONTEXT` — Gather project context (default: true)
 - `RLM_METRICS_FILE` — Path to metrics JSONL log for dashboard (Phase 5)

@@ -56,6 +56,8 @@ The cache is keyed on message text only, not on cwd or model. This means the sam
 
 Cache misses are the common case for novel questions. The cache primarily helps with repeated queries in long sessions (e.g., retrying a prompt, running the same planning query after a small edit).
 
+Semantic caching uses an OpenAI-compatible embeddings endpoint. Set `RLM_EMBED_BASE_URL` to override the default `https://api.openai.com/v1`, and provide `OPENAI_API_KEY` when `RLM_SEMANTIC_CACHE=true`.
+
 ## Graceful Degradation
 
 Every error path exits 0. The hook contract with Claude Code is:
