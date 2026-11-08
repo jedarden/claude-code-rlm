@@ -55,7 +55,8 @@ Two operating modes, controlled by `RLM_AGENTIC_MODE` (default: `true`) and `RLM
 
 ### Agentic mode (default)
 - Haiku receives `Read`, `Glob`, `Grep`, `Write`, and `Bash`. A subprocess `PreToolUse` guard rejects `Write` calls outside that run's PID-scoped `.claude/rlm-scratch-{pid}.md` and Bash calls outside the configured `git status`, `log`, `diff`, `show`, `branch`, `ls-files`, `remote` command families or cleanup of that same scratch file.
-- Haiku writes scratch notes to a PID-scoped `.claude/rlm-scratch-{pid}.md` as it explores, then deletes the file
+- Haiku writes scratch notes to a PID-scoped `.claude/rlm-scratch-{pid}.md` as it explores, then deletes the file. On every normal hook startup, the hook also scans `.claude/` and removes only regular scratch files whose numeric owner PID is no longer alive, recovering files left by a killed or crashed run while preserving active concurrent runs.
+- `.gitignore` excludes `.claude/rlm-scratch-*.md`, so an orphan cannot be accidentally committed while waiting for the next hook startup to remove it.
 - Produces a rich JSON structure: `relevant_files`, `existing_patterns`, `recent_changes`, `approach`, `warnings`
 - Latency: ~4–15s depending on codebase size and number of tool calls
 - The CLI runs with only those five built-in tools exposed and no MCP tools. The guard is needed because Claude Code does not match `Write(path)` permission rules, `dontAsk` denies writes under its protected `.claude/` directory even with an `Edit(path)` allow rule, and `bypassPermissions` does not enforce the Bash allowlist. `bypassPermissions` keeps the scratch write working while the guard enforces the Write and Bash scope.
@@ -84,7 +85,7 @@ The cwd half of the key scopes entries to a project, so one repository's cached 
 
 Cache misses are the common case for novel questions. The cache primarily helps with repeated queries in long sessions (e.g., retrying a prompt, running the same planning query after a small edit).
 
-Semantic caching (default off, `RLM_SEMANTIC_CACHE=true`) layers onto the SHA-256 miss path: on a miss, the query is embedded as `prompt + '\0' + cwd` and scored against stored embeddings, and the nearest analysis above `RLM_SEMANTIC_THRESHOLD` is served in place of a Haiku run. It uses an OpenAI-compatible embeddings endpoint. Set `RLM_EMBED_BASE_URL` to override the default `https://api.openai.com/v1`, and provide `OPENAI_API_KEY`. This is an outbound transmission of raw prompt text — see [Outbound data flow and privacy](#outbound-data-flow-and-privacy) for the payload and its controls.
+Semantic caching (default off, `RLM_SEMANTIC_CACHE=true`) layers onto the SHA-256 miss path: on a miss, the query is embedded as `prompt + '\0' + cwd` and scored against stored embeddings, and the nearest analysis above `RLM_SEMANTIC_THRESHOLD` is served in place of a Haiku run. It uses an OpenAI-compatible embeddings endpoint. Set `RLM_EMBED_BASE_URL` to override the default `https://api.openai.com/v1`, and provide `OPENAI_API_KEY` — supplied by reference like the Anthropic key (README: [Supplying credentials](../../README.md#supplying-credentials)). This is an outbound transmission of raw prompt text — see [Outbound data flow and privacy](#outbound-data-flow-and-privacy) for the payload and its controls.
 
 ### Embedding failure and latency contract
 
@@ -129,7 +130,7 @@ Tradeoffs: ~1–2s subprocess startup overhead vs direct API. See Phase 2 in `pl
 
 ## SDK-Direct mode: authentication, billing, and fallback
 
-Verified 2026-11-08 against Anthropic's own documentation (Claude Code authentication: `code.claude.com/docs/en/authentication.md`; Claude API authentication: `platform.claude.com/docs/en/manage-claude/authentication.md`). This resolves Phase 2's open questions in `plan.md`.
+Verified 2026-11-08 against Anthropic's own documentation (Claude Code authentication: `code.claude.com/docs/en/authentication.md`; Claude API authentication: `platform.claude.com/docs/en/manage-claude/authentication.md`). This resolves Phase 2's open questions in `plan.md`. How the key should reach the hook's environment — by reference from a secret store or a mode-600 env file, with by-property verification steps — is documented in the README's [Supplying credentials](../../README.md#supplying-credentials) section.
 
 ### Which account types support which path
 

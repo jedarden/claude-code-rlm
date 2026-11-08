@@ -34,7 +34,8 @@ const ANALYSIS = {
 
 /**
  * Create a fake claude executable. Its behavior is selected through
- * FAKE_CLAUDE_MODE so one script can cover success, failure, and timeout.
+ * FAKE_CLAUDE_MODE so one script can cover success, failure, timeout, and a
+ * killed parent process.
  */
 async function createEnvironment() {
   const root = await mkdtemp(join(tmpdir(), 'rlm-hook-contract-'));
@@ -82,6 +83,9 @@ if (process.env.FAKE_CLAUDE_MODE === 'timeout') {
   }
   process.on('SIGTERM', () => {});
   setTimeout(() => {}, 60000);
+} else if (process.env.FAKE_CLAUDE_MODE === 'kill-parent') {
+  process.kill(process.ppid, 'SIGKILL');
+  process.exit(137);
 } else {
   process.stdout.write(${JSON.stringify(JSON.stringify(ANALYSIS))});
 }
@@ -555,6 +559,45 @@ describe('hook process contract', { timeout: 10000 }, () => {
       } finally {
         await destroyEnvironment(environment);
       }
+    }
+  });
+
+  it('removes the orphaned scratch file from a killed run on the next startup', async () => {
+    const environment = await createEnvironment();
+    try {
+      const projectDir = join(environment.root, 'project');
+      await mkdir(projectDir, { recursive: true });
+
+      const killed = await runHook(
+        JSON.stringify({
+          prompt: 'Leave an orphaned scratch file when the hook process is killed.',
+          cwd: projectDir,
+        }),
+        environment,
+        {
+          FAKE_CLAUDE_MODE: 'kill-parent',
+          FAKE_CLAUDE_CREATE_SCRATCH: 'true',
+        },
+      );
+
+      assert.equal(killed.code, null);
+      assert.equal(killed.signal, 'SIGKILL');
+      const orphaned = await readdir(join(projectDir, '.claude'));
+      assert.deepEqual(orphaned, [`rlm-scratch-${killed.pid}.md`]);
+
+      const recovered = await runHook(
+        JSON.stringify({
+          prompt: 'Recover from the previous killed hook run and continue normally.',
+          cwd: projectDir,
+        }),
+        environment,
+      );
+
+      assert.equal(recovered.code, 0);
+      assert.match(recovered.stdout, /The hook received and analyzed the user request\./);
+      assert.deepEqual(await readdir(join(projectDir, '.claude')), []);
+    } finally {
+      await destroyEnvironment(environment);
     }
   });
 });

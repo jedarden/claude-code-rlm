@@ -1590,6 +1590,47 @@ function sdkScratchPath(cwd) {
   return join(cwd || process.cwd(), '.claude', `rlm-scratch-${process.pid}.md`);
 }
 
+/**
+ * Remove scratch files left behind by a hook process that was killed before
+ * its normal finally block ran. Only regular files with a numeric PID owner
+ * are candidates; a live PID (including one we cannot probe due to
+ * permissions) is left untouched so concurrent runs keep their notes.
+ */
+async function cleanupOrphanedScratchFiles(cwd) {
+  const scratchDir = join(cwd || process.cwd(), '.claude');
+  let entries;
+  try {
+    entries = await readdir(scratchDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const match = /^rlm-scratch-(\d+)\.md$/.exec(entry.name);
+    if (!match) continue;
+
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      // EPERM means the process exists but is not probeable. Preserve it;
+      // only a definite ESRCH is safe evidence of an orphan.
+      alive = error?.code !== 'ESRCH';
+    }
+    if (alive || pid === process.pid) continue;
+
+    try {
+      await rm(join(scratchDir, entry.name), { force: true });
+    } catch {
+      // Cleanup is best-effort and must never prevent the hook from running.
+    }
+  }
+}
+
 /** Write tool — always targets the pid-scoped scratch file (never user code). */
 async function toolWrite(content, cwd) {
   const root = cwd || process.cwd();
@@ -2250,6 +2291,11 @@ async function main() {
     ({ userMessage } = parsedInput);
     rememberSensitiveContent(userMessage);
     const { cwd, transcriptPath } = parsedInput;
+
+    // Recover files from runs killed before their normal cleanup finally block.
+    // This runs after parsing so it has the project root, but before skip/cache
+    // exits so every normal hook startup gets the same orphan cleanup chance.
+    await cleanupOrphanedScratchFiles(cwd);
 
     await log(`Processing input of length ${userMessage.length}${cwd ? ` in ${cwd}` : ''}`);
 
