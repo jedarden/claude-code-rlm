@@ -24,9 +24,35 @@ import { normalizePreresearch, parsePreresearchResponse, boundPreresearchOutput,
 import { createConfig, selectMode, shouldUseSDK as isSDKConfigured } from './rlm-config.mjs';
 import { appendRotating, ERROR_LOG_LIMIT, METRICS_LOG_LIMIT } from './rotating-log.mjs';
 
-const READ_ONLY_GIT_SUBCOMMANDS = new Set([
+export const READ_ONLY_GIT_SUBCOMMANDS = new Set([
   'status', 'log', 'diff', 'show', 'branch', 'ls-files', 'remote',
 ]);
+
+// Bash-gate tables. These MUST stay above the `--guard-agentic-tool` block
+// below: the guard runs as this module's entry point and calls
+// isAllowedGitCommand (via hoisting) before the rest of the module evaluates,
+// so const declarations further down would still be in their temporal dead
+// zone. Contract: docs/notes/sdk-tool-contracts.md.
+const GIT_BRANCH_MUTATING_SHORT = new Set(['d', 'D', 'm', 'M', 'c', 'C', 'u']);
+const GIT_BRANCH_MUTATING_LONG =
+  /^--(delete|move|copy|edit-description|set-upstream|set-upstream-to|unset-upstream)/;
+const GIT_MUTATING_LONG_ANY =
+  /^--(delete|move|copy|edit-description|set-upstream|set-upstream-to|unset-upstream|output=|output$|ext-diff)/;
+const GIT_BRANCH_VALUE_FLAGS = new Set(['--contains', '--no-contains', '--points-at', '--list']);
+const GIT_REMOTE_READ_ONLY_WORDS = new Set(['-v', '--verbose', '--all', 'show', 'get-url']);
+
+/**
+ * agenticAllowedTools — the subprocess invocation's `--allowedTools` value,
+ * derived from READ_ONLY_GIT_SUBCOMMANDS so the CLI permission layer and the
+ * SDK Bash gate expose exactly the same read-only git surface and cannot drift
+ * apart. The trailing rm rule covers scratch cleanup; the SDK path performs the
+ * same cleanup itself in a finally block after the tool loop. Contract:
+ * docs/notes/sdk-tool-contracts.md.
+ */
+export function agenticAllowedTools() {
+  const gitRules = [...READ_ONLY_GIT_SUBCOMMANDS].map((s) => `Bash(git ${s}:*)`).join(',');
+  return `Read,Glob,Grep,Write,${gitRules},Bash(rm .claude/rlm-scratch-*.md)`;
+}
 
 // Runs as the agentic subprocess's PreToolUse hook. Missing or malformed
 // inputs fail closed; the parent hook passes its exact PID-scoped target.
@@ -1125,7 +1151,7 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
         args.push('--tools', 'Read,Glob,Grep,Write,Bash');
         args.push('--disallowedTools', 'mcp__*');
         // Enable file exploration tools + read-only git + scratch file cleanup
-        args.push('--allowedTools', 'Read,Glob,Grep,Write,Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git branch:*),Bash(git ls-files:*),Bash(git remote:*),Bash(rm .claude/rlm-scratch-*.md)');
+        args.push('--allowedTools', agenticAllowedTools());
         args.push('--max-turns', String(CONFIG.maxTurns));
       } else {
         args.push('--safe-mode');
@@ -1224,7 +1250,7 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
  * `text` blocks joined in order. Defensive against missing/partial shapes so a
  * malformed response degrades to '' rather than throwing.
  */
-function extractSDKText(response) {
+export function extractSDKText(response) {
   if (!response || !Array.isArray(response.content)) return '';
   return response.content
     .filter(b => b && b.type === 'text' && typeof b.text === 'string')
@@ -1237,7 +1263,7 @@ function extractSDKText(response) {
  * Returns { input_tokens, output_tokens } or null if usage data is missing.
  * Defensive against missing/partial shapes.
  */
-function extractSDKUsage(response) {
+export function extractSDKUsage(response) {
   try {
     if (!response || typeof response !== 'object') return null;
     const usage = response.usage;
@@ -1348,7 +1374,7 @@ async function callHaikuDetailedSDK(prompt, apiKey, client = null) {
 // pid-scoped scratch file) or run arbitrary shell.
 
 /** The tool schema advertised to Haiku. Mirrors the agentic prompt's tool list. */
-const AGENTIC_TOOLS = [
+export const AGENTIC_TOOLS = [
   {
     name: 'Glob',
     description: 'Find files by glob pattern (e.g. "src/**/*.ts", "**/auth*"). Returns matching paths relative to the project root.',
@@ -1400,17 +1426,17 @@ const AGENTIC_TOOLS = [
 ];
 
 /** Single-quote a string for safe use as one shell argument. */
-function shellQuote(s) {
+export function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
 /** Resolve existing paths through symlinks before checking the project boundary. */
-function isWithinRoot(root, full) {
+export function isWithinRoot(root, full) {
   const rel = relative(root, full);
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-function resolveWithin(root, p) {
+export function resolveWithin(root, p) {
   if (typeof p !== 'string' || !p || !root) return null;
   try {
     const project = realpathSync(root);
@@ -1422,13 +1448,13 @@ function resolveWithin(root, p) {
 }
 
 /** Glob filters must remain relative even when the tool also supplies a path. */
-function isProjectGlob(pattern) {
+export function isProjectGlob(pattern) {
   return typeof pattern === 'string' && pattern.length > 0 &&
     !isAbsolute(pattern) && !pattern.startsWith('~') && !pattern.includes('..');
 }
 
 /** Recursive native CLI searches may follow symlinks; refuse such a tree. */
-function searchTreeStaysWithin(root, start) {
+export function searchTreeStaysWithin(root, start) {
   try {
     const project = realpathSync(root);
     const stack = [realpathSync(start)];
@@ -1454,7 +1480,7 @@ function searchTreeStaysWithin(root, start) {
   }
 }
 
-function isAllowedAgenticRead(event, root) {
+export function isAllowedAgenticRead(event, root) {
   const input = event?.tool_input;
   if (!input || typeof input !== 'object' || !root) return false;
   if (event.tool_name === 'Read') return Boolean(resolveWithin(root, input.file_path));
@@ -1481,17 +1507,74 @@ function isAllowedAgenticRead(event, root) {
  * The command must start with `git` and contain no shell metacharacters that
  * would allow chaining, redirection, or substitution (the command is run via a
  * shell, so this guard is what prevents `git log; rm -rf /`).
+ *
+ * A read-only first word is not sufficient on its own: several allowlisted
+ * subcommands carry mutating forms, so a bare allowlist would admit
+ * `git branch -D x` (deletes a ref), `git branch <name>` (creates a ref),
+ * `git remote add x url` (mutates .git/config), and `git diff --output=f`
+ * (writes a file) under a "read-only" contract. The gate therefore also:
+ *   - rejects mutating long flags on every allowlisted subcommand
+ *     (--delete, --move, --copy, --edit-description, --set-upstream,
+ *     --set-upstream-to, --unset-upstream, --output=<file>, and --ext-diff,
+ *     which hands diff rendering to repo config);
+ *   - for `branch`, rejects mutating short-flag letters (d/D/m/M/c/C/u),
+ *     including inside combined clusters like -avD, and rejects bare
+ *     positional arguments — the branch-creation form — unless a read-only
+ *     value flag (--contains/--no-contains/--points-at/--list) justifies them;
+ *   - for `remote`, accepts only the read-only forms (`git remote [-v]`,
+ *     `git remote show <name>`, `git remote get-url [--all] <name>`).
+ * Global options (`git -C <dir> log`) are rejected because the first word
+ * after `git` must itself be an allowlisted subcommand.
  */
-function isAllowedGitCommand(command) {
+export function isAllowedGitCommand(command) {
   const cmd = String(command || '').trim();
   if (!/^git(\s|$)/.test(cmd)) return false;
   if (/[;&|`$()<>{}\n]/.test(cmd)) return false;
-  const subcommand = cmd.match(/^git\s+(\S+)/)?.[1];
-  return READ_ONLY_GIT_SUBCOMMANDS.has(subcommand);
+  const args = cmd.split(/\s+/);
+  const subcommand = args[1];
+  if (!READ_ONLY_GIT_SUBCOMMANDS.has(subcommand)) return false;
+  if (subcommand === 'remote') {
+    // add/rename/remove/rm/set-head/set-branches/set-url/prune all mutate
+    // config or tracking refs. Only the read-only words pass, and a remote
+    // name is accepted only after `show`/`get-url`.
+    let takesName = false;
+    for (const a of args.slice(2)) {
+      if (a === 'show' || a === 'get-url') {
+        takesName = true;
+        continue;
+      }
+      if (GIT_REMOTE_READ_ONLY_WORDS.has(a) || takesName) continue;
+      return false;
+    }
+    return true;
+  }
+  if (subcommand === 'branch') {
+    let allowsPositional = false;
+    for (const a of args.slice(2)) {
+      if (a.startsWith('--')) {
+        if (GIT_BRANCH_MUTATING_LONG.test(a)) return false;
+        if (GIT_BRANCH_VALUE_FLAGS.has(a.split('=')[0])) allowsPositional = true;
+        continue;
+      }
+      if (a.startsWith('-') && a.length > 1) {
+        // Combined short clusters (`-av` is fine, `-avD` is not).
+        if (a.slice(1).split('').some((ch) => GIT_BRANCH_MUTATING_SHORT.has(ch))) return false;
+        continue;
+      }
+      // Bare positional without a value flag is the `git branch <name>`
+      // creation form.
+      if (!allowsPositional) return false;
+    }
+    return true;
+  }
+  for (const a of args.slice(2)) {
+    if (GIT_MUTATING_LONG_ANY.test(a)) return false;
+  }
+  return true;
 }
 
 /** glob → anchored RegExp. `**` crosses directory separators, `*`/`?` do not. */
-function globToRegExp(pattern) {
+export function globToRegExp(pattern) {
   let re = '';
   let i = 0;
   while (i < pattern.length) {
@@ -1522,7 +1605,7 @@ function globToRegExp(pattern) {
 const GLOB_SKIP_DIRS = new Set(['node_modules', '.git']);
 
 /** Glob tool — recursive readdir (fs.glob is Node 22+; we target Node 20). */
-async function toolGlob(pattern, cwd, limit = 100) {
+export async function toolGlob(pattern, cwd, limit = 100) {
   if (!pattern) return 'Error: Glob requires a pattern';
   if (!isProjectGlob(pattern)) return 'Error: Glob pattern escapes project root';
   const root = cwd || process.cwd();
@@ -1552,14 +1635,16 @@ async function toolGlob(pattern, cwd, limit = 100) {
 }
 
 /** Grep tool — delegates to system grep (recursive, skipping node_modules/.git). */
-function toolGrep(pattern, path, cwd) {
+export function toolGrep(pattern, path, cwd) {
   if (!pattern) return 'Error: Grep requires a pattern';
   const root = cwd || process.cwd();
   const target = resolveWithin(root, path || '.');
   if (!target) return `Error: path escapes project root: ${path}`;
   try {
+    // -H keeps the path:line:text prefix uniform even when the target is a
+    // single file (grep would otherwise omit the filename there).
     const out = execSync(
-      `grep -rn --exclude-dir=node_modules --exclude-dir=.git -e ${shellQuote(pattern)} ${shellQuote(target)} 2>/dev/null | head -50`,
+      `grep -rnH --exclude-dir=node_modules --exclude-dir=.git -e ${shellQuote(pattern)} ${shellQuote(target)} 2>/dev/null | head -50`,
       { timeout: 5000, maxBuffer: 1024 * 1024 }
     ).toString().trim();
     return out || 'No matches found.';
@@ -1571,7 +1656,7 @@ function toolGrep(pattern, path, cwd) {
 }
 
 /** Read tool — read a file inside the project root, truncating long content. */
-async function toolRead(path, cwd, maxBytes = 16000) {
+export async function toolRead(path, cwd, maxBytes = 16000) {
   if (!path) return 'Error: Read requires a path';
   const root = cwd || process.cwd();
   const full = resolveWithin(root, path);
@@ -1586,7 +1671,7 @@ async function toolRead(path, cwd, maxBytes = 16000) {
 }
 
 /** pid-scoped scratch path — avoids collisions between concurrent hook runs. */
-function sdkScratchPath(cwd) {
+export function sdkScratchPath(cwd) {
   return join(cwd || process.cwd(), '.claude', `rlm-scratch-${process.pid}.md`);
 }
 
@@ -1632,7 +1717,7 @@ async function cleanupOrphanedScratchFiles(cwd) {
 }
 
 /** Write tool — always targets the pid-scoped scratch file (never user code). */
-async function toolWrite(content, cwd) {
+export async function toolWrite(content, cwd) {
   const root = cwd || process.cwd();
   const scratch = sdkScratchPath(root);
   const text = String(content ?? '');
@@ -1646,7 +1731,7 @@ async function toolWrite(content, cwd) {
 }
 
 /** Bash tool — read-only git commands only. */
-function toolBashGit(command, cwd) {
+export function toolBashGit(command, cwd) {
   if (!command) return 'Error: Bash requires a command';
   if (!isAllowedGitCommand(command)) {
     return `Error: only read-only "git ..." commands are permitted (rejected: ${String(command).trim().slice(0, 60)})`;
@@ -1668,7 +1753,7 @@ function toolBashGit(command, cwd) {
  * return a string result for the tool_result block. Never throws: any failure
  * becomes an "Error: ..." string so the loop can continue and Haiku can react.
  */
-async function dispatchAgenticTool(name, input, cwd) {
+export async function dispatchAgenticTool(name, input, cwd) {
   const args = input || {};
   try {
     switch (name) {
@@ -1692,7 +1777,7 @@ async function dispatchAgenticTool(name, input, cwd) {
  * { text, usage } where usage is the summed { input_tokens, output_tokens } across
  * all turns, or null if unavailable. `client` and `dispatch` are injectable for tests.
  */
-async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch = dispatchAgenticTool) {
+export async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch = dispatchAgenticTool) {
   const startTime = Date.now();
   const c = client || await createAnthropicClient(apiKey);
   const messages = [{ role: 'user', content: prompt }];
@@ -2102,7 +2187,7 @@ async function semanticLookup(queryText, {
 // RESPONSE PARSING
 // =============================================================================
 
-function parseHaikuResponse(response) {
+export function parseHaikuResponse(response) {
   return parsePreresearchResponse(response);
 }
 
@@ -2110,7 +2195,7 @@ function parseHaikuResponse(response) {
 // OUTPUT FORMATTING
 // =============================================================================
 
-function formatOutput(analysis) {
+export function formatOutput(analysis) {
   analysis = normalizePreresearch(analysis);
   // console.log adds one newline to stdout; reserve it under the configured
   // total injection cap on every branch and every cache/reuse path.
@@ -2502,4 +2587,20 @@ async function main() {
   }
 }
 
-main();
+// rlm-hook.mjs ...`, including the install.sh copy and the
+// `--guard-agentic-tool` invocation, whose early-exit blocks above never reach
+// main). Contract tests import the module for its exported SDK tool layer;
+// without the entry-point check, importing would execute the whole hook.
+const invokedAsEntryPoint = (() => {
+  try {
+    const self = realpathSync(fileURLToPath(import.meta.url));
+    const entry = process.argv[1] ? realpathSync(process.argv[1]) : null;
+    return entry !== null && entry === self;
+  } catch {
+    return false;
+  }
+})();
+
+if (invokedAsEntryPoint) {
+  main();
+}
