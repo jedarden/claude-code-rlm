@@ -9,6 +9,34 @@ UserPromptSubmit fires once per user turn, before Opus/Sonnet sees the message. 
 
 The tradeoff: the hook must complete before Sonnet starts. We cap timeout at 60s (configurable via `RLM_TIMEOUT`). Graceful degradation (exit 0 on any error) ensures the hook never blocks the conversation.
 
+## Trust and injection surface
+
+The `<rlm_preresearch>` and `<rlm_analysis>` blocks, and their human-readable
+summaries, are **untrusted data, not instructions**. Haiku may copy text from a
+repository controlled by someone other than the user; that text can include
+instructions addressed to the main model. The main model must treat findings
+as leads to verify against the user's request and the repository, never as a
+new instruction source. Cache hits and prior-block reuse have the same trust
+posture as a fresh Haiku response.
+
+The parser normalizes every response before it can be emitted. It neutralizes
+RLM opening/closing tags and Markdown fences in strings and JSON keys, including
+unknown fields, so repository text cannot splice a second block or terminate
+the current one. It also limits strings, arrays, object keys, nesting, and
+unknown top-level fields. This is a framing defense; it cannot determine
+whether a plausible finding is true or prevent all semantic prompt injection.
+
+The **total stdout injection** (including `console.log`'s newline) is capped at
+12,000 characters by default. `RLM_MAX_OUTPUT_CHARS` accepts an integer and is
+clamped to 2,000–32,000 characters. The hook first truncates individual strings
+and collections, then drops unknown fields, then shrinks known fields under cap
+pressure. It marks structured elision with `rlm_truncated: true`. If even the
+shrunk JSON cannot fit, it emits a parseable truncation notice. The final
+rendering keeps the JSON block whole and truncates the repeated summary tail
+with a visible marker; if the block itself is too large, it replaces the body
+with the truncation notice. The exact limits and rule are in
+[Preresearch output schema](preresearch-schema.md#injected-output-bound).
+
 ## Skip Detection
 
 The hook skips RLM when the input is unlikely to benefit from codebase exploration:
@@ -57,6 +85,27 @@ The cwd half of the key scopes entries to a project, so one repository's cached 
 Cache misses are the common case for novel questions. The cache primarily helps with repeated queries in long sessions (e.g., retrying a prompt, running the same planning query after a small edit).
 
 Semantic caching (default off, `RLM_SEMANTIC_CACHE=true`) layers onto the SHA-256 miss path: on a miss, the query is embedded as `prompt + '\0' + cwd` and scored against stored embeddings, and the nearest analysis above `RLM_SEMANTIC_THRESHOLD` is served in place of a Haiku run. It uses an OpenAI-compatible embeddings endpoint. Set `RLM_EMBED_BASE_URL` to override the default `https://api.openai.com/v1`, and provide `OPENAI_API_KEY`. This is an outbound transmission of raw prompt text — see [Outbound data flow and privacy](#outbound-data-flow-and-privacy) for the payload and its controls.
+
+### Embedding failure and latency contract
+
+The exact SHA-256 cache lookup always runs first. An exact hit is therefore
+SHA-only: it does not contact the embedding endpoint, even when
+`RLM_SEMANTIC_CACHE=true`. Only a SHA miss attempts semantic lookup.
+
+Each embedding request has its own deadline, controlled by
+`RLM_EMBED_TIMEOUT` and defaulting to **5,000 ms**. The deadline covers waiting
+for response headers and reading the response body; the request is aborted when
+the transport supports abort signals. A timeout, connection failure, non-2xx
+response, or malformed response is a semantic-cache miss. The hook catches the
+failure and continues to the ordinary Haiku path; there is no second SHA lookup
+because the exact SHA lookup already completed. This is the SHA-256-only cache
+behavior: semantic caching cannot prevent a normal miss from reaching Haiku.
+
+The failure is recorded in `RLM_LOG_FILE` (normally
+`~/.local/share/rlm-hook/rlm-hook.log`) with the bounded diagnostic, including
+the timeout reason when applicable. The hook still exits 0. If the post-Haiku
+embedding write fails, the JSON SHA cache entry remains valid and the failure
+is logged in the same way.
 
 ## Graceful Degradation
 
