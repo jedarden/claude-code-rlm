@@ -70,13 +70,46 @@ Since we never want the preresearch hook to interrupt a conversation, all `catch
 
 ## Why subprocess instead of SDK
 
-The hook uses `spawn('claude', ...)` to invoke the Claude CLI rather than the Anthropic SDK directly. Reasons:
+The hook uses `spawn('claude', ...)` to invoke the Claude CLI rather than the Anthropic SDK directly. Reasons (verified against Anthropic's live docs, 2026-11-08 — see the next section for the evidence and citations):
 
-1. **No API key required**: Uses the user's existing Claude Max subscription (same billing as interactive Claude Code sessions). The SDK would require a separate `ANTHROPIC_API_KEY`.
+1. **No API key required**: Uses the user's existing Claude Pro/Max/Ultra subscription (same billing as interactive Claude Code sessions). Subscription credentials authenticate only the `claude` CLI and the surfaces that wrap it — the Anthropic SDK cannot bill `client.messages.create` to a claude.ai subscription.
 2. **Tool use for free**: The Claude CLI handles tool invocation natively in agentic mode. Implementing the same with the SDK requires a full tool-call loop.
-3. **Model routing**: The `--model` flag routes through the same proxy/subscription as the interactive session.
+3. **Model routing**: The `--model` flag routes through the same account/proxy as the interactive session.
 
 Tradeoffs: ~1–2s subprocess startup overhead vs direct API. See Phase 2 in `plan.md` for the SDK-direct path.
+
+## SDK-Direct mode: authentication, billing, and fallback
+
+Verified 2026-11-08 against Anthropic's own documentation (Claude Code authentication: `code.claude.com/docs/en/authentication.md`; Claude API authentication: `platform.claude.com/docs/en/manage-claude/authentication.md`). This resolves Phase 2's open questions in `plan.md`.
+
+### Which account types support which path
+
+| Credential | Bills to | Works with | Works with this hook |
+|---|---|---|---|
+| claude.ai Pro/Max/Ultra/Team/Enterprise login (OAuth, stored in `~/.claude/.credentials.json` / macOS Keychain) | Flat Claude.ai subscription | Only Claude Code surfaces: the `claude` CLI, VS Code extension, Agent SDK, GitHub Actions | **Default subprocess path only** |
+| `claude setup-token` long-lived OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`) | Same subscription | Same Claude Code surfaces; "can only make model requests" | Subprocess path (CI/headless Claude Code) |
+| Console API key (`ANTHROPIC_API_KEY`, `sk-ant-...`) | **Pay-per-token to a Console workspace** | Any SDK / raw-API client | Default path *and* `RLM_USE_SDK=true` SDK-Direct path |
+| Workload Identity Federation, App Attest | Pay-per-token to a Console workspace | Any SDK / raw-API client | Not wired up (`createConfig` reads only `ANTHROPIC_API_KEY`) |
+
+The decisive fact: the Claude API's documented credential types are exactly API keys, WIF, and App Attest — every one bills usage to a Console workspace. There is **no claude.ai subscription credential for direct API calls**. SDK-Direct mode therefore requires a Console API key and is *always* pay-per-token; a Max subscription cannot subsidize it. (Subscription OAuth tokens minted by Claude Code hit `api.anthropic.com` with `Authorization: Bearer` plus the `anthropic-beta: oauth-2025-04-20` header, but their authorized surface is Claude Code itself, not arbitrary SDK clients; `ant auth login` OAuth profiles are bound to a Console org+workspace and are pay-per-token too.)
+
+### Cost interaction to be aware of
+
+Claude Code's authentication precedence places `ANTHROPIC_API_KEY` (sent as `X-Api-Key`) **above** the subscription OAuth credential, and in non-interactive `-p` mode "the key is always used when present". This hook's fallback spawns `claude -p`, so once `ANTHROPIC_API_KEY` is exported into the hook's environment to enable SDK mode, the **fallback subprocess runs are billed pay-per-token too** — not to the subscription. A user on Max who enables `RLM_USE_SDK=true` should assume both paths bill to the Console while the key is in scope; unset the key (or scope it out of the hook's env) to return the subprocess path to subscription billing. For scale: `claude-haiku-4-5` lists at $1/$5 per MTok input/output (Anthropic first-party rate, October 2026), and an agentic run is estimated at ~2K–10K input / ~0.5K–2K output tokens.
+
+### Model IDs via SDK vs CLI (Phase 2 open question 2)
+
+The SDK and the CLI target the same `/v1/messages` endpoint, and the same explicit model IDs are valid on both — the hook's `claude-haiku-4-5-20251001` resolves identically either way. Aliases such as `haiku` are a CLI convenience layer and are not part of the SDK contract, so the hook correctly uses the full dated ID (`RLM_MODEL` overrides it). Verified from documentation, not a live call: anyone with a key can confirm with one Models API request — `await client.models.retrieve('claude-haiku-4-5-20251001')` (Models API is GA, no beta header).
+
+### Unavailable-access fallback (defined behavior)
+
+SDK-Direct mode degrades through three tiers, each ending with the hook still exiting 0 and emitting analysis when a prior tier produced nothing:
+
+1. **SDK configured but key missing/empty** (`RLM_USE_SDK=true`, no usable `ANTHROPIC_API_KEY`): `shouldUseSDK()` is false, no SDK call is attempted, and the run goes straight to the subprocess. As of 2026-11-08 the hook logs the reason ("RLM_USE_SDK=true but ANTHROPIC_API_KEY is not set — ... using subprocess fallback") once per run to `RLM_LOG_FILE` so silent cold-start cost is diagnosable. Covered by unit tests (gating) and the "SDK enabled but no API key" integration test.
+2. **SDK call fails at runtime** (bad key → 401, SDK not installed → import error, network error): the `catch` around each SDK branch logs the error and falls through to the subprocess path. Covered by the "fast/agentic SDK path: SDK failure falls back to subprocess" integration tests.
+3. **Subprocess also fails**: existing graceful degradation — empty stdout, exit 0, error logged (`~/.local/share/rlm-hook/rlm-hook.log`). The conversation is never blocked.
+
+Billing note for tier 2: the fallback runs on whatever credential the subprocess resolves, which per the cost interaction above may be the same Console key — a repeated SDK failure under a pay-per-token key means every fallback run is billed, not free.
 
 ## Model ID
 

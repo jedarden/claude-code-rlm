@@ -111,6 +111,16 @@ RLM_USE_SDK=true
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
+> **Billing:** SDK-Direct mode requires an **Anthropic Console API key** and is billed
+> **pay-per-token** to your Console workspace. A Claude Pro/Max/Ultra subscription
+> cannot be used — subscription credentials authenticate only the `claude` CLI, never
+> direct SDK/API calls (verified against Anthropic's docs, 2026-11-08; details in
+> `docs/notes/architecture.md`). Note also that with `ANTHROPIC_API_KEY` set, Claude
+> Code itself prefers that key over a subscription login in `-p` mode — so the hook's
+> *fallback subprocess runs* are pay-per-token too while the key is in the hook's
+> environment. Without a usable key the hook logs the reason and falls back to the
+> subprocess path automatically; the conversation is never blocked.
+
 If you skipped SDK installation during install, you can add it later:
 ```bash
 npm install --prefix ~/.claude/hooks @anthropic-ai/sdk
@@ -144,7 +154,7 @@ RLM_DASHBOARD_HOST=127.0.0.1                 # Dashboard bind host; loopback by 
 
 # Phase 2: SDK-Direct mode (alternative to subprocess)
 RLM_USE_SDK=true                       # Use Anthropic SDK directly (requires ANTHROPIC_API_KEY)
-ANTHROPIC_API_KEY=sk-ant-...           # Required when RLM_USE_SDK=true
+ANTHROPIC_API_KEY=sk-ant-...           # Required when RLM_USE_SDK=true (Console key, pay-per-token — see "SDK-Direct mode" above)
 RLM_SDK_MAX_TOKENS=2048                # Max tokens for SDK Haiku calls (default: 2048)
 
 # Phase 3: Semantic caching (embeddings)

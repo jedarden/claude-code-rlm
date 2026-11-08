@@ -2181,6 +2181,20 @@ async function main() {
 
     let response = null;
 
+    // Observability for the silent fallback: SDK-Direct mode requires a Console
+    // API key (a Claude Pro/Max subscription authenticates only the `claude`
+    // CLI, never client.messages.create). When RLM_USE_SDK=true is set but no
+    // usable key is present, say so once in the log instead of quietly paying
+    // subprocess cold-start forever. stdout stays untouched — it is the context
+    // injection channel.
+    if (CONFIG.useSDK && !isSDKConfigured(CONFIG)) {
+      await log(
+        'RLM_USE_SDK=true but ANTHROPIC_API_KEY is not set — SDK-Direct mode ' +
+        'requires an Anthropic Console API key (subscription auth rides the ' +
+        'claude CLI only); using subprocess fallback'
+      );
+    }
+
     // SDK-Direct path (Phase 2): any non-agentic mode (fast or detailed) can skip
     // the subprocess entirely — both are single-turn, tool-free calls that differ
     // only in the prompt. On any SDK error, fall through to the subprocess so the

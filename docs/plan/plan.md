@@ -81,8 +81,8 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 **Expected latency:** ~800ms for fast mode, ~2–5s for agentic mode (no subprocess overhead, but tool calls still have I/O latency).
 
 **Open questions:**
-- Does the Max subscription expose an API endpoint, or is SDK mode only for pay-per-token accounts?
-- Need to confirm model ID availability via SDK (vs CLI alias routing)
+- ~~Does the Max subscription expose an API endpoint, or is SDK mode only for pay-per-token accounts?~~ **RESOLVED (2026-11-08, bead claudeco-0aef7e7d)** — No. The Claude API's documented credential types (API key, Workload Identity Federation, App Attest) all bill pay-per-token to a Console workspace; a claude.ai Pro/Max/Ultra subscription authenticates only Claude Code surfaces (the `claude` CLI and what wraps it). SDK-Direct mode requires `ANTHROPIC_API_KEY` and is always pay-per-token — the subprocess path is the only subscription-billed route. Evidence and the account/credential matrix: `docs/notes/architecture.md`, "SDK-Direct mode: authentication, billing, and fallback". Cost caveat verified there: setting `ANTHROPIC_API_KEY` also switches the fallback `claude -p` subprocess to pay-per-token billing (Claude Code auth precedence puts the key above the subscription login, and `-p` always uses a present key).
+- ~~Need to confirm model ID availability via SDK (vs CLI alias routing)~~ **RESOLVED (2026-11-08, bead claudeco-0aef7e7d)** — SDK and CLI hit the same `/v1/messages` endpoint with the same explicit model IDs; the hook's dated `claude-haiku-4-5-20251001` is valid on both. Aliases (`haiku`) are a CLI-only convenience, so keeping the full dated ID is correct. Doc-verified; live check for key holders: `client.models.retrieve('claude-haiku-4-5-20251001')` (Models API, GA).
 
 ---
 
