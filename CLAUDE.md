@@ -46,7 +46,8 @@ Commit `package.json` and `package-lock.json` together.
 
 ## Env vars (all optional, runtime config)
 
-All `RLM_*` vars are documented in `rlm-hook.mjs` at the top (lines 32-76). Key ones:
+All `RLM_*` vars are documented in the README's Configuration section and parsed
+by `createConfig` in `rlm-config.mjs`. Key ones:
 - `RLM_AGENTIC_MODE` — `true` (default) to enable codebase exploration with tools; `false` for fast analysis only
 - `RLM_FAST_MODE` — `true` (default) for concise non-agentic analysis (~4s); `false` for detailed (~9s)
 - `RLM_USE_SDK` — `true` to use Anthropic SDK directly instead of subprocess (requires `ANTHROPIC_API_KEY`)
@@ -67,6 +68,21 @@ metrics remain reachable only from the local machine. Set `RLM_DASHBOARD_HOST`
 explicitly to bind elsewhere; non-loopback hosts expose intents, latencies, and
 token counts to any network path that can reach port 9876, so use an appropriate
 firewall or access control boundary.
+
+## Supplying credentials
+
+`RLM_USE_SDK` needs `ANTHROPIC_API_KEY`; `RLM_SEMANTIC_CACHE` needs
+`OPENAI_API_KEY`. The hook reads both from its process environment only — it has
+no key-file feature of its own. Keep the long-lived value in a secret store
+(e.g. an OpenBao path like `secret/<cluster>/claude-code-rlm/<key>`) or a
+mode-600 env file that the shell launching Claude Code sources, and materialize
+it by pipe or interactive read. Never place the value on a command line, in an
+rc-file literal, in a `settings.json` `env` entry, or in any commit, bead, log,
+or doc. Verify features by property, not by echoing the key: a fresh
+`Used SDK-Direct` log line plus a numeric `token_estimate` on the metrics
+`complete` record for SDK mode; a `.embedding` sidecar in the cache dir plus a
+`Wrote semantic embedding` log line for the semantic cache. Recipes and failure
+signatures: README, [Supplying credentials](README.md#supplying-credentials).
 
 ## Marathon
 

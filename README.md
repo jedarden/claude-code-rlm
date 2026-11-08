@@ -109,11 +109,11 @@ The install script copies `rlm-hook.mjs` to `~/.claude/hooks/` and makes it exec
 - Claude Code CLI (`claude` in PATH)
 
 **SDK-Direct mode (optional):**
-If you chose to install SDK dependencies during installation, set these environment variables:
-```bash
-RLM_USE_SDK=true
-ANTHROPIC_API_KEY=sk-ant-...
-```
+If you chose to install SDK dependencies during installation, set
+`RLM_USE_SDK=true` and supply `ANTHROPIC_API_KEY` through the environment of the
+process that launches Claude Code — by reference from a secret store or a
+mode-600 env file, never as a literal on a command line or in a shell rc file.
+See [Supplying credentials](#supplying-credentials) below.
 
 > **Billing:** SDK-Direct mode requires an **Anthropic Console API key** and is billed
 > **pay-per-token** to your Console workspace. A Claude Pro/Max/Ultra subscription
@@ -167,7 +167,11 @@ hook, remove that entry by hand — the script only manages the user-level
 
 ## Configuration
 
-All configuration is via environment variables. Set them in your shell profile or in `~/.claude/settings.json` under `env`.
+All configuration is via environment variables. Set them in your shell profile
+or in `~/.claude/settings.json` under `env` — with one exception:
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` should be supplied by reference, not
+stored as literals anywhere on disk ([Supplying
+credentials](#supplying-credentials) below).
 
 ```bash
 # Master switch
@@ -196,6 +200,7 @@ RLM_DASHBOARD_HOST=127.0.0.1                 # Dashboard bind host; loopback by 
 # Phase 2: SDK-Direct mode (alternative to subprocess)
 RLM_USE_SDK=true                       # Use Anthropic SDK directly (requires ANTHROPIC_API_KEY)
 ANTHROPIC_API_KEY=sk-ant-...           # Required when RLM_USE_SDK=true (Console key, pay-per-token — see "SDK-Direct mode" above)
+                                       # Supply by reference — see Supplying credentials below
 RLM_SDK_MAX_TOKENS=2048                # Max tokens for SDK Haiku calls (default: 2048)
 
 # Phase 3: Semantic caching (embeddings)
@@ -205,6 +210,7 @@ RLM_EMBED_MODEL=text-embedding-3-small # OpenAI embedding model (default: text-e
 RLM_EMBED_BASE_URL=https://api.openai.com/v1  # Embedding API endpoint
 RLM_EMBED_TIMEOUT=5000                # Per-request embedding deadline in ms
 OPENAI_API_KEY=sk-...                  # Required for semantic caching
+                                       # Supply by reference — see Supplying credentials below
 
 # Phase 4: Context awareness
 RLM_CONTEXT_WINDOW=5                   # How many prior RLM blocks to look back (default: 5)
@@ -213,6 +219,125 @@ RLM_GATHER_CONTEXT=true                # Gather project context (default: true)
 # Debug
 RLM_DEBUG=true    # Verbose logging to RLM_LOG_FILE
 ```
+
+### Supplying credentials
+
+Two features read a credential from the hook's process environment:
+
+| Feature | Gate | Variable |
+|---|---|---|
+| SDK-Direct mode | `RLM_USE_SDK=true` | `ANTHROPIC_API_KEY` — Anthropic Console key, pay-per-token |
+| Semantic cache | `RLM_SEMANTIC_CACHE=true` | `OPENAI_API_KEY` |
+
+The hook reads both from its process environment only (`createConfig` in
+`rlm-config.mjs`); it has no key-file or key-URI feature of its own. Supplying
+by reference means the long-lived value lives in a secret store or a protected
+file, and the shell or wrapper that launches Claude Code materializes it into
+the environment the hook inherits. Keep the value out of every channel that
+captures and copies text:
+
+- **Never on a command line.** `ANTHROPIC_API_KEY=sk-ant-… claude` (or any
+  inline assignment in a launcher invocation) puts the key into `ps` output and
+  shell history. Export it from the parent environment instead.
+- **Never as a literal in a shell rc file.** Dotfiles end up in repos, backups,
+  and sync targets. Source a file that holds the value; don't inline it.
+- **Never in `~/.claude/settings.json` `env`.** That is plaintext on disk and is
+  injected into every Claude Code session, not just this hook.
+- **Never in a repo, bead, ticket, log, or document** — including this one; the
+  `sk-…` shapes in the listing above are placeholders, not values.
+
+**Option A — secret store (preferred where one exists).** Park the key at a
+stable path — for example an OpenBao KV mount serving
+`secret/<cluster>/claude-code-rlm/anthropic_api_key` and `…/openai_api_key` —
+writing it once through the store CLI's stdin field (`key=-`) so the value never
+appears as an argument. Then materialize it into a mode-600 env file through a
+pipe, so it never touches the terminal either:
+
+```bash
+install -d -m 700 ~/.config/rlm-hook
+umask 077
+{
+  printf 'ANTHROPIC_API_KEY='
+  bao kv get -field=anthropic_api_key secret/<cluster>/claude-code-rlm/anthropic_api_key
+  printf 'OPENAI_API_KEY='
+  bao kv get -field=openai_api_key secret/<cluster>/claude-code-rlm/openai_api_key
+} > ~/.config/rlm-hook/creds.env
+```
+
+Re-run that after rotating a key. Then load the file where sessions start —
+the rc file now holds a reference, not a value:
+
+```bash
+# in the shell profile or wrapper that launches Claude Code
+set -a; source ~/.config/rlm-hook/creds.env; set +a
+```
+
+**Option B — no secret store.** The same mode-600 file, filled interactively so
+the value never lands in history or argv:
+
+```bash
+install -d -m 700 ~/.config/rlm-hook
+install -m 600 /dev/null ~/.config/rlm-hook/creds.env
+read -rs -p 'ANTHROPIC_API_KEY: ' k && printf 'ANTHROPIC_API_KEY=%s\n' "$k" >> ~/.config/rlm-hook/creds.env && unset k
+read -rs -p 'OPENAI_API_KEY: '    k && printf 'OPENAI_API_KEY=%s\n'    "$k" >> ~/.config/rlm-hook/creds.env && unset k
+```
+
+If the file is copied or synced anywhere, re-check the mode:
+`stat -c '%a' ~/.config/rlm-hook/creds.env` must print `600`.
+
+**Billing scoping:** while `ANTHROPIC_API_KEY` is in the hook's environment,
+Claude Code's auth precedence bills the hook's *fallback subprocess* runs
+pay-per-token too (see the billing note under Installation and the
+[architecture notes](docs/notes/architecture.md#sdk-direct-mode-authentication-billing-and-fallback)).
+Source the env file only where preresearch is actually used; unsetting the key
+returns subprocess runs to subscription billing.
+
+**Verify by property — never by echoing.** A working key is proven by its
+effects; a broken one by its log line. The key itself is never printed at any
+step below — the hook's observability content policy already keeps credential
+values out of every log it writes, so `echo "$ANTHROPIC_API_KEY"` would be the
+only step in the loop that leaks.
+
+SDK-Direct mode — after one non-trivial prompt on a cold cache:
+
+```bash
+grep -F 'Used SDK-Direct' ~/.local/share/rlm-hook/rlm-hook.log   # want: a fresh hit
+grep '"event":"complete"' ~/.local/share/rlm-hook/metrics.jsonl | tail -n 1
+# want: the matching record (compare "ts" with the log line) carrying a numeric
+# "token_estimate":{"input_tokens":…,"output_tokens":…} — on SDK runs that
+# envelope is the provider's exact usage, which exists only if the call succeeded
+```
+
+Recognize the failure signatures instead of inspecting the key's value:
+
+| Log line | Meaning |
+|---|---|
+| `RLM_USE_SDK=true but ANTHROPIC_API_KEY is not set — … using subprocess fallback` | The key never reached the hook's environment — fix the supply path, not the SDK |
+| `SDK fast/detailed/agentic path failed, falling back to subprocess: …` | The key arrived but was rejected (401) or the SDK import failed — check the key's billing route, then re-materialize |
+
+Semantic cache — after one fresh analysis:
+
+```bash
+ls ~/.cache/rlm-hook/*.embedding                                        # want: ≥1 sidecar file
+grep -F 'Wrote semantic embedding' ~/.local/share/rlm-hook/rlm-hook.log # want: a fresh hit, with a dimension
+```
+
+A `.embedding` sidecar is written only after the embeddings endpoint accepted
+the key, so its existence is the property. A near-identical follow-up prompt
+should then log `Semantic cache hit` and append a metrics record containing
+`"source":"semantic"`:
+
+```bash
+grep '"source":"semantic"' ~/.local/share/rlm-hook/metrics.jsonl | tail -n 1
+```
+
+| Log line | Meaning |
+|---|---|
+| `Semantic cache enabled but no embedding API key — skipping embedding write` | `OPENAI_API_KEY` never reached the environment |
+| `Embedding write failed (degrading to SHA-256 cache): … HTTP 401` | The key arrived but was rejected — rotate it in the store, then re-materialize the file |
+
+Both checks read log labels and file presence only; no key material is printed
+anywhere in the loop.
 
 ---
 

@@ -48,9 +48,12 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
   npm install --prefix "${HOOK_DIR}" @anthropic-ai/sdk
   echo "SDK dependencies installed to ${HOOK_DIR}/node_modules/"
   echo ""
-  echo "To enable SDK mode, set in your environment or ~/.claude/settings.json:"
-  echo "  RLM_USE_SDK=true"
-  echo "  ANTHROPIC_API_KEY=sk-ant-..."
+  echo "To enable SDK mode, set RLM_USE_SDK=true and supply ANTHROPIC_API_KEY"
+  echo "by reference: keep the key in a secret store (e.g. an OpenBao path like"
+  echo "secret/<cluster>/claude-code-rlm/anthropic_api_key) or a mode-600 env"
+  echo "file that the shell launching Claude Code sources. Do not paste the key"
+  echo "into a command line, a shell rc file, or a settings.json env block."
+  echo "See README.md, 'Supplying credentials', for recipes and verification."
   echo ""
 else
   echo "Skipping SDK dependencies. The hook will use subprocess mode (default)."
