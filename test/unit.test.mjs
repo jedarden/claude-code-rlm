@@ -22,7 +22,13 @@ import { createConfig, DEFAULTS } from '../rlm-config.mjs';
 import { parseLog, aggregate, percentile, summarize } from '../bench/parse-log.mjs';
 // dashboard.mjs is likewise side-effect-free on import (CLI/server guarded by
 // import.meta.url) — renderHTML / esc are pure string fns.
-import { renderHTML, esc } from '../bench/dashboard.mjs';
+import {
+  renderHTML,
+  esc,
+  dashboardHost,
+  startDashboardServer,
+  DEFAULT_DASHBOARD_HOST,
+} from '../bench/dashboard.mjs';
 
 // ============================================================================
 // INLINED LOGIC FROM rlm-hook.mjs
@@ -4607,6 +4613,25 @@ describe('Group 26: Metrics dashboard renderHTML (Phase 5)', () => {
   it('shows the log path in the subheader when provided', () => {
     const html = renderHTML(aggregate([]), { logPath: '/tmp/metrics.jsonl' });
     assert.match(html, /Source: \/tmp\/metrics\.jsonl/);
+  });
+
+  it('binds the live dashboard to loopback by default', async () => {
+    assert.equal(DEFAULT_DASHBOARD_HOST, '127.0.0.1');
+    assert.equal(dashboardHost({}), DEFAULT_DASHBOARD_HOST);
+    assert.equal(dashboardHost({ RLM_DASHBOARD_HOST: '   ' }), DEFAULT_DASHBOARD_HOST);
+
+    const server = startDashboardServer('/tmp/metrics.jsonl', { port: 0 });
+    await new Promise((resolve, reject) => {
+      server.once('listening', resolve);
+      server.once('error', reject);
+    });
+    assert.equal(server.address().address, DEFAULT_DASHBOARD_HOST);
+    await new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  });
+
+  it('allows an explicit RLM_DASHBOARD_HOST override', () => {
+    assert.equal(dashboardHost({ RLM_DASHBOARD_HOST: '0.0.0.0' }), '0.0.0.0');
+    assert.equal(dashboardHost({ RLM_DASHBOARD_HOST: ' ::1 ' }), '::1');
   });
 });
 

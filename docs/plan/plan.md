@@ -150,7 +150,7 @@ Opus/Sonnet sees: [RLM context] + [user prompt]
 - `currentMode` — returns current mode (agentic/fast/detailed)
 - Metrics wired at every `main()` exit (skip, cache_hit SHA/semantic, context_reuse, haiku_skip, complete, error)
 - `bench/parse-log.mjs` — JSONL parser + per-UTC-day aggregation with nearest-rank percentiles
-- `bench/dashboard.mjs` — static HTML render + `--serve` HTTP server on port 9876
+- `bench/dashboard.mjs` — static HTML render + `--serve` HTTP server on `127.0.0.1:9876` by default; `RLM_DASHBOARD_HOST` explicitly overrides the bind host
 - Configurable via `RLM_METRICS_FILE`
 
 **Features implemented:**

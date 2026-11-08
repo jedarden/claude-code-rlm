@@ -140,6 +140,7 @@ RLM_MAX_TURNS=10                       # Max tool calls in agentic mode
 RLM_CACHE_DIR=~/.cache/rlm-hook        # Cache directory
 RLM_LOG_FILE=~/.local/share/rlm-hook/rlm-hook.log
 RLM_METRICS_FILE=~/.local/share/rlm-hook/metrics.jsonl  # Phase 5: metrics JSONL for dashboard
+RLM_DASHBOARD_HOST=127.0.0.1                 # Dashboard bind host; loopback by default
 
 # Phase 2: SDK-Direct mode (alternative to subprocess)
 RLM_USE_SDK=true                       # Use Anthropic SDK directly (requires ANTHROPIC_API_KEY)
@@ -225,8 +226,14 @@ files remain best effort and cannot interrupt the hook.
 # Serve the dashboard
 node bench/dashboard.mjs --serve
 
-# Access at http://localhost:9876
+# Access locally at http://127.0.0.1:9876
 ```
+
+The server binds to `127.0.0.1:9876` by default, keeping prompt-derived
+metrics local to the machine. To make it reachable from another host, set
+`RLM_DASHBOARD_HOST` explicitly (for example, `RLM_DASHBOARD_HOST=0.0.0.0`);
+that exposes intents, latencies, and token counts to the network, so protect
+the port with an appropriate firewall or access-control boundary.
 
 **Metrics tracked:**
 

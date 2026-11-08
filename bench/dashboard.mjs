@@ -19,8 +19,9 @@
  *   node bench/dashboard.mjs                  # render to bench/results/dashboard.html
  *   node bench/dashboard.mjs <log>            # explicit log path
  *   node bench/dashboard.mjs --out <path>     # explicit output HTML path
- *   node bench/dashboard.mjs --serve          # serve live on http://localhost:9876
+ *   node bench/dashboard.mjs --serve          # serve on 127.0.0.1:9876 by default
  *   node bench/dashboard.mjs --serve --port N # serve on a custom port
+ *   RLM_DASHBOARD_HOST=0.0.0.0 node bench/dashboard.mjs --serve # explicitly expose
  */
 
 import { createServer } from 'http';
@@ -28,6 +29,22 @@ import { writeFile, mkdir } from 'fs/promises';
 import { dirname, join } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { aggregate, parseLog, readLog, defaultLogPath } from './parse-log.mjs';
+
+/** The dashboard is loopback-only unless an operator explicitly overrides it. */
+export const DEFAULT_DASHBOARD_HOST = '127.0.0.1';
+
+/**
+ * Resolve the dashboard bind host from the environment.
+ *
+ * An explicit host is an opt-in to a different access posture. Empty values
+ * are treated as unset so the safe loopback default remains in effect.
+ */
+export function dashboardHost(env = process.env) {
+  const configured = env && typeof env.RLM_DASHBOARD_HOST === 'string'
+    ? env.RLM_DASHBOARD_HOST.trim()
+    : '';
+  return configured || DEFAULT_DASHBOARD_HOST;
+}
 
 // ---------------------------------------------------------------------------
 // Pure HTML render (no FS, no clock — directly importable for tests)
@@ -217,6 +234,28 @@ async function buildHTML(logPath) {
   return renderHTML(agg, { logPath });
 }
 
+/** Start the live dashboard server and return the listening server instance. */
+export function startDashboardServer(logPath, options = {}) {
+  const port = options.port ?? 9876;
+  const host = options.host ?? dashboardHost();
+  const server = createServer(async (req, res) => {
+    try {
+      const html = await buildHTML(logPath);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(`dashboard error: ${err && err.message}`);
+    }
+  });
+  server.listen(port, host, () => {
+    const displayHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+    console.error(`RLM dashboard serving ${logPath}`);
+    console.error(`  → http://${displayHost}:${port}`);
+  });
+  return server;
+}
+
 function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = { serve: false, port: 9876, out: null, logPath: null };
@@ -235,20 +274,7 @@ async function main(argv) {
   const logPath = opts.logPath || defaultLogPath();
 
   if (opts.serve) {
-    const server = createServer(async (req, res) => {
-      try {
-        const html = await buildHTML(logPath);
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
-      } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end(`dashboard error: ${err && err.message}`);
-      }
-    });
-    server.listen(opts.port, () => {
-      console.error(`RLM dashboard serving ${logPath}`);
-      console.error(`  → http://localhost:${opts.port}`);
-    });
+    startDashboardServer(logPath, opts);
     return;
   }
 

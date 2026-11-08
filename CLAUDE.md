@@ -12,7 +12,7 @@ A `UserPromptSubmit` hook for Claude Code that dispatches Haiku to pre-explore t
 - `test/unit.test.mjs` — unit tests (inline logic, no imports from hook)
 - `test/integration.test.mjs` — integration tests (fake subprocess injection)
 - `bench/benchmark.mjs` — benchmark suite
-- `bench/dashboard.mjs` — metrics dashboard (Phase 5, serves on port 9876)
+- `bench/dashboard.mjs` — metrics dashboard (Phase 5, loopback-only on port 9876 by default)
 
 ## Test commands
 
@@ -59,7 +59,14 @@ All `RLM_*` vars are documented in `rlm-hook.mjs` at the top (lines 32-76). Key 
 - `RLM_CONTEXT_WINDOW` — How many prior RLM blocks to look back for context reuse (default: 5)
 - `RLM_GATHER_CONTEXT` — Gather project context (default: true)
 - `RLM_METRICS_FILE` — Path to metrics JSONL log for dashboard (Phase 5)
+- `RLM_DASHBOARD_HOST` — Dashboard bind host (default: `127.0.0.1`; set explicitly, for example `0.0.0.0`, only when network access is intended)
 - `RLM_DEBUG` — `true` for verbose logging to `RLM_LOG_FILE`
+
+The live metrics dashboard binds to `127.0.0.1:9876` by default, so prompt-derived
+metrics remain reachable only from the local machine. Set `RLM_DASHBOARD_HOST`
+explicitly to bind elsewhere; non-loopback hosts expose intents, latencies, and
+token counts to any network path that can reach port 9876, so use an appropriate
+firewall or access control boundary.
 
 ## Marathon
 
