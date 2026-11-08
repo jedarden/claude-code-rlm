@@ -8,7 +8,7 @@
 
 RLM stands for **Retrieval-augmented Language Model** in the academic literature, but that framing misses what this project actually does. The academic RLM retrieves documents from a static corpus at query time. This hook does something structurally different: it dispatches a lightweight agent to *actively explore* a live codebase, synthesize what it finds, and hand the synthesis to a more capable model before that model ever processes the query.
 
-The better mental model is **preresearch delegation**: you hire a junior researcher (Haiku) to spend 20 seconds canvassing the relevant materials, then walk into the meeting with a senior consultant (Opus/Sonnet) who has already been briefed. The senior consultant's first words are substantive — not "let me take a look around first."
+The better mental model is **preresearch delegation**: a smaller model (Haiku) canvasses relevant materials and briefs the main model (Opus/Sonnet). The time spent and how much orientation the main model can skip depend on the prompt, repository, and model response.
 
 ---
 
@@ -29,9 +29,9 @@ A static retriever cannot do any of this. A human would do all of it instinctive
 
 ## The latency-vs-quality trade-off
 
-The core tension is that preresearch costs time (20s in agentic mode) and money. The break-even depends on how much exploration the main model would otherwise do.
+The core tension is that preresearch costs time and money. The break-even depends on how much exploration the main model would otherwise do, and whether the injected summary actually reduces that work.
 
-Empirically, a cold Opus or Sonnet session on an unfamiliar codebase spends 10–20 tool calls on orientation before writing code. At Opus pricing, those calls are expensive. Haiku at a tenth of the cost runs the same orientation pass faster and compresses the findings into a single injected block. The main model's first tool call is substantive.
+A cold session on an unfamiliar codebase *might* use 10–20 tool calls to orient before writing code. That range is an illustrative assumption from the original project rationale; this repository has no paired runs measuring orientation calls with and without the hook. Haiku may compress useful exploration into one injected block, but the main model can still need to inspect and verify files. A net latency or cost benefit has not been established by the repository's benchmark.
 
 For short, self-contained prompts — "what does `x` do?", quick edits with a file already in context — the trade-off inverts: preresearch adds latency with no payoff. This is why skip detection is non-negotiable, not an optimization.
 
@@ -41,9 +41,9 @@ For short, self-contained prompts — "what does `x` do?", quick edits with a fi
 
 Three properties make Haiku the right choice for the preresearch role:
 
-1. **Speed.** Haiku's time-to-first-token is roughly 4–6x lower than Sonnet and 10x lower than Opus. The 20s agentic budget covers 10 tool calls with synthesis to spare.
+1. **Speed.** Anthropic [positions Haiku as its lower-latency model](https://platform.claude.com/docs/en/models/overview). The earlier 4–6×/10× time-to-first-token ratios have no recorded model versions, workload, or measurement here, so they should not be treated as measured results. This hook allows up to `RLM_MAX_TURNS` (default 10) model turns in agentic mode, within `RLM_TIMEOUT` (default 60 s); neither limit promises that a run will finish in 20 s or use every turn. One turn may contain multiple tool calls.
 
-2. **Cost.** Preresearch is a lossy summarization task — we are discarding most of what Haiku finds and keeping only the synthesis. Paying Opus prices for lossy summarization is wasteful.
+2. **Cost.** Preresearch retains a synthesis rather than every file read. At [Anthropic's Claude API list prices](https://platform.claude.com/docs/en/about-claude/pricing), Haiku 4.5 is $1/$5 per million input/output tokens, Sonnet 4.5 is $3/$15, and Opus 4.5 is $5/$25. Haiku's per-token rates are one-third and one-fifth of those rates at equal token usage, rather than a universal one-tenth cost. Actual spend depends on the model versions, token mix, caching, and billing route; the extra Haiku request may increase total spend if it saves little main-model work.
 
 3. **Structured output reliability.** Haiku follows JSON schema instructions accurately. The synthesis step produces a structured block that the hook can parse and reformat without post-processing heuristics.
 
@@ -55,7 +55,7 @@ Haiku is not the right model for nuanced judgment calls, subtle architectural tr
 
 Coding sessions are repetitive in a specific way. Developers refine prompts — they ask roughly the same thing two or three times, tweaking wording, then accept one answer and move on. They re-open a session to continue yesterday's work with nearly identical initial context. They hit the same files repeatedly across a session.
 
-A SHA-256 cache keyed on `(prompt, cwd)` with a 1-hour TTL captures most of this repetition. The 37ms cache hit cost is essentially free — lower than the round-trip to display a response. The two key dimensions do different jobs: `prompt` identifies the request; `cwd` scopes it to a project, so the same question asked in two different repositories cannot serve one repository's file paths into the other's context. What the key cannot see is code changing underneath a stable prompt and working directory — staleness is bounded by the TTL, not by the key.
+A SHA-256 cache keyed on `(prompt, cwd)` with a 1-hour TTL can capture exact repeat requests. No end-to-end log or environment description is committed for the README's historical ~37 ms cache-hit example. The committed [cache benchmark](../../bench/README.md) measures synthetic file-cache operations, not full hook time; the hook's metrics log records `latency_ms` for actual cache hits. The two key dimensions do different jobs: `prompt` identifies the request; `cwd` scopes it to a project, so the same question asked in two different repositories cannot serve one repository's file paths into the other's context. What the key cannot see is code changing underneath a stable prompt and working directory — staleness is bounded by the TTL, not by the key.
 
 The 1-hour TTL is a deliberate choice: long enough to cover a focused coding session, short enough that stale preresearch from before a major refactor does not persist into the next session.
 

@@ -16,13 +16,15 @@ When you type a prompt in Claude Code, this hook fires first. Haiku (fast, cheap
 
 ## Why it matters
 
-**Without RLM:** Opus starts cold. It spends 10–20 tool calls just orienting itself — reading `package.json`, globbing for test files, grepping for the function you mentioned — before writing a single line of code. You're paying Opus prices for work Haiku could do at a tenth of the cost.
+**Without RLM:** On an unfamiliar codebase, the main model may first read project files, find tests, and search for relevant symbols. A 10–20-call orientation pass is an illustrative scenario, not a measured baseline or a prediction for every prompt. The number of calls saved by this hook has not been measured here.
 
-**With RLM:** Haiku pre-maps the codebase in the time it takes you to read your own prompt back. Opus gets handed a structured summary of the files that matter, the patterns already in use, and the most recent relevant commits. It starts implementing on turn one.
+**With RLM:** Haiku can hand the main model a structured summary of relevant files, existing patterns, and recent changes. The main model may still need to inspect files and verify the summary; whether preresearch saves time depends on the task and hook latency.
 
-**Smart skipping:** Trivial queries — `ls`, `/help`, short affirmatives, pure CLI commands — are detected and bypassed instantly. No API call, no delay.
+**Smart skipping:** Trivial queries — `ls`, `/help`, short affirmatives, pure CLI commands — bypass the model call. The hook itself still takes time to run.
 
-**Caching:** Identical or near-identical prompts (common in coding sessions where you refine the same request) return in ~37ms via a SHA-256 keyed file cache with a 1-hour TTL.
+**Caching:** An identical prompt in the same working directory can reuse a SHA-256 keyed file-cache entry within its 1-hour TTL. Near-identical prompts require the optional semantic cache. Cache hits avoid a model call; actual hook latency depends on the machine and session context (see [Latency profile](#latency-profile)).
+
+**Model cost:** As a concrete [Claude API list-price example](https://platform.claude.com/docs/en/about-claude/pricing), Haiku 4.5 is $1/$5 per million input/output tokens, versus $3/$15 for Sonnet 4.5 and $5/$25 for Opus 4.5. Haiku's per-token rates are one-third or one-fifth of those rates at equal usage, not a guaranteed saving per task. Actual cost depends on model versions, token counts, caching, and billing route; the hook's extra Haiku call can outweigh any main-model savings.
 
 ---
 
@@ -128,6 +130,32 @@ If you skipped SDK installation during install, you can add it later:
 npm install --prefix ~/.claude/hooks @anthropic-ai/sdk
 ```
 
+**Disable without uninstalling:**
+Set `RLM_ENABLED=false` (or `RLM_DISABLED=true`) in your environment — in your
+shell profile, or in `~/.claude/settings.json` under `env`. This is a master
+off switch checked before skip detection and every cache: the hook exits
+immediately (~30ms), injects nothing, reads no cache, and never calls Haiku.
+The installation itself is untouched, so `RLM_ENABLED=true` turns preresearch
+back on instantly. `RLM_ENABLED` wins when both variables are set; only the
+literal strings `true`/`false` are recognized, so a typo'd value falls back to
+enabled rather than silently disabling the hook.
+
+**Uninstall:**
+```bash
+bash uninstall.sh
+```
+Removes exactly what the installation created — the runtime files in
+`~/.claude/hooks/`, the SDK dependencies it installed (only if that
+`package.json` declares nothing but `@anthropic-ai/sdk`), the hook's
+`UserPromptSubmit` registration in `~/.claude/settings.json`, and its cache
+(`~/.cache/rlm-hook`) and logs (`~/.local/share/rlm-hook`). Other hooks,
+unrelated settings, and any other `package.json` in the hooks directory are
+preserved, a malformed `settings.json` is left untouched rather than
+destroyed, and the script is safe to run repeatedly or when nothing is
+installed. If a *project-level* `.claude/settings.json` also references the
+hook, remove that entry by hand — the script only manages the user-level
+`~/.claude/settings.json`.
+
 ---
 
 ## Configuration
@@ -135,10 +163,14 @@ npm install --prefix ~/.claude/hooks @anthropic-ai/sdk
 All configuration is via environment variables. Set them in your shell profile or in `~/.claude/settings.json` under `env`.
 
 ```bash
+# Master switch
+RLM_ENABLED=true         # Master off switch: RLM_ENABLED=false disables all preresearch (default: true)
+RLM_DISABLED=false       # Equivalent inverse switch: RLM_DISABLED=true also disables (RLM_ENABLED wins if both set)
+
 # Mode selection
-RLM_AGENTIC_MODE=true    # Enable codebase exploration with tools (default: true, ~20s)
-RLM_AGENTIC_MODE=false   # Fast analysis only (~4s)
-RLM_FAST_MODE=true       # Concise non-agentic analysis (~4s, default when agentic=false)
+RLM_AGENTIC_MODE=true    # Enable codebase exploration with tools (default: true)
+RLM_AGENTIC_MODE=false   # Fast analysis only
+RLM_FAST_MODE=true       # Concise non-agentic analysis (default when agentic=false)
 
 # Model tuning
 RLM_MODEL=claude-haiku-4-5-20251001   # Which model to use for preresearch
@@ -146,7 +178,7 @@ RLM_TIMEOUT=60000                      # Total timeout in ms (default: 60s, must
 RLM_CACHE_TTL=3600                     # Cache TTL in seconds (default: 1h)
 RLM_MIN_LENGTH=20                      # Skip inputs shorter than this (chars)
 RLM_MAX_LENGTH=4000                    # Truncate inputs longer than this (chars)
-RLM_MAX_TURNS=10                       # Max tool calls in agentic mode
+RLM_MAX_TURNS=10                       # Max model turns in agentic mode
 
 # Paths
 RLM_CACHE_DIR=~/.cache/rlm-hook        # Cache directory
@@ -178,7 +210,7 @@ RLM_DEBUG=true    # Verbose logging to RLM_LOG_FILE
 
 ## How skip detection works
 
-Not every prompt benefits from preresearch. The hook detects and skips trivial inputs immediately — no API call, ~27ms exit.
+Not every prompt benefits from preresearch. The hook detects and skips trivial inputs without a model call.
 
 | Input type | Example | Reason skipped |
 |---|---|---|
@@ -192,14 +224,14 @@ Not every prompt benefits from preresearch. The hook detects and skips trivial i
 
 ## Latency profile
 
-| Scenario | Latency | Notes |
+| Scenario | Historical rough example | Notes |
 |---|---|---|
-| Skip (trivial query) | ~27ms | No API call made |
-| Cache hit | ~37ms | File read + JSON parse only |
-| Agentic mode (cache miss) | ~20s | Full codebase exploration with tools |
-| Fast mode (cache miss) | ~4s | Concise analysis, no tool calls |
+| Skip (trivial query) | ~27 ms | No model call |
+| SHA cache hit | ~37 ms | Avoids a model call; includes other hook work |
+| Agentic mode (cache miss) | ~20 s | Exploration with tools |
+| Fast mode (cache miss) | ~4 s | Analysis without exploration tools |
 
-Agentic mode latency overlaps with the time you spend reading the response to your previous turn — for most workflows, it adds zero perceived delay.
+No reproducible end-to-end measurements are committed for these historical figures. They are **examples**, not service targets or expected results for a particular setup. In particular, the ~37 ms figure is not established by the committed [cache microbenchmark](bench/README.md), which times synthetic file reads and writes rather than a full hook invocation. The hook records total runtime as `latency_ms` in its [metrics log](#phase-5-metrics-and-dashboard); use cache-hit and mode fields from that log to measure your own distribution. Cache misses vary with model response time, tool calls, project size, and configuration. Hook time is on the prompt's critical path.
 
 ---
 
@@ -303,7 +335,7 @@ Tests live in `test/`. Integration tests require a live `claude` binary and make
 2. **Skip check:** Trivial inputs (short, slash commands, CLI patterns, code-heavy) exit 0 immediately.
 3. **Cache check:** SHA-256 hash of `(prompt, cwd)` is looked up in `RLM_CACHE_DIR`. Hit → print cached block, exit 0.
 4. **Haiku runs:** `claude --model $RLM_MODEL` is spawned with the five needed built-in tools and a `PreToolUse` guard that confines `Write` to its PID-scoped `.claude/rlm-scratch-{pid}.md` and Bash to the configured Git commands and scratch cleanup. A structured prompt instructs it to explore the codebase and write findings to that scratch file.
-5. **Haiku explores:** Up to `RLM_MAX_TURNS` tool calls — globbing for relevant files, grepping for referenced symbols, reading key sections, checking `git log` for recent changes.
+5. **Haiku explores:** Up to `RLM_MAX_TURNS` model turns, potentially using multiple tool calls per turn — globbing for relevant files, grepping for referenced symbols, reading key sections, checking `git log` for recent changes.
 6. **Synthesis:** Haiku writes a JSON scratch file, then the hook formats it into the `<rlm_preresearch>` XML block and cleans up the scratch file.
 7. **Injection:** The formatted block is printed to stdout. Claude Code injects it as a system-level prefix before the user's prompt reaches the main model.
 8. **Error safety:** Any failure (timeout, API error, parse error) exits 0 with no output — the hook never blocks or corrupts a conversation.
