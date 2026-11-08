@@ -26,11 +26,11 @@ All thresholds are overridable via env vars (`RLM_MIN_LENGTH`, etc.). Skip detec
 Two operating modes, controlled by `RLM_AGENTIC_MODE` (default: `true`) and `RLM_FAST_MODE` (default: `true`, applies when agentic is disabled):
 
 ### Agentic mode (default)
-- Haiku receives tool access: `Read`, `Glob`, `Grep`, `Write`, `Bash(git status:*)`, `Bash(git log:*)`, `Bash(git diff:*)`, `Bash(git show:*)`, `Bash(git branch:*)`, `Bash(git ls-files:*)`, `Bash(git remote:*)`, `Bash(rm .claude/rlm-scratch-*.md)`
+- Haiku receives `Read`, `Glob`, `Grep`, `Write`, and `Bash`. A subprocess `PreToolUse` guard rejects `Write` calls outside that run's PID-scoped `.claude/rlm-scratch-{pid}.md` and Bash calls outside the configured `git status`, `log`, `diff`, `show`, `branch`, `ls-files`, `remote` command families or cleanup of that same scratch file.
 - Haiku writes scratch notes to a PID-scoped `.claude/rlm-scratch-{pid}.md` as it explores, then deletes the file
 - Produces a rich JSON structure: `relevant_files`, `existing_patterns`, `recent_changes`, `approach`, `warnings`
 - Latency: ~4–15s depending on codebase size and number of tool calls
-- Tool set is intentionally narrow: no `Edit`, no arbitrary `Bash` — only the seven explicitly allowlisted git read ops above and scratch cleanup (scoped to the specific scratch file pattern)
+- The CLI runs with only those five built-in tools exposed and no MCP tools. The guard is needed because Claude Code does not match `Write(path)` permission rules, `dontAsk` denies writes under its protected `.claude/` directory even with an `Edit(path)` allow rule, and `bypassPermissions` does not enforce the Bash allowlist. `bypassPermissions` keeps the scratch write working while the guard enforces the Write and Bash scope.
 
 ### Fast mode (non-agentic, no tools)
 - Pure text analysis from initial context (project type, git branch, file list)

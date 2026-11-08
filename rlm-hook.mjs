@@ -16,11 +16,47 @@ import { spawn, execSync } from 'child_process';
 import { createHash } from 'crypto';
 import { mkdir, readFile, writeFile, stat, rm, rename, readdir } from 'fs/promises';
 import { join, basename, resolve, relative, isAbsolute } from 'path';
+import { fileURLToPath } from 'url';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { parseLog, aggregate, readLog, defaultLogPath } from './bench/parse-log.mjs';
 import { normalizePreresearch, parsePreresearchResponse } from './preresearch-schema.mjs';
 import { createConfig, selectMode, shouldUseSDK as isSDKConfigured } from './rlm-config.mjs';
+
+const READ_ONLY_GIT_SUBCOMMANDS = new Set([
+  'status', 'log', 'diff', 'show', 'branch', 'ls-files', 'remote',
+]);
+
+// Runs as the agentic subprocess's PreToolUse hook. Missing or malformed
+// inputs fail closed; the parent hook passes its exact PID-scoped target.
+if (process.argv[2] === '--guard-agentic-tool') {
+  const scratchPath = process.argv[3];
+  let event;
+  try {
+    let input = '';
+    for await (const chunk of process.stdin) input += chunk;
+    event = JSON.parse(input);
+  } catch {}
+
+  const requestedPath = event?.tool_input?.file_path;
+  const scratchName = scratchPath && basename(scratchPath);
+  const validScratch = /^rlm-scratch-\d+\.md$/.test(scratchName || '');
+  const writeAllowed = event?.tool_name === 'Write' && validScratch &&
+    typeof requestedPath === 'string' && isAbsolute(requestedPath) &&
+    resolve(requestedPath) === resolve(scratchPath);
+  const command = event?.tool_input?.command;
+  const bashAllowed = event?.tool_name === 'Bash' && validScratch &&
+    typeof command === 'string' &&
+    (isAllowedGitCommand(command) || command.trim() === `rm .claude/${scratchName}`);
+  if (!writeAllowed && !bashAllowed) {
+    console.log(JSON.stringify({ hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: 'RLM preresearch permits only scratch Write, read-only git, and scratch cleanup.',
+    } }));
+  }
+  process.exit(0);
+}
 
 // --version flag
 if (process.argv.includes('--version')) {
@@ -1008,20 +1044,34 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
         '-p', prompt,
         '--model', CONFIG.haikuModel,
         '--output-format', 'text',
-        '--safe-mode',
       ];
 
       if (workingDir) {
         args.push('--add-dir', workingDir);
       }
 
-      // Always bypass permissions — this is a preresearch subprocess, not an interactive session
+      // The scratch path is under .claude/, which Claude Code protects even
+      // from explicit allow rules in dontAsk mode. Keep bypassPermissions for
+      // that write, and guard Write and Bash calls with PreToolUse.
       args.push('--permission-mode', 'bypassPermissions');
 
       if (CONFIG.agenticMode) {
+        const scratchPath = join(workingDir || process.cwd(), '.claude', `rlm-scratch-${process.pid}.md`);
+        const guardCommand = [process.execPath, fileURLToPath(import.meta.url), '--guard-agentic-tool', scratchPath]
+          .map(shellQuote).join(' ') + ' || exit 2';
+        // Safe mode suppresses hooks. Load only this session's explicit hook
+        // settings and expose only the tools needed for preresearch.
+        args.push('--setting-sources', '');
+        args.push('--settings', JSON.stringify({ hooks: { PreToolUse: [{
+          matcher: 'Write|Bash', hooks: [{ type: 'command', command: guardCommand }],
+        }] } }));
+        args.push('--tools', 'Read,Glob,Grep,Write,Bash');
+        args.push('--disallowedTools', 'mcp__*');
         // Enable file exploration tools + read-only git + scratch file cleanup
         args.push('--allowedTools', 'Read,Glob,Grep,Write,Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git branch:*),Bash(git ls-files:*),Bash(git remote:*),Bash(rm .claude/rlm-scratch-*.md)');
         args.push('--max-turns', String(CONFIG.maxTurns));
+      } else {
+        args.push('--safe-mode');
       }
 
       // Session resume flags (ADR-001)
@@ -1306,10 +1356,6 @@ function resolveWithin(root, p) {
   if (rel.startsWith('..') || isAbsolute(rel)) return null;
   return full;
 }
-
-const READ_ONLY_GIT_SUBCOMMANDS = new Set([
-  'status', 'log', 'diff', 'show', 'branch', 'ls-files', 'remote',
-]);
 
 /**
  * isAllowedGitCommand — the Bash tool only permits explicitly allowlisted,

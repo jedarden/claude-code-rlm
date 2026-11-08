@@ -273,7 +273,7 @@ Tests live in `test/`. Integration tests require a live `claude` binary and make
 1. **Hook fires:** Claude Code calls `rlm-hook.mjs` with JSON on stdin: `{prompt, cwd, transcript_path}`.
 2. **Skip check:** Trivial inputs (short, slash commands, CLI patterns, code-heavy) exit 0 immediately.
 3. **Cache check:** SHA-256 hash of `(prompt, cwd)` is looked up in `RLM_CACHE_DIR`. Hit → print cached block, exit 0.
-4. **Haiku runs:** `claude --model $RLM_MODEL --allowedTools 'Read,Glob,Grep,Write,Bash(git status:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git branch:*),Bash(git ls-files:*),Bash(git remote:*),Bash(rm .claude/rlm-scratch-*.md)'` is spawned with a structured system prompt instructing it to explore the codebase and write findings to a scratch file.
+4. **Haiku runs:** `claude --model $RLM_MODEL` is spawned with the five needed built-in tools and a `PreToolUse` guard that confines `Write` to its PID-scoped `.claude/rlm-scratch-{pid}.md` and Bash to the configured Git commands and scratch cleanup. A structured prompt instructs it to explore the codebase and write findings to that scratch file.
 5. **Haiku explores:** Up to `RLM_MAX_TURNS` tool calls — globbing for relevant files, grepping for referenced symbols, reading key sections, checking `git log` for recent changes.
 6. **Synthesis:** Haiku writes a JSON scratch file, then the hook formats it into the `<rlm_preresearch>` XML block and cleans up the scratch file.
 7. **Injection:** The formatted block is printed to stdout. Claude Code injects it as a system-level prefix before the user's prompt reaches the main model.

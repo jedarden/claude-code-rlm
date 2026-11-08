@@ -132,9 +132,22 @@ function runHook(input, environment, extraEnv = {}) {
     child.stdout.on('data', (data) => { stdout += data.toString(); });
     child.stderr.on('data', (data) => { stderr += data.toString(); });
     child.on('error', (error) => finish({ code: null, stdout, stderr, error }));
-    child.on('close', (code, signal) => finish({ code, signal, stdout, stderr }));
+    child.on('close', (code, signal) => finish({ code, signal, pid: child.pid, stdout, stderr }));
 
     child.stdin.end(input);
+  });
+}
+
+/** Execute the exact command installed as the subprocess's tool guard. */
+function runToolGuard(command, event, cwd) {
+  return new Promise((resolve) => {
+    const child = spawn('sh', ['-c', command], { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (data) => { stdout += data.toString(); });
+    child.stderr.on('data', (data) => { stderr += data.toString(); });
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+    child.stdin.end(JSON.stringify(event));
   });
 }
 
@@ -377,8 +390,50 @@ describe('hook process contract', { timeout: 10000 }, () => {
         assert.equal(
           args[args.indexOf('--permission-mode') + 1],
           'bypassPermissions',
-          `${mode}: hook must use its isolated permission mode`,
+          `${mode}: protected .claude scratch path needs bypassPermissions`,
         );
+        assert.equal(args.includes('--safe-mode'), false, `${mode}: safe mode would suppress the Write guard`);
+        assert.equal(args[args.indexOf('--setting-sources') + 1], '', `${mode}: inherited settings must be disabled`);
+        assert.equal(args[args.indexOf('--tools') + 1], 'Read,Glob,Grep,Write,Bash');
+        assert.equal(args[args.indexOf('--disallowedTools') + 1], 'mcp__*');
+        const settings = JSON.parse(args[args.indexOf('--settings') + 1]);
+        const [toolHook] = settings.hooks.PreToolUse;
+        assert.equal(toolHook.matcher, 'Write|Bash');
+        const guardCommand = toolHook.hooks[0].command;
+        assert.match(guardCommand, /--guard-agentic-tool/);
+
+        const scratchPath = join(projectDir, '.claude', `rlm-scratch-${result.pid}.md`);
+        const allowed = await runToolGuard(guardCommand, {
+          tool_name: 'Write', tool_input: { file_path: scratchPath, content: 'notes' },
+        }, projectDir);
+        assert.equal(allowed.code, 0);
+        assert.equal(allowed.stdout, '', `${mode}: scratch Write must pass the guard`);
+
+        for (const outsidePath of [join(projectDir, 'src', 'app.js'),
+          join(projectDir, '.claude', `rlm-scratch-${result.pid + 1}.md`)]) {
+          const blocked = await runToolGuard(guardCommand, {
+            tool_name: 'Write', tool_input: { file_path: outsidePath, content: 'bad' },
+          }, projectDir);
+          assert.equal(blocked.code, 0);
+          assert.equal(JSON.parse(blocked.stdout).hookSpecificOutput.permissionDecision, 'deny',
+            `${mode}: out-of-scope Write to ${outsidePath} must be rejected`);
+        }
+        for (const command of ['git status --short', `rm .claude/rlm-scratch-${result.pid}.md`]) {
+          const allowedBash = await runToolGuard(guardCommand, {
+            tool_name: 'Bash', tool_input: { command },
+          }, projectDir);
+          assert.equal(allowedBash.code, 0);
+          assert.equal(allowedBash.stdout, '', `${mode}: ${command} must pass the guard`);
+        }
+        for (const command of ['git status; touch source.js', 'rm source.js',
+          `rm .claude/rlm-scratch-${result.pid + 1}.md`]) {
+          const blockedBash = await runToolGuard(guardCommand, {
+            tool_name: 'Bash', tool_input: { command },
+          }, projectDir);
+          assert.equal(blockedBash.code, 0);
+          assert.equal(JSON.parse(blockedBash.stdout).hookSpecificOutput.permissionDecision, 'deny',
+            `${mode}: unsafe Bash command must be rejected`);
+        }
         assert.equal(args.includes('Edit'), false, `${mode}: Edit must not be allowed`);
         assert.equal(args.includes('Bash'), false, `${mode}: unrestricted Bash must not be allowed`);
 
