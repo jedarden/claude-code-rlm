@@ -20,7 +20,7 @@ import { fileURLToPath } from 'url';
 import { existsSync, realpathSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { parseLog, aggregate, readLog, defaultLogPath } from './bench/parse-log.mjs';
-import { normalizePreresearch, parsePreresearchResponse } from './preresearch-schema.mjs';
+import { normalizePreresearch, parsePreresearchResponse, boundPreresearchOutput, resolveMaxOutputChars } from './preresearch-schema.mjs';
 import { createConfig, selectMode, shouldUseSDK as isSDKConfigured } from './rlm-config.mjs';
 import { appendRotating, ERROR_LOG_LIMIT, METRICS_LOG_LIMIT } from './rotating-log.mjs';
 
@@ -1721,37 +1721,57 @@ async function callHaikuAgenticSDK(prompt, apiKey, cwd, client = null, dispatch 
  * The Anthropic SDK does not expose embeddings, so this hits the OpenAI HTTP API
  * directly with `fetch` (global in Node 18+) and an `OPENAI_API_KEY`. `fetchImpl`
  * is injectable so unit tests can drive it without a network. THROWS on any
- * failure (no key, non-2xx, malformed body) — the semantic-cache layer catches
- * the throw and degrades to plain SHA-256 lookup, so the hook never breaks.
+ * failure (no key, timeout, non-2xx, malformed body) — the semantic-cache
+ * layer catches the throw and degrades to the SHA-256-only path, so the hook
+ * never breaks. The timeout covers both response headers and response-body
+ * parsing, and aborts the underlying request when the transport supports it.
  */
 async function embedText(text, apiKey, {
   fetchImpl = fetch,
   model = CONFIG.embedModel,
   baseUrl = CONFIG.embedBaseUrl,
+  timeoutMs = CONFIG.embedTimeout,
 } = {}) {
   if (!apiKey) throw new Error('embedText: no embedding API key');
   if (typeof text !== 'string' || text.length === 0) {
     throw new Error('embedText: empty input');
   }
   const startTime = Date.now();
-  const res = await fetchImpl(`${baseUrl}/embeddings`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({ model, input: text }),
-  });
-  if (!res || !res.ok) {
-    throw new Error(`embedText: HTTP ${res ? res.status : 'no-response'}`);
+  const controller = new AbortController();
+  let timeoutId;
+  const request = (async () => {
+    const res = await fetchImpl(`${baseUrl}/embeddings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ model, input: text }),
+      signal: controller.signal,
+    });
+    if (!res || !res.ok) {
+      throw new Error(`embedText: HTTP ${res ? res.status : 'no-response'}`);
+    }
+    const json = await res.json();
+    const vec = json && json.data && json.data[0] && json.data[0].embedding;
+    if (!Array.isArray(vec) || vec.length === 0) {
+      throw new Error('embedText: malformed embedding response');
+    }
+    await log(`Embedding (${model}, dim ${vec.length}) completed in ${Date.now() - startTime}ms`);
+    return Float32Array.from(vec);
+  })();
+
+  try {
+    return await new Promise((resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        controller.abort();
+        reject(new Error(`embedText: request timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      request.then(resolve, reject);
+    });
+  } finally {
+    clearTimeout(timeoutId);
   }
-  const json = await res.json();
-  const vec = json && json.data && json.data[0] && json.data[0].embedding;
-  if (!Array.isArray(vec) || vec.length === 0) {
-    throw new Error('embedText: malformed embedding response');
-  }
-  await log(`Embedding (${model}, dim ${vec.length}) completed in ${Date.now() - startTime}ms`);
-  return Float32Array.from(vec);
 }
 
 /**
@@ -2032,7 +2052,7 @@ async function semanticLookup(queryText, {
     await log(`Semantic cache hit ${bestKey.slice(0, 16)}... (cosine ${bestScore.toFixed(4)} ≥ ${CONFIG.semanticThreshold})`);
     return entry;
   } catch (err) {
-    await log(`Semantic lookup failed (degrading to Haiku): ${String(err?.message ?? err)}`);
+    await log(`Semantic lookup failed (SHA-256-only path; continuing to Haiku): ${String(err?.message ?? err)}`);
     return null;
   }
 }
@@ -2051,6 +2071,9 @@ function parseHaikuResponse(response) {
 
 function formatOutput(analysis) {
   analysis = normalizePreresearch(analysis);
+  // console.log adds one newline to stdout; reserve it under the configured
+  // total injection cap on every branch and every cache/reuse path.
+  const maxChars = resolveMaxOutputChars() - 1;
 
   // Agentic mode produces a rich structure with relevant_files
   if (CONFIG.agenticMode) {
@@ -2078,7 +2101,7 @@ Recent Changes: ${recentChanges}
 Tasks: ${tasks}
 Approach: ${approach}`;
     if (warnings) output += `\nWarnings: ${warnings}`;
-    return output;
+    return boundPreresearchOutput(output, { maxChars });
   }
 
   // Fast mode: compact structure
@@ -2099,7 +2122,7 @@ RLM: ${intent} | Tasks: ${tasks}`;
     if (tech) output += ` | Tech: ${tech}`;
     if (files) output += ` | Files: ${files}`;
     output += ` | Approach: ${approach}`;
-    return output;
+    return boundPreresearchOutput(output, { maxChars });
   }
 
   // Detailed mode
@@ -2118,7 +2141,7 @@ RLM: ${intent} | Tasks: ${tasks}`;
   const technologies = (Array.isArray(analysis.implicit_context?.relevant_technologies)
     ? analysis.implicit_context.relevant_technologies : []).join(', ') || 'N/A';
 
-  return `<rlm_analysis>
+  return boundPreresearchOutput(`<rlm_analysis>
 ${JSON.stringify(analysis, null, 2)}
 </rlm_analysis>
 
@@ -2127,7 +2150,7 @@ RLM Pre-Analysis Summary:
 - Key Tasks: ${tasks || 'N/A'}
 - Approach: ${approach}
 - Domain: ${domain}
-- Technologies: ${technologies}`;
+- Technologies: ${technologies}`, { maxChars });
 }
 
 // =============================================================================

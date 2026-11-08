@@ -90,6 +90,35 @@ function startEmbeddingServer(vector) {
   });
 }
 
+function startHangingEmbeddingServer() {
+  const requests = [];
+  const sockets = new Set();
+  const server = createServer((request) => {
+    requests.push({ method: request.method, url: request.url });
+    request.resume();
+    // Deliberately leave the response open. The hook must enforce its own
+    // deadline rather than waiting for the embedding service or RLM_TIMEOUT.
+  });
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      resolve({
+        requests,
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        close: () => new Promise((done) => {
+          for (const socket of sockets) socket.destroy();
+          server.close(done);
+        }),
+      });
+    });
+  });
+}
+
 function runHook(input, env) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [HOOK], {
@@ -225,6 +254,51 @@ describe('semantic cache process contract', { timeout: 10000 }, () => {
       assert.equal(await readFile(invokedPath, 'utf8'), 'invoked\n');
     } finally {
       await embedding.close();
+    }
+  });
+
+  it('keeps exact SHA-256 hits independent of a dead semantic endpoint', async () => {
+    const prompt = 'Read the authentication middleware and explain its session checks.';
+    await writeFakeClaude(binDir, invokedPath);
+    await writeFile(
+      join(cacheDir, `${cacheKey(prompt, projectDir)}.json`),
+      JSON.stringify(CACHED_ANALYSIS),
+    );
+
+    const result = await runHook(
+      { prompt, cwd: projectDir },
+      hookEnv('http://127.0.0.1:1/v1'),
+    );
+
+    assert.equal(result.code, 0);
+    assert.match(result.stdout, /Cached semantic context for authentication\./);
+    assert.equal(await readFile(invokedPath, 'utf8').catch(() => ''), '');
+  });
+
+  it('times out a hanging embedding request and continues to the normal miss path', async () => {
+    const hanging = await startHangingEmbeddingServer();
+    try {
+      await writeFakeClaude(binDir, invokedPath);
+      const started = Date.now();
+      const result = await runHook(
+        { prompt: 'Investigate why the session refresh flow is failing in production.', cwd: projectDir },
+        {
+          ...hookEnv(hanging.baseUrl),
+          RLM_EMBED_TIMEOUT: '75',
+          RLM_TIMEOUT: '1000',
+        },
+      );
+      const elapsed = Date.now() - started;
+      const log = await readFile(join(root, 'hook.log'), 'utf8');
+
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /The embedding was not close enough/);
+      assert.equal(await readFile(invokedPath, 'utf8'), 'invoked\n');
+      assert.equal(hanging.requests.length, 2, 'lookup and post-Haiku cache write each honor the deadline');
+      assert.match(log, /Semantic lookup failed .*request timed out after 75ms/);
+      assert.ok(elapsed < 1500, `dead embedding endpoint took ${elapsed}ms`);
+    } finally {
+      await hanging.close();
     }
   });
 });

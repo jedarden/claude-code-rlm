@@ -25,6 +25,7 @@ describe('RLM configuration defaults', () => {
     assert.equal(config.semanticThreshold, DEFAULTS.semanticThreshold);
     assert.equal(config.embedModel, DEFAULTS.embedModel);
     assert.equal(config.embedBaseUrl, DEFAULTS.embedBaseUrl);
+    assert.equal(config.embedTimeout, DEFAULTS.embedTimeout);
     assert.equal(config.contextWindow, DEFAULTS.contextWindow);
     assert.equal(config.debug, false);
     assert.equal(config.sessionResume, false);
@@ -60,6 +61,7 @@ describe('RLM configuration environment overrides', () => {
       RLM_EMBED_MODEL: 'test-embedding-model',
       OPENAI_API_KEY: 'test-openai-key',
       RLM_EMBED_BASE_URL: 'http://localhost:8080/v1',
+      RLM_EMBED_TIMEOUT: '1250',
       RLM_CONTEXT_WINDOW: '8',
       RLM_DEBUG: 'true',
       RLM_SESSION_RESUME: 'true',
@@ -88,6 +90,7 @@ describe('RLM configuration environment overrides', () => {
         embedModel: config.embedModel,
         embedApiKey: config.embedApiKey,
         embedBaseUrl: config.embedBaseUrl,
+        embedTimeout: config.embedTimeout,
         contextWindow: config.contextWindow,
         debug: config.debug,
         sessionResume: config.sessionResume,
@@ -114,6 +117,7 @@ describe('RLM configuration environment overrides', () => {
         embedModel: 'test-embedding-model',
         embedApiKey: 'test-openai-key',
         embedBaseUrl: 'http://localhost:8080/v1',
+        embedTimeout: 1250,
         contextWindow: 8,
         debug: true,
         sessionResume: true,
@@ -137,6 +141,7 @@ describe('RLM configuration environment overrides', () => {
       RLM_SEMANTIC_CACHE: 'enabled',
       RLM_SEMANTIC_THRESHOLD: '1.2',
       RLM_CONTEXT_WINDOW: '-oops',
+      RLM_EMBED_TIMEOUT: 'not-a-duration',
       RLM_DEBUG: 'verbose',
       RLM_SESSION_RESUME: '1',
       RLM_SESSION_RESUME_MAX_TURNS: '20 turns',
@@ -155,6 +160,7 @@ describe('RLM configuration environment overrides', () => {
     assert.equal(config.semanticCache, false);
     assert.equal(config.semanticThreshold, DEFAULTS.semanticThreshold);
     assert.equal(config.contextWindow, DEFAULTS.contextWindow);
+    assert.equal(config.embedTimeout, DEFAULTS.embedTimeout);
     assert.equal(config.debug, false);
     assert.equal(config.sessionResume, false);
     assert.equal(config.sessionResumeMaxTurns, DEFAULTS.sessionResumeMaxTurns);

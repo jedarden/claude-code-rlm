@@ -203,6 +203,7 @@ RLM_SEMANTIC_CACHE=true                # Enable embedding similarity cache (defa
 RLM_SEMANTIC_THRESHOLD=0.92            # Cosine similarity threshold (0-1, default: 0.92)
 RLM_EMBED_MODEL=text-embedding-3-small # OpenAI embedding model (default: text-embedding-3-small)
 RLM_EMBED_BASE_URL=https://api.openai.com/v1  # Embedding API endpoint
+RLM_EMBED_TIMEOUT=5000                # Per-request embedding deadline in ms
 OPENAI_API_KEY=sk-...                  # Required for semantic caching
 
 # Phase 4: Context awareness
