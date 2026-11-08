@@ -19,6 +19,7 @@ cp "${SCRIPT_DIR}/rlm-hook.sh"  "${HOOK_DIR}/rlm-hook.sh"
 # graph next to the entrypoint lets the installed hook run outside the repo.
 cp "${SCRIPT_DIR}/rlm-config.mjs" "${HOOK_DIR}/rlm-config.mjs"
 cp "${SCRIPT_DIR}/preresearch-schema.mjs" "${HOOK_DIR}/preresearch-schema.mjs"
+cp "${SCRIPT_DIR}/rotating-log.mjs" "${HOOK_DIR}/rotating-log.mjs"
 cp "${SCRIPT_DIR}/bench/parse-log.mjs" "${HOOK_DIR}/bench/parse-log.mjs"
 
 # Make executable

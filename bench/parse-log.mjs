@@ -32,10 +32,10 @@ export const HAIKU_PRICING_USD_PER_TOKEN = Object.freeze({
   output: 5 / 1_000_000,
 });
 
-import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
+import { METRICS_LOG_LIMIT, readRotatedLog } from '../rotating-log.mjs';
 
 // ---------------------------------------------------------------------------
 // Pure aggregation core (no FS, no clock — directly importable for tests)
@@ -244,10 +244,10 @@ export function defaultLogPath() {
   );
 }
 
-/** Read a log file, returning '' if it is missing/unreadable (never throws). */
+/** Read the bounded metrics history, returning '' if missing/unreadable. */
 export async function readLog(path) {
   try {
-    return await readFile(path, 'utf-8');
+    return await readRotatedLog(path, METRICS_LOG_LIMIT.backups);
   } catch {
     return '';
   }

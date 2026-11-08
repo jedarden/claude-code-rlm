@@ -19,6 +19,7 @@ const RUNTIME_FILES = [
   'bench/parse-log.mjs',
   'preresearch-schema.mjs',
   'rlm-config.mjs',
+  'rotating-log.mjs',
   'rlm-hook.mjs',
   'rlm-hook.sh',
 ];
@@ -77,7 +78,7 @@ test('install creates a usable UserPromptSubmit hook and resolves its runtime mo
   }
   await assertExecutable(paths['rlm-hook.mjs']);
   await assertExecutable(paths['rlm-hook.sh']);
-  assert.deepEqual((await readdir(hookDir)).sort(), ['bench', 'preresearch-schema.mjs', 'rlm-config.mjs', 'rlm-hook.mjs', 'rlm-hook.sh']);
+  assert.deepEqual((await readdir(hookDir)).sort(), ['bench', 'preresearch-schema.mjs', 'rlm-config.mjs', 'rlm-hook.mjs', 'rlm-hook.sh', 'rotating-log.mjs']);
 
   assert.match(result.stdout, /"UserPromptSubmit"/);
   assert.match(result.stdout, /"command": "~\/.claude\/hooks\/rlm-hook\.mjs"/);
@@ -111,7 +112,7 @@ test('install is idempotent and does not duplicate or alter the runtime graph', 
   assert.equal(second.code, 0, second.stderr);
   const after = await Promise.all(RUNTIME_FILES.map(async (file) => [file, await readFile(paths[file], 'utf8')]));
   assert.deepEqual(after, before);
-  assert.deepEqual((await readdir(hookDir)).sort(), ['bench', 'preresearch-schema.mjs', 'rlm-config.mjs', 'rlm-hook.mjs', 'rlm-hook.sh']);
+  assert.deepEqual((await readdir(hookDir)).sort(), ['bench', 'preresearch-schema.mjs', 'rlm-config.mjs', 'rlm-hook.mjs', 'rlm-hook.sh', 'rotating-log.mjs']);
 });
 
 test('SDK opt-in delegates installation to npm at the hook location', async () => {

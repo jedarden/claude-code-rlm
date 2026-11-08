@@ -22,6 +22,7 @@ import { homedir } from 'os';
 import { parseLog, aggregate, readLog, defaultLogPath } from './bench/parse-log.mjs';
 import { normalizePreresearch, parsePreresearchResponse } from './preresearch-schema.mjs';
 import { createConfig, selectMode, shouldUseSDK as isSDKConfigured } from './rlm-config.mjs';
+import { appendRotating, ERROR_LOG_LIMIT, METRICS_LOG_LIMIT } from './rotating-log.mjs';
 
 const READ_ONLY_GIT_SUBCOMMANDS = new Set([
   'status', 'log', 'diff', 'show', 'branch', 'ls-files', 'remote',
@@ -133,9 +134,7 @@ async function log(message) {
   const timestamp = new Date().toISOString();
   const entry = `[${timestamp}] ${message}\n`;
   try {
-    const logDir = join(homedir(), '.local', 'share', 'rlm-hook');
-    await mkdir(logDir, { recursive: true });
-    await writeFile(CONFIG.logFile, entry, { flag: 'a' });
+    await appendRotating(CONFIG.logFile, entry, ERROR_LOG_LIMIT);
   } catch {
     // Ignore logging errors — never block the conversation
   }
@@ -155,15 +154,12 @@ function currentMode() {
 // Append one JSON line to the metrics JSONL log. Bullet-proof exactly like
 // log(): wrapped in try/catch, swallows every error, never throws, never blocks
 // the user — a metrics failure must never change the hook's exit behavior.
-// Stamps `ts` (epoch ms) at write time. Dependency-free (fs/promises appendFile
-// via writeFile flag:'a'). The caller's fields (event, latency_ms, mode,
+// Stamps `ts` (epoch ms) at write time. The caller's fields (event, latency_ms, mode,
 // input_len, cache_hit, …) are spread after ts.
 async function appendMetric(metric) {
   try {
     const line = JSON.stringify({ ts: Date.now(), ...metric }) + '\n';
-    const dir = join(homedir(), '.local', 'share', 'rlm-hook');
-    await mkdir(dir, { recursive: true });
-    await writeFile(CONFIG.metricsFile, line, { flag: 'a' });
+    await appendRotating(CONFIG.metricsFile, line, METRICS_LOG_LIMIT);
   } catch {
     // Never let a metrics failure change the hook's behavior
   }

@@ -211,6 +211,16 @@ You ask "add error handling to the API client." Haiku explores `src/api.ts`, fin
 
 Phase 5 adds a metrics JSONL log (`RLM_METRICS_FILE`, default: `~/.local/share/rlm-hook/metrics.jsonl`). One JSON line per hook outcome captures latency, cache status, mode, and token counts. The bundled dashboard visualizes these metrics:
 
+The hook rotates this file before an append would exceed 8 MiB, retaining three
+backups (`metrics.jsonl.1` through `.3`). The dashboard, `bench/parse-log.mjs`,
+and `rlm-hook.mjs --stats` aggregate the current file and all retained backups.
+The oldest backup is discarded at the next rotation, so totals cover retained
+history rather than all-time history. The error/debug log (`RLM_LOG_FILE`, default:
+`~/.local/share/rlm-hook/rlm-hook.log`) rotates at 2 MiB with two backups.
+An individual entry larger than its file limit is dropped. Existing oversized
+files are trimmed to complete recent lines when first rotated. Writes to both
+files remain best effort and cannot interrupt the hook.
+
 ```bash
 # Serve the dashboard
 node bench/dashboard.mjs --serve
