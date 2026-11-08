@@ -22,7 +22,7 @@ When you type a prompt in Claude Code, this hook fires first. Haiku (fast, cheap
 
 **Smart skipping:** Trivial queries — `ls`, `/help`, short affirmatives, pure CLI commands — bypass the model call. The hook itself still takes time to run.
 
-**Caching:** An identical prompt in the same working directory can reuse a SHA-256 keyed file-cache entry within its 1-hour TTL. Near-identical prompts require the optional semantic cache. Cache hits avoid a model call; actual hook latency depends on the machine and session context (see [Latency profile](#latency-profile)).
+**Caching:** An identical prompt in the same working directory can reuse a SHA-256 keyed file-cache entry within its 1-hour TTL. Near-identical prompts require the optional semantic cache, which sends raw prompt text to an embeddings endpoint — see [Outbound data flow and privacy](docs/notes/architecture.md#outbound-data-flow-and-privacy) for exactly what leaves the machine. Cache hits avoid a model call; actual hook latency depends on the machine and session context (see [Latency profile](#latency-profile)).
 
 **Model cost:** As a concrete [Claude API list-price example](https://platform.claude.com/docs/en/about-claude/pricing), Haiku 4.5 is $1/$5 per million input/output tokens, versus $3/$15 for Sonnet 4.5 and $5/$25 for Opus 4.5. Haiku's per-token rates are one-third or one-fifth of those rates at equal usage, not a guaranteed saving per task. Actual cost depends on model versions, token counts, caching, and billing route; the hook's extra Haiku call can outweigh any main-model savings.
 
@@ -124,6 +124,13 @@ ANTHROPIC_API_KEY=sk-ant-...
 > *fallback subprocess runs* are pay-per-token too while the key is in the hook's
 > environment. Without a usable key the hook logs the reason and falls back to the
 > subprocess path automatically; the conversation is never blocked.
+
+> **Privacy:** SDK-Direct mode transmits the same payload as the subprocess path —
+> your prompt plus gathered project context, and (in agentic mode) the contents of
+> any project files Haiku reads. The default subprocess path makes the same
+> transmission through the `claude` CLI. The full enumeration, including the
+> optional semantic-cache call that sends raw prompt text to an embeddings
+> endpoint, is in [Outbound data flow and privacy](docs/notes/architecture.md#outbound-data-flow-and-privacy).
 
 If you skipped SDK installation during install, you can add it later:
 ```bash

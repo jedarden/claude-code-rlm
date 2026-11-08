@@ -56,7 +56,7 @@ The cwd half of the key scopes entries to a project, so one repository's cached 
 
 Cache misses are the common case for novel questions. The cache primarily helps with repeated queries in long sessions (e.g., retrying a prompt, running the same planning query after a small edit).
 
-Semantic caching (default off, `RLM_SEMANTIC_CACHE=true`) layers onto the SHA-256 miss path: on a miss, the query is embedded as `prompt + '\0' + cwd` and scored against stored embeddings, and the nearest analysis above `RLM_SEMANTIC_THRESHOLD` is served in place of a Haiku run. It uses an OpenAI-compatible embeddings endpoint. Set `RLM_EMBED_BASE_URL` to override the default `https://api.openai.com/v1`, and provide `OPENAI_API_KEY`.
+Semantic caching (default off, `RLM_SEMANTIC_CACHE=true`) layers onto the SHA-256 miss path: on a miss, the query is embedded as `prompt + '\0' + cwd` and scored against stored embeddings, and the nearest analysis above `RLM_SEMANTIC_THRESHOLD` is served in place of a Haiku run. It uses an OpenAI-compatible embeddings endpoint. Set `RLM_EMBED_BASE_URL` to override the default `https://api.openai.com/v1`, and provide `OPENAI_API_KEY`. This is an outbound transmission of raw prompt text — see [Outbound data flow and privacy](#outbound-data-flow-and-privacy) for the payload and its controls.
 
 ## Graceful Degradation
 
@@ -110,6 +110,51 @@ SDK-Direct mode degrades through three tiers, each ending with the hook still ex
 3. **Subprocess also fails**: existing graceful degradation — empty stdout, exit 0, error logged (`~/.local/share/rlm-hook/rlm-hook.log`). The conversation is never blocked.
 
 Billing note for tier 2: the fallback runs on whatever credential the subprocess resolves, which per the cost interaction above may be the same Console key — a repeated SDK failure under a pay-per-token key means every fallback run is billed, not free.
+
+## Outbound data flow and privacy
+
+The hook makes at most two kinds of outbound network calls. Everything else it touches — the metrics JSONL, the error/verbose log, the prompt-keyed analysis cache, the agentic scratch file, and the metrics dashboard (loopback-bound by default) — stays on the local machine; the observability content policy in the README and the [Graceful Degradation](#graceful-degradation) section cover what those local artifacts may contain. This section enumerates what actually leaves it.
+
+### Call 1 — the Haiku preresearch request
+
+| | |
+|---|---|
+| Destination | The Anthropic Messages API, reached one of two ways: through the `claude` CLI subprocess (default; the CLI's own provider routing applies, so any gateway/`ANTHROPIC_BASE_URL`-style override the CLI honors applies here too), or directly from the hook process via `@anthropic-ai/sdk` when `RLM_USE_SDK=true` and `ANTHROPIC_API_KEY` is set |
+| Trigger | Any prompt that survives skip detection and misses both the SHA-256 cache and (when enabled) the semantic cache — see the ordering below |
+| Auth | Whichever credential the chosen transport uses: the CLI's subscription/Console auth for subprocess runs, the Console API key for SDK runs (billing routes in the SDK-Direct mode section above) |
+
+**Payload.** Both transports send the same assembled prompt (`buildRLMPrompt` in `rlm-hook.mjs`):
+
+- The user prompt, truncated to `RLM_MAX_LENGTH` (default 4000 chars) with a `[truncated]` marker.
+- An `INITIAL CONTEXT` block when `RLM_GATHER_CONTEXT=true` (default). Gathered locally by `gatherProjectContext` and `gatherConversationContext`, then transmitted as part of the prompt: project directory name and type, dependency names from `package.json` (up to 10 deps + 5 devDependencies are gathered; the prompt carries at most the first 8 stack entries), the current git branch, the first 5 lines of `git status --porcelain`, up to 5 recent source-file paths, and previews of the last 3 conversation turns (≤100 chars each) read from the Claude Code transcript at `transcript_path`.
+- In agentic mode (default), the transmission does not stop at the prompt. Haiku explores the repository with `Read`/`Glob`/`Grep` and read-only git commands for up to `RLM_MAX_TURNS` rounds, and **the file contents and command output those tools return are transmitted to the Anthropic API as tool results** in the ongoing conversation. Both transports do this — the CLI's native tool loop, and the SDK agentic loop feeding `tool_result` messages back (`callHaikuAgenticSDK`). Tool reads are confined to the project directory in both modes (see the sandbox paragraph in the README's "Example output" section), but files *inside* the project are read and their contents transit to the model provider.
+
+Env vars that shape this call: `RLM_AGENTIC_MODE`, `RLM_FAST_MODE`, `RLM_MODEL`, `RLM_MAX_TURNS`, `RLM_TIMEOUT` (subprocess kill timer), `RLM_USE_SDK` + `ANTHROPIC_API_KEY` (transport), `RLM_SDK_MAX_TOKENS` (SDK path only), `RLM_GATHER_CONTEXT` (whether the context block is attached), `RLM_MAX_LENGTH` (prompt truncation), `RLM_CONTEXT_WINDOW` (how much transcript the hook reads).
+
+**When this call does not fire:** skip detection (trivial inputs), a SHA-256 cache hit, a semantic cache hit, or the Phase 4 early-exit all exit before Haiku is invoked — zero outbound calls on those paths.
+
+### Call 2 — the embedding request (semantic cache only)
+
+Fires only when **both** `RLM_SEMANTIC_CACHE=true` and `OPENAI_API_KEY` are set. Off by default.
+
+| | |
+|---|---|
+| Destination | `{RLM_EMBED_BASE_URL}/embeddings` — default `https://api.openai.com/v1/embeddings`. Unless you override `RLM_EMBED_BASE_URL` (e.g. to a self-hosted endpoint), the recipient is OpenAI, a third party distinct from the model provider |
+| Trigger | Twice per fresh analysis: once on the lookup path (`semanticLookup` embeds every query that reached it — so even a semantic-cache *miss* transmits the prompt), and again after a successful Haiku analysis (`saveCacheEmbedding` stores the query's vector) |
+| Payload | `{ model, input }` where `input` is the **raw, untruncated user prompt** with `'\0' + cwd` appended — the full prompt text and the project directory path, verbatim |
+| Auth | `Authorization: Bearer $OPENAI_API_KEY` |
+
+Note the asymmetry with Call 1: `RLM_MAX_LENGTH` truncation applies only to the Haiku prompt, never to the embedding input. The raw prompt goes to the embedding endpoint in full. A SHA-256 cache hit short-circuits before `semanticLookup`, so enabling the SHA cache also avoids this call for exact repeats.
+
+Env vars that control this call: `RLM_SEMANTIC_CACHE` (gate), `OPENAI_API_KEY` (gate and credential), `RLM_EMBED_BASE_URL` (destination), `RLM_EMBED_MODEL`, `RLM_SEMANTIC_THRESHOLD` (decides hit vs. miss, i.e. whether the Haiku call in Call 1 happens).
+
+### Limiting exposure
+
+- Keep `RLM_SEMANTIC_CACHE` off (the default): Call 2 does not exist, and only preresearch prompts reach the model provider.
+- Point `RLM_EMBED_BASE_URL` at a self-hosted or first-party-trusted embeddings endpoint if the semantic cache is wanted but raw prompts must not reach a third party.
+- `RLM_GATHER_CONTEXT=false` skips context gathering entirely: only the prompt itself is transmitted (agentic exploration is unaffected — Haiku still reads whatever it chooses to read).
+- `RLM_AGENTIC_MODE=false` (with `RLM_FAST_MODE` choosing the non-agentic variant) removes the tool loop entirely: only the assembled prompt is transmitted, no project file contents beyond the context line.
+- The injected `<rlm_preresearch>` block becomes part of the main conversation; its onward transmission follows whatever provider and settings the *main* Claude Code session uses — the hook cannot scope that.
 
 ## Model ID
 
