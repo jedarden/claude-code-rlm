@@ -265,6 +265,27 @@ the port with an appropriate firewall or access-control boundary.
 
 The dashboard shows latency distribution, cache hit rate over time, per-mode performance, and estimated Haiku cost when token estimates are available — useful for tuning timeouts, cache TTL, mode selection, and spend.
 
+### Observability content policy
+
+The metrics file and `RLM_LOG_FILE` are observability artifacts, not transcript
+or research archives. The hook persists only operational metadata: `input_len`
+is a character count, while event/mode/cache/source/intent values are labels and
+`token_estimate` contains numbers. Raw prompt text is never a metrics field.
+
+Recent transcript turns and explored file contents are request context only. They
+may be held in memory or sent to Haiku, but transcript excerpts, prompt text,
+and file contents are not written to the metrics JSONL, the error log, or the
+verbose log produced when `RLM_DEBUG=true`. Model-provided skip reasons are
+discarded, and subprocess stderr is not persisted because it can echo request
+or explored-file content. If a known sensitive value reaches an unavoidable
+diagnostic path, it is replaced by a short SHA-256 marker and its length; log
+messages are also bounded to 512 characters. The existing rotation limits bound
+retention, and all writes remain best effort.
+
+This policy covers the three observability files named above. The prompt-keyed
+analysis cache and the temporary agentic scratch file are separate storage
+surfaces with their own lifecycle.
+
 ---
 
 ## Benchmark

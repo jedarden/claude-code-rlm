@@ -69,6 +69,11 @@ if (process.env.FAKE_CLAUDE_MODE === 'failure') {
   process.exit(42);
 }
 
+if (process.env.FAKE_CLAUDE_MODE === 'echo-failure') {
+  process.stderr.write(process.env.FAKE_CLAUDE_ECHO || 'synthetic subprocess failure');
+  process.exit(42);
+}
+
 if (process.env.FAKE_CLAUDE_MODE === 'timeout') {
   setTimeout(() => {}, 60000);
 } else if (process.env.FAKE_CLAUDE_MODE === 'stubborn-timeout') {
@@ -267,12 +272,53 @@ describe('hook process contract', { timeout: 10000 }, () => {
       assert.equal(result.error, undefined);
       assert.equal(result.stdout, '');
       assert.equal(result.stderr, '');
-      assert.match(log, /ERROR: Haiku failed \(exit 42\): synthetic subprocess failure/);
+      assert.match(log, /ERROR: Haiku failed \(exit 42\)/);
       assert.equal(log.includes(sensitivePrompt), false, 'error log must not include the user prompt');
       assert.equal(metrics.at(-1).event, 'error');
       assert.equal(metrics.at(-1).cache_hit, false);
-      assert.equal(metrics.at(-1).reason, 'Haiku failed (exit 42): synthetic subprocess failure');
+      assert.equal(metrics.at(-1).reason, 'Haiku failed (exit 42)');
       assert.equal(JSON.stringify(metrics).includes(sensitivePrompt), false, 'error metrics must not include the user prompt');
+    } finally {
+      await destroyEnvironment(environment);
+    }
+  });
+
+  it('does not persist prompt, transcript, or explored-file content in debug artifacts', async () => {
+    const environment = await createEnvironment();
+    try {
+      const prompt = 'Inspect the payment path; prompt-secret-9f8c7b6a';
+      const transcriptText = 'Earlier conversation carries transcript-secret-4e3d2c1b';
+      const exploredFileText = 'Read output contains explored-file-secret-a7b6c5d4';
+      const transcriptPath = join(environment.root, 'conversation.jsonl');
+      await writeFile(transcriptPath, JSON.stringify({
+        type: 'user',
+        message: { content: transcriptText },
+      }) + '\n');
+
+      const result = await runHook(
+        JSON.stringify({ prompt, transcript_path: transcriptPath }),
+        environment,
+        {
+          FAKE_CLAUDE_MODE: 'echo-failure',
+          FAKE_CLAUDE_ECHO: `${prompt} ${transcriptText} ${exploredFileText}`,
+          RLM_DEBUG: 'true',
+          RLM_GATHER_CONTEXT: 'true',
+        },
+      );
+      const log = await readIfPresent(environment.env.RLM_LOG_FILE);
+      const metrics = await readIfPresent(environment.env.RLM_METRICS_FILE);
+      const persisted = `${log}\n${metrics}`;
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, '');
+      assert.equal(result.stderr, '');
+      for (const secret of [prompt, transcriptText, exploredFileText]) {
+        assert.equal(persisted.includes(secret), false, `observability files must omit ${secret}`);
+      }
+      assert.match(log, /ERROR: Haiku failed \(exit 42\)/);
+      const record = JSON.parse(metrics.trim().split('\n').at(-1));
+      assert.equal(record.input_len, prompt.length);
+      assert.equal(record.reason, 'Haiku failed (exit 42)');
     } finally {
       await destroyEnvironment(environment);
     }

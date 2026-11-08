@@ -66,7 +66,7 @@ Every error path exits 0. The hook contract with Claude Code is:
 - **exit code 0**: proceed normally
 - **exit code non-zero**: Claude Code may surface the error to the user
 
-Since we never want the preresearch hook to interrupt a conversation, all `catch` blocks call `process.exit(0)`. Errors are logged to `~/.local/share/rlm-hook/rlm-hook.log` for debugging.
+Since we never want the preresearch hook to interrupt a conversation, all `catch` blocks call `process.exit(0)`. Errors are logged to `~/.local/share/rlm-hook/rlm-hook.log` for debugging. The metrics JSONL, error log, and `RLM_DEBUG` verbose log share a content-safety boundary: they retain counts, fixed labels, token numbers, and bounded operational diagnostics only. Raw prompts, transcript excerpts, and explored-file contents are not persisted; subprocess stderr and model-provided skip reasons are dropped when they could carry such content. Known sensitive values reaching an unavoidable diagnostic are replaced with a short SHA-256 plus length marker, and log entries remain bounded by the rotating-log limits.
 
 ## Why subprocess instead of SDK
 

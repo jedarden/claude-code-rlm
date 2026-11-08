@@ -132,9 +132,63 @@ const CONFIG = createConfig();
 // LOGGING
 // =============================================================================
 
+// Observability files are deliberately content-blind. The hook may read the
+// prompt, transcript, and project files in memory (or pass them to Haiku), but
+// those values are not part of the metrics schema or log contract. Keep the
+// current invocation's raw inputs only in memory so an unexpected subprocess
+// or provider error can be scrubbed before it reaches either file.
+const PERSISTED_TEXT_LIMIT = 512;
+const sensitiveContent = new Set();
+
+function rememberSensitiveContent(value) {
+  if (typeof value === 'string' && value.length > 0) sensitiveContent.add(value);
+}
+
+function hashContent(value) {
+  return createHash('sha256').update(value).digest('hex').slice(0, 16);
+}
+
+function redactPersistedText(value) {
+  let text = String(value ?? '');
+  const candidates = [...sensitiveContent]
+    .filter((candidate) => candidate.length > 0)
+    .sort((a, b) => b.length - a.length);
+  for (const candidate of candidates) {
+    if (text.includes(candidate)) {
+      const marker = `[redacted sha256:${hashContent(candidate)} length:${candidate.length}]`;
+      text = text.split(candidate).join(marker);
+    }
+  }
+  text = text.replace(/[\r\n]+/g, '\\n');
+  return text.length > PERSISTED_TEXT_LIMIT
+    ? `${text.slice(0, PERSISTED_TEXT_LIMIT)}... [truncated]`
+    : text;
+}
+
+function safeMetric(metric) {
+  // Explicit allowlist: input_len is a count; token_estimate is numeric; all
+  // other values are fixed labels or bounded diagnostics. Unknown fields are
+  // intentionally dropped so a future caller cannot accidentally persist a
+  // prompt, transcript excerpt, or explored file content.
+  const safe = {};
+  for (const key of ['event', 'latency_ms', 'mode', 'input_len', 'cache_hit', 'source', 'intent']) {
+    if (Object.hasOwn(metric, key)) safe[key] = metric[key];
+  }
+  if (Object.hasOwn(metric, 'token_estimate') && metric.token_estimate &&
+      Number.isFinite(metric.token_estimate.input_tokens) &&
+      Number.isFinite(metric.token_estimate.output_tokens)) {
+    safe.token_estimate = {
+      input_tokens: metric.token_estimate.input_tokens,
+      output_tokens: metric.token_estimate.output_tokens,
+    };
+  }
+  if (Object.hasOwn(metric, 'reason')) safe.reason = redactPersistedText(metric.reason);
+  return safe;
+}
+
 async function log(message) {
   const timestamp = new Date().toISOString();
-  const entry = `[${timestamp}] ${message}\n`;
+  const entry = `[${timestamp}] ${redactPersistedText(message)}\n`;
   try {
     await appendRotating(CONFIG.logFile, entry, ERROR_LOG_LIMIT);
   } catch {
@@ -160,7 +214,7 @@ function currentMode() {
 // input_len, cache_hit, …) are spread after ts.
 async function appendMetric(metric) {
   try {
-    const line = JSON.stringify({ ts: Date.now(), ...metric }) + '\n';
+    const line = JSON.stringify({ ts: Date.now(), ...safeMetric(metric) }) + '\n';
     await appendRotating(CONFIG.metricsFile, line, METRICS_LOG_LIMIT);
   } catch {
     // Never let a metrics failure change the hook's behavior
@@ -433,6 +487,10 @@ async function gatherConversationContext(transcriptPath, maxMessages = CONFIG.co
 
   try {
     const content = await readFile(transcriptPath, 'utf-8');
+    // Transcript text is request context only. Remember it in memory so an
+    // unexpected downstream error that echoes it is redacted before logging;
+    // no transcript bytes are returned in a metric or log field.
+    rememberSensitiveContent(content);
     const lines = content.trim().split('\n').slice(-maxMessages * 2);
 
     const messages = [];
@@ -445,6 +503,7 @@ async function gatherConversationContext(transcriptPath, maxMessages = CONFIG.co
             ? raw.filter(b => b.type === 'text').map(b => b.text).join(' ')
             : (typeof raw === 'string' ? raw : '');
           if (text) {
+            rememberSensitiveContent(text);
             messages.push({
               role: entry.type,
               preview: text.slice(0, 200) + (text.length > 200 ? '...' : '')
@@ -1118,7 +1177,10 @@ async function invokeHaiku(prompt, workingDir = null, session = null) {
         } else if (code === 0) {
           resolve(stdout);
         } else {
-          reject(new Error(`Haiku failed (exit ${code}): ${stderr.slice(0, 500)}`));
+          // Do not persist CLI stderr: it can echo the request or explored
+          // file content. The exit code is sufficient for the observability
+          // contract; raw subprocess diagnostics stay process-local.
+          reject(new Error(`Haiku failed (exit ${code})`));
         }
       });
 
@@ -2144,7 +2206,6 @@ async function main() {
     const input = await readStdin();
 
     userMessage = input;
-
     // Claude Code hook format: JSON with prompt, cwd, transcript_path.
     // Invalid input must not be reinterpreted as a successful plain-text request.
     const parsedInput = parseHookInput(input);
@@ -2152,6 +2213,7 @@ async function main() {
       throw new Error(`Invalid hook input: ${parsedInput.error}`);
     }
     ({ userMessage } = parsedInput);
+    rememberSensitiveContent(userMessage);
     const { cwd, transcriptPath } = parsedInput;
 
     await log(`Processing input of length ${userMessage.length}${cwd ? ` in ${cwd}` : ''}`);
@@ -2329,9 +2391,12 @@ async function main() {
     const analysis = normalizePreresearch(parseHaikuResponse(responseText(response)));
 
     if (analysis.skip_rlm || analysis.skip) {
-      await log(`RLM skipped by Haiku: ${analysis.skip_reason || analysis.reason}`);
+      // The model's reason is untrusted content and is not an observability
+      // field. Persist only the event category; prompt/file text is never
+      // needed to count a Haiku skip.
+      await log('RLM skipped by Haiku');
       await recordMetric('haiku_skip', false, {
-        reason: analysis.skip_reason || analysis.reason,
+        reason: 'haiku_skip',
         ...(tokenEstimate ? { token_estimate: tokenEstimate } : {}),
       });
       process.exit(0);
