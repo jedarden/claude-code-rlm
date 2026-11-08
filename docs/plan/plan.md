@@ -15,7 +15,7 @@ UserPromptSubmit hook fires
        ▼
 rlm-hook.mjs
   ├── Skip detection (trivial inputs → exit 0)
-  ├── Cache lookup (SHA-256 of message)
+  ├── Cache lookup (SHA-256 of message + cwd)
   ├── Project context gathering (project type, git state)
   ├── Haiku invocation (agentic or fast mode)
   │     ├── Agentic: Glob, Grep, Read, Write scratch, read-only Bash(git status/log/diff/show/branch/ls-files/remote)

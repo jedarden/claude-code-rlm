@@ -46,17 +46,17 @@ Two operating modes, controlled by `RLM_AGENTIC_MODE` (default: `true`) and `RLM
 
 ## Cache Design
 
-- **Key**: SHA-256 of the raw user message (before truncation)
-- **Location**: `~/.cache/rlm-hook/` (user-level, not project-relative)
+- **Key**: SHA-256 of the raw user message plus the working directory — `sha256(userMessage + '\0' + cwd)`, computed before truncation. Project-scoped: the same prompt in two different projects produces different keys (resolved plan.md Open Question 5, bead claudeco-b1c6997f). Not keyed on model or mode.
+- **Location**: `~/.cache/rlm-hook/` (user-level; entries are project-scoped by the key, not by the directory layout)
 - **TTL**: 3600s (1 hour), configurable via `RLM_CACHE_TTL`
 - **Format**: JSON files named `<sha256>.json`
 - **Eviction**: Lazy — stale files are deleted on access, not via a background sweep
 
-The cache is keyed on message text only, not on cwd or model. This means the same question in two different projects hits the same cache entry. For the current use case (intent classification + task decomposition) this is acceptable — the agentic exploration is what makes answers project-specific, and that is also cached.
+The cwd half of the key scopes entries to a project, so one repository's cached `relevant_files` paths can never be served into another repository's `<rlm_preresearch>` block. The key does not cover code state: a prompt repeated after edits within the same project still hits the pre-edit entry until the TTL expires — the TTL, not the key, is the staleness bound. Model and mode are likewise absent from the key.
 
 Cache misses are the common case for novel questions. The cache primarily helps with repeated queries in long sessions (e.g., retrying a prompt, running the same planning query after a small edit).
 
-Semantic caching uses an OpenAI-compatible embeddings endpoint. Set `RLM_EMBED_BASE_URL` to override the default `https://api.openai.com/v1`, and provide `OPENAI_API_KEY` when `RLM_SEMANTIC_CACHE=true`.
+Semantic caching (default off, `RLM_SEMANTIC_CACHE=true`) layers onto the SHA-256 miss path: on a miss, the query is embedded as `prompt + '\0' + cwd` and scored against stored embeddings, and the nearest analysis above `RLM_SEMANTIC_THRESHOLD` is served in place of a Haiku run. It uses an OpenAI-compatible embeddings endpoint. Set `RLM_EMBED_BASE_URL` to override the default `https://api.openai.com/v1`, and provide `OPENAI_API_KEY`.
 
 ## Graceful Degradation
 

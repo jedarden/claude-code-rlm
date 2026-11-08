@@ -55,6 +55,10 @@ Haiku is not the right model for nuanced judgment calls, subtle architectural tr
 
 Coding sessions are repetitive in a specific way. Developers refine prompts — they ask roughly the same thing two or three times, tweaking wording, then accept one answer and move on. They re-open a session to continue yesterday's work with nearly identical initial context. They hit the same files repeatedly across a session.
 
-A SHA-256 cache keyed on `(prompt, cwd)` with a 1-hour TTL captures most of this repetition. The 37ms cache hit cost is essentially free — lower than the round-trip to display a response. The cache is also a correctness guarantee: if the codebase changed significantly, `cwd` produces a different hash, and the cache is bypassed.
+A SHA-256 cache keyed on `(prompt, cwd)` with a 1-hour TTL captures most of this repetition. The 37ms cache hit cost is essentially free — lower than the round-trip to display a response. The two key dimensions do different jobs: `prompt` identifies the request; `cwd` scopes it to a project, so the same question asked in two different repositories cannot serve one repository's file paths into the other's context. What the key cannot see is code changing underneath a stable prompt and working directory — staleness is bounded by the TTL, not by the key.
 
 The 1-hour TTL is a deliberate choice: long enough to cover a focused coding session, short enough that stale preresearch from before a major refactor does not persist into the next session.
+
+An optional similarity layer extends this to prompts that are *near*-identical rather than byte-identical: the prompt-plus-cwd is embedded and scored against stored embeddings, and the nearest analysis above a cosine threshold is served without consulting Haiku. It ships default-off.
+
+*(Implemented contract — exact key scheme, TTL, and the semantic layer — is specified in `docs/notes/architecture.md`, "Cache Design". That document tracks the code; treat it as authoritative over this research note.)*
