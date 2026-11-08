@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const DEFAULTS = Object.freeze({
+  enabled: true,
   minInputLength: 20,
   maxInputLength: 4000,
   cacheTTL: 3600,
@@ -44,6 +45,32 @@ function stringValue(env, name, fallback) {
   return typeof env[name] === 'string' && env[name] !== '' ? env[name] : fallback;
 }
 
+/**
+ * resolveEnabled — the hook's master runtime switch.
+ *
+ * Precedence: a recognized RLM_ENABLED value wins, then RLM_DISABLED, else the
+ * default (enabled). Only the literal strings 'true'/'false' are recognized —
+ * consistent with every other RLM_* boolean — and an unrecognized value falls
+ * through to the next source, so a typo cannot silently disable the hook.
+ *
+ *   RLM_ENABLED=false   → disabled (master off switch)
+ *   RLM_ENABLED=true    → enabled, even alongside RLM_DISABLED=true
+ *   RLM_DISABLED=true   → disabled
+ *   RLM_DISABLED=false  → enabled, unless RLM_ENABLED=false also set
+ *   neither/unrecognized → enabled
+ *
+ * @param {Record<string, string|undefined>} env  environment-like object
+ * @param {boolean} [fallback]  value when neither variable is recognized
+ * @returns {boolean}
+ */
+export function resolveEnabled(env = process.env, fallback = DEFAULTS.enabled) {
+  if (env.RLM_ENABLED === 'true') return true;
+  if (env.RLM_ENABLED === 'false') return false;
+  if (env.RLM_DISABLED === 'true') return false;
+  if (env.RLM_DISABLED === 'false') return true;
+  return fallback;
+}
+
 function expandTilde(value, home) {
   return value?.startsWith('~/') ? join(home, value.slice(2)) : value;
 }
@@ -55,6 +82,7 @@ function expandTilde(value, home) {
  */
 export function createConfig(env = process.env, home = homedir()) {
   return {
+    enabled: resolveEnabled(env),
     minInputLength: parseInteger(env.RLM_MIN_LENGTH, DEFAULTS.minInputLength),
     maxInputLength: parseInteger(env.RLM_MAX_LENGTH, DEFAULTS.maxInputLength),
     cacheTTL: parseInteger(env.RLM_CACHE_TTL, DEFAULTS.cacheTTL),

@@ -83,3 +83,6 @@ Add the following to ~/.claude/settings.json to activate the hook:
 EOF
 
 echo "RLM hook installed successfully"
+echo "To disable preresearch temporarily without uninstalling, set RLM_ENABLED=false"
+echo "(or RLM_DISABLED=true) in your environment."
+echo "To uninstall, run: bash uninstall.sh"

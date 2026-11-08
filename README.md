@@ -130,6 +130,32 @@ If you skipped SDK installation during install, you can add it later:
 npm install --prefix ~/.claude/hooks @anthropic-ai/sdk
 ```
 
+**Disable without uninstalling:**
+Set `RLM_ENABLED=false` (or `RLM_DISABLED=true`) in your environment — in your
+shell profile, or in `~/.claude/settings.json` under `env`. This is a master
+off switch checked before skip detection and every cache: the hook exits
+immediately (~30ms), injects nothing, reads no cache, and never calls Haiku.
+The installation itself is untouched, so `RLM_ENABLED=true` turns preresearch
+back on instantly. `RLM_ENABLED` wins when both variables are set; only the
+literal strings `true`/`false` are recognized, so a typo'd value falls back to
+enabled rather than silently disabling the hook.
+
+**Uninstall:**
+```bash
+bash uninstall.sh
+```
+Removes exactly what the installation created — the runtime files in
+`~/.claude/hooks/`, the SDK dependencies it installed (only if that
+`package.json` declares nothing but `@anthropic-ai/sdk`), the hook's
+`UserPromptSubmit` registration in `~/.claude/settings.json`, and its cache
+(`~/.cache/rlm-hook`) and logs (`~/.local/share/rlm-hook`). Other hooks,
+unrelated settings, and any other `package.json` in the hooks directory are
+preserved, a malformed `settings.json` is left untouched rather than
+destroyed, and the script is safe to run repeatedly or when nothing is
+installed. If a *project-level* `.claude/settings.json` also references the
+hook, remove that entry by hand — the script only manages the user-level
+`~/.claude/settings.json`.
+
 ---
 
 ## Configuration
@@ -137,6 +163,10 @@ npm install --prefix ~/.claude/hooks @anthropic-ai/sdk
 All configuration is via environment variables. Set them in your shell profile or in `~/.claude/settings.json` under `env`.
 
 ```bash
+# Master switch
+RLM_ENABLED=true         # Master off switch: RLM_ENABLED=false disables all preresearch (default: true)
+RLM_DISABLED=false       # Equivalent inverse switch: RLM_DISABLED=true also disables (RLM_ENABLED wins if both set)
+
 # Mode selection
 RLM_AGENTIC_MODE=true    # Enable codebase exploration with tools (default: true)
 RLM_AGENTIC_MODE=false   # Fast analysis only

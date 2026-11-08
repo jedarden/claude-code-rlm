@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { createConfig, DEFAULTS, selectMode, shouldUseSDK } from '../rlm-config.mjs';
+import { createConfig, DEFAULTS, resolveEnabled, selectMode, shouldUseSDK } from '../rlm-config.mjs';
 
 const TEST_HOME = '/tmp/rlm-config-test-home';
 
@@ -9,6 +9,7 @@ describe('RLM configuration defaults', () => {
   it('uses the documented defaults when no environment overrides are present', () => {
     const config = createConfig({}, TEST_HOME);
 
+    assert.equal(config.enabled, DEFAULTS.enabled);
     assert.equal(config.minInputLength, DEFAULTS.minInputLength);
     assert.equal(config.maxInputLength, DEFAULTS.maxInputLength);
     assert.equal(config.cacheTTL, DEFAULTS.cacheTTL);
@@ -157,6 +158,44 @@ describe('RLM configuration environment overrides', () => {
     assert.equal(config.debug, false);
     assert.equal(config.sessionResume, false);
     assert.equal(config.sessionResumeMaxTurns, DEFAULTS.sessionResumeMaxTurns);
+  });
+});
+
+describe('RLM master disable switch', () => {
+  it('defaults to enabled when neither variable is set', () => {
+    assert.equal(resolveEnabled({}), true);
+    assert.equal(createConfig({}, TEST_HOME).enabled, true);
+  });
+
+  it('RLM_ENABLED=false is the master off switch and wins over RLM_DISABLED', () => {
+    assert.equal(resolveEnabled({ RLM_ENABLED: 'false' }), false);
+    assert.equal(resolveEnabled({ RLM_ENABLED: 'false', RLM_DISABLED: 'true' }), false);
+    assert.equal(resolveEnabled({ RLM_ENABLED: 'false', RLM_DISABLED: 'false' }), false);
+    assert.equal(createConfig({ RLM_ENABLED: 'false' }, TEST_HOME).enabled, false);
+  });
+
+  it('RLM_ENABLED=true enables even alongside RLM_DISABLED=true', () => {
+    assert.equal(resolveEnabled({ RLM_ENABLED: 'true', RLM_DISABLED: 'true' }), true);
+    assert.equal(resolveEnabled({ RLM_ENABLED: 'true' }), true);
+  });
+
+  it('RLM_DISABLED=true disables and RLM_DISABLED=false enables', () => {
+    assert.equal(resolveEnabled({ RLM_DISABLED: 'true' }), false);
+    assert.equal(resolveEnabled({ RLM_DISABLED: 'false' }), true);
+    assert.equal(createConfig({ RLM_DISABLED: 'true' }, TEST_HOME).enabled, false);
+  });
+
+  it('falls through to the default on unrecognized values so a typo cannot disable the hook', () => {
+    assert.equal(resolveEnabled({ RLM_ENABLED: '0', RLM_DISABLED: '1' }), true);
+    assert.equal(resolveEnabled({ RLM_ENABLED: 'FALSE' }), true);
+    assert.equal(resolveEnabled({ RLM_DISABLED: 'yes' }), true);
+    assert.equal(resolveEnabled({ RLM_ENABLED: '', RLM_DISABLED: '' }), true);
+    assert.equal(createConfig({ RLM_ENABLED: 'off' }, TEST_HOME).enabled, true);
+  });
+
+  it('falls back to the provided default when nothing is recognized', () => {
+    assert.equal(resolveEnabled({}, false), false);
+    assert.equal(resolveEnabled({ RLM_ENABLED: 'nope' }, false), false);
   });
 });
 

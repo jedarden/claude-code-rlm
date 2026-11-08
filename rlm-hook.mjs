@@ -2206,6 +2206,18 @@ async function main() {
     const input = await readStdin();
 
     userMessage = input;
+
+    // Master disable switch — the first behavioral gate, ahead of skip
+    // detection and every cache. A disabled hook must be fully inert: no
+    // input parsing, no cache reads, no Haiku invocation, and no error even
+    // on malformed input. Exit 0 with empty stdout so Claude Code injects
+    // nothing and the conversation proceeds untouched.
+    if (!CONFIG.enabled) {
+      await log('RLM disabled by environment (RLM_ENABLED=false or RLM_DISABLED=true)');
+      await recordMetric('disabled', false, { reason: 'disabled_by_env' });
+      process.exit(0);
+    }
+
     // Claude Code hook format: JSON with prompt, cwd, transcript_path.
     // Invalid input must not be reinterpreted as a successful plain-text request.
     const parsedInput = parseHookInput(input);
